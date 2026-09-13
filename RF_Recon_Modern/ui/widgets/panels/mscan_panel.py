@@ -44,7 +44,7 @@ class MSCANPanel(QWidget):
         outer_layout.addWidget(scroll)
 
         # --- 1. PRIMARY SCAN ACTION & TELEMETRY ---
-        self.scan_btn = QPushButton("Start Rapid Channel Monitoring")
+        self.scan_btn = QPushButton("Start Rapid Channel Monitor")
         self.scan_btn.setObjectName("triggerBtn")
         self.scan_btn.setFixedHeight(36)
         self.scan_btn.setCheckable(True)
@@ -281,7 +281,7 @@ class MSCANPanel(QWidget):
                 }
             """)
         else:
-            self.scan_btn.setText("Start Rapid Channel Monitoring")
+            self.scan_btn.setText("Start Rapid Channel Monitor")
             self.scan_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #1f6feb;

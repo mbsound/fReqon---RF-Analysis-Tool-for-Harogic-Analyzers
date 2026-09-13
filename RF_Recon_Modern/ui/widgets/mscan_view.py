@@ -254,7 +254,7 @@ class MSCANView(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
-        lbl_title = QLabel("RAPID CHANNEL MONITORING")
+        lbl_title = QLabel("RAPID CHANNEL MONITOR")
         lbl_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #38bdf8; letter-spacing: 0.5px;")
         top_bar.addWidget(lbl_title)
 
