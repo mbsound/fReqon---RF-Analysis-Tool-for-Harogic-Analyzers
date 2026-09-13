@@ -51,6 +51,8 @@ from .widgets.panels.dtv_panel import DTVPanel
 from .widgets.panels.dect_panel import DECTPanel
 from .widgets.panels.showlink_panel import ShowLinkPanel
 from .widgets.panels.threats_panel import ThreatsPanel, NumericTableWidgetItem
+from .widgets.panels.mscan_panel import MSCANPanel
+from .widgets.mscan_view import MSCANView
 from core.demod_engine import DemodEngine, DemodResult
 from core.soundbase_parser import SoundbaseParser
 
@@ -218,6 +220,7 @@ class MainWindow(QMainWindow):
         self.dect_panel = DECTPanel(self.panel_stack)
         self.showlink_panel = ShowLinkPanel(self.panel_stack)
         self.threats_panel = ThreatsPanel(self.panel_stack)
+        self.mscan_panel = MSCANPanel(self.panel_stack)
         
         self.panel_stack.addWidget(self.sweep_panel)
         self.panel_stack.addWidget(self.rtsa_panel)
@@ -227,6 +230,7 @@ class MainWindow(QMainWindow):
         self.panel_stack.addWidget(self.dect_panel)
         self.panel_stack.addWidget(self.showlink_panel)
         self.panel_stack.addWidget(self.threats_panel)
+        self.panel_stack.addWidget(self.mscan_panel)
         
         left_hub_layout.addWidget(self.panel_stack)
         self.main_h_splitter.addWidget(self.left_hub)
@@ -281,11 +285,15 @@ class MainWindow(QMainWindow):
         self.demod_view.waterfall_view.set_colormap(self.waterfall_colormap)
         self.demod_view.waterfall_view.set_history_depth(self.waterfall_history_depth)
         
+        # Viewport Page 5: Hardware Discrete Channel Scanning Viewport (MSCAN)
+        self.mscan_view = MSCANView(self.viewport_stack)
+        
         self.viewport_stack.addWidget(self.dual_view_widget)
         self.viewport_stack.addWidget(self.multi_row_view)
         self.viewport_stack.addWidget(self.rtsa_view)
         self.viewport_stack.addWidget(self.det_view)
         self.viewport_stack.addWidget(self.demod_view)
+        self.viewport_stack.addWidget(self.mscan_view)
         
         viewport_layout.addWidget(self.viewport_stack)
         self.main_h_splitter.addWidget(self.viewport_container)
@@ -424,6 +432,18 @@ class MainWindow(QMainWindow):
         self.threats_panel.loadSoundbaseClicked.connect(self.load_soundbase_json)
         self.threats_panel.markerItemChanged.connect(self._on_marker_tree_item_changed)
         self.threats_panel.carrierSelected.connect(self._on_soundbase_carrier_selected)
+
+        # MSCAN Panel & View
+        self.multi_device_manager.mscan_data_ready.connect(self._on_mscan_data)
+        self.mscan_panel.scanToggled.connect(self._on_mscan_toggled)
+        self.mscan_panel.paramsChanged.connect(self._on_mscan_params_changed)
+        self.mscan_panel.loadSoundbaseClicked.connect(self.load_soundbase_json)
+        self.mscan_panel.channelsSelectionChanged.connect(self._on_mscan_channels_selected)
+        self.mscan_panel.tuneAudioDemodRequested.connect(self.tune_audio_demod_carrier)
+        self.mscan_panel.inspectRtsaRequested.connect(self.inspect_rtsa_carrier)
+
+        self.mscan_view.tuneDemodRequested.connect(self.tune_audio_demod_carrier)
+        self.mscan_view.inspectRtsaRequested.connect(self.inspect_rtsa_carrier)
 
     def _init_state(self):
         # Active regional presets & channels
@@ -832,6 +852,12 @@ class MainWindow(QMainWindow):
             if not self.demod_panel.is_active:
                 if self._last_operating_mode != "SWP" or not self.is_sweeping:
                     self.resume_rf_sweep()
+        elif mode_idx == 8: # Channel Scan (MSCAN)
+            self.viewport_stack.setCurrentIndex(5) # MSCANView
+            if self.mscan_panel.is_scanning:
+                self._on_mscan_toggled(True)
+            elif self._last_operating_mode != "SWP":
+                self.resume_rf_sweep()
         else: # Broadcast/DTV (4), DECT (5), ShowLink (6), Threats (7)
             if self._last_operating_mode != "SWP":
                 self.resume_rf_sweep()
@@ -956,6 +982,70 @@ class MainWindow(QMainWindow):
             self.total_frames += 1
             self.det_view.update_det_data(time_ns, power, info)
 
+    def _on_mscan_data(self, slot_id: str, el_idx: int, freq_hz: float, peak_power: float, spec_data, info: dict):
+        if self.viewport_stack.currentIndex() == 5:
+            self.frame_count += 1
+            self.total_frames += 1
+            dropout_thresh = self.mscan_panel.dropout_spin.value()
+            self.mscan_view.update_channel_data(el_idx, freq_hz, peak_power, spec_data, info, dropout_thresh)
+            n_ch = max(1, len(self.mscan_panel.selected_carriers))
+            hr = max(0.1, self.mscan_view.hop_rate)
+            self.mscan_panel.update_telemetry(n_ch, hr, (n_ch / hr) * 1000.0)
+
+    # --- MSCAN Mode Control Handlers ---
+    def _on_mscan_toggled(self, is_active: bool):
+        if is_active:
+            self._last_operating_mode = "MSCAN"
+            params = self.mscan_panel.get_params()
+            channels = params.get("channels", [])
+            if not channels:
+                QMessageBox.information(self, "MSCAN Notice", "Please load a Soundbase coordination file or select channels to scan.")
+                self.mscan_panel.scan_btn.setChecked(False)
+                self.mscan_panel._update_scan_btn_style()
+                return
+            self.viewport_stack.setCurrentIndex(5)
+            self.mscan_view.set_channels(channels)
+            dwell = params.get("dwell_time", 0.001)
+            det = params.get("detector", 1)
+            ref_lvl = params.get("ref_level", -10.0)
+            preamp = params.get("preamp", 0)
+            atten = params.get("atten", 0)
+            self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten)
+            self.top_bar.dev_label.setText(f"Hardware MSCAN: {len(channels)} channels hopping @ {dwell*1000:.1f}ms")
+        else:
+            self.multi_device_manager.set_operating_mode("SWP")
+            self.resume_rf_sweep()
+
+    def _on_mscan_params_changed(self, params: dict):
+        if self.mscan_panel.is_scanning:
+            channels = params.get("channels", [])
+            if channels:
+                dwell = params.get("dwell_time", 0.001)
+                det = params.get("detector", 1)
+                ref_lvl = params.get("ref_level", -10.0)
+                preamp = params.get("preamp", 0)
+                atten = params.get("atten", 0)
+                self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten)
+
+    def _on_mscan_channels_selected(self, selected_channels: list):
+        self.mscan_view.set_channels(selected_channels)
+
+    def tune_audio_demod_carrier(self, freq_mhz: float):
+        if self.audio_demod_dialog is None:
+            self.audio_demod_dialog = AudioDemodDialog(initial_freq_hz=freq_mhz * 1e6, parent=self)
+            self.audio_demod_dialog.listenStarted.connect(self._on_audio_listen_started)
+            self.audio_demod_dialog.listenStopped.connect(self._on_audio_listen_stopped)
+            self.audio_demod_dialog.retuneRequested.connect(self._on_audio_retune_requested)
+        else:
+            self.audio_demod_dialog.cf_spin.setValue(freq_mhz)
+        self.audio_demod_dialog.show()
+        self.audio_demod_dialog.raise_()
+        self.audio_demod_dialog.activateWindow()
+
+    def inspect_rtsa_carrier(self, freq_mhz: float):
+        self.nav_rail.set_active_mode(1)
+        self.rtsa_panel.cf_spin.setValue(freq_mhz)
+
     def _on_temperature_updated(self, slot_id: str, temp_c: float):
         self.top_bar.set_device_temperature(temp_c)
 
@@ -1057,8 +1147,8 @@ class MainWindow(QMainWindow):
             self.top_bar.dev_label.setText(f"Audio Demod: {mode.upper()} @ {freq_hz/1e6:.3f} MHz")
 
     def _on_view_mode_changed(self, mode: str):
-        if self.nav_rail.btn_group.checkedId() in (1, 2, 3):
-            # If in RTSA, DET, or Demodulation, selecting a view mode combo switches back to RF & Sweep
+        if self.nav_rail.btn_group.checkedId() in (1, 2, 3, 8):
+            # If in RTSA, DET, Demodulation, or MSCAN, selecting a view mode combo switches back to RF & Sweep
             self.nav_rail.set_active_mode(0)
             return
             
@@ -2065,6 +2155,10 @@ class MainWindow(QMainWindow):
                 self.threats_panel.populate_soundbase_tree(parsed)
                 site_name = parsed["sites"][0]["name"] if parsed.get("sites") else Path(fp).stem
                 self.threats_panel.set_soundbase_active(site_name, len(carriers))
+                if hasattr(self, 'mscan_panel'):
+                    self.mscan_panel.set_soundbase_data(parsed)
+                if hasattr(self, 'mscan_view'):
+                    self.mscan_view.set_channels(carriers)
             except Exception as e:
                 QMessageBox.warning(self, "Import Notice", f"Failed to parse Soundbase file: {e}")
 

@@ -23,7 +23,8 @@ class NavRail(QWidget):
         ("Broadcast / DTV", "FCC/OFCOM broadcast television station lookups"),
         ("DECT / Intercom", "DECT & Riedel Bolero capacity and TDMA time slots"),
         ("2.4G / ShowLink", "ShowLink, Wireless DMX / CRMX and Wi-Fi coexistence"),
-        ("Threats & Markers", "Intruder alerts, Soundbase JSON and custom markers")
+        ("Threats & Markers", "Intruder alerts, Soundbase JSON and custom markers"),
+        ("Channel Scan (MSCAN)", "Ultra-fast discrete channel hopping across Soundbase coordinated carriers")
     ]
 
     def __init__(self, parent=None):

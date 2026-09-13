@@ -405,6 +405,15 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
     iqs_raw_packet = None
     iqs_raw_stream = None
 
+    # 5. MSCAN State (Hardware Discrete Channel Scanning)
+    mscan_profiles_in = None
+    mscan_profiles_out = None
+    mscan_info = MSCAN_Info_Typedef()
+    mscan_channels = []
+    mscan_running = False
+    mscan_spec_buf = None
+    mscan_iq_buf = None
+
     is_running = False
     consecutive_errors = 0
     last_temp_check_time = 0.0
@@ -459,6 +468,8 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("status", "Switched to Zero-Span (DET) mode"))
                 elif current_mode == "IQS":
                     data_queue.put(("status", "Switched to IQ Stream (Demodulation) mode"))
+                elif current_mode == "MSCAN":
+                    data_queue.put(("status", "Switched to Discrete Channel Scanning (MSCAN) mode"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "fan_config":
                 fan_state, threshold_temp = cmd[1]
@@ -539,6 +550,73 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("status", f"IQS Demod active @ {c_freq/1e6:.3f} MHz (Decimate: {iqs_profile_out.DecimateFactor})"))
                 else:
                     data_queue.put(("error", f"IQS configuration failed (Status: {status})"))
+
+            elif isinstance(cmd, tuple) and cmd[0] == "mscan_config":
+                channels, dwell_time, detector, r_lvl, preamp, atten = cmd[1]
+                if current_mode == "MSCAN" and mscan_running:
+                    try:
+                        dll.MSCAN_Stop(ctypes.pointer(device))
+                    except Exception:
+                        pass
+                    mscan_running = False
+
+                if mscan_profiles_in is not None and len(mscan_channels) > 0:
+                    try:
+                        deinit_cnt = ctypes.c_int32(len(mscan_channels))
+                        dll.MSCAN_ProfileDeinit(ctypes.pointer(device), mscan_profiles_in, ctypes.pointer(deinit_cnt))
+                    except Exception:
+                        pass
+
+                num_channels = len(channels)
+                if num_channels > 0:
+                    mscan_channels = channels
+                    mscan_profiles_in = (MSCAN_Profile_TypeDef * num_channels)()
+                    mscan_profiles_out = (MSCAN_Profile_TypeDef * num_channels)()
+                    det_enum = Detector_TypeDef.Detector_PosPeak if detector == 1 else (Detector_TypeDef.Detector_Average if detector == 2 else Detector_TypeDef.Detector_RMS)
+                    for i, ch in enumerate(channels):
+                        f_hz = float(ch if isinstance(ch, (int, float)) else ch.get("freq_hz", ch.get("freq", 500e6)))
+                        p = mscan_profiles_in[i]
+                        p.CenterFreq_Hz = f_hz
+                        p.RefLevel_dBm = float(r_lvl)
+                        p.DwellTime = float(dwell_time)
+                        p.DecimateFactor = 1
+                        p.FFTSize = 512
+                        p.DetectCount = 1
+                        p.Detector = det_enum
+                        p.IFAGC = IFAGC_TypeDef.IFAGC_Off
+                        p.XPPSTrigger = XPPSTrigger_TypeDef.XPPSTrigger_Off
+                        p.IQPlayBack = IQPlayBack_TypeDef.IQPlayBack_Off
+                        p.Window = Window_TypeDef.Blackman
+
+                    elements = ctypes.c_int32(num_channels)
+                    repetitions = ctypes.c_int64(100_000_000)
+                    preamp_val = PreamplifierState_TypeDef(int(preamp))
+                    status = dll.MSCAN_Configuration(
+                        ctypes.pointer(device),
+                        mscan_profiles_in,
+                        mscan_profiles_out,
+                        ctypes.pointer(mscan_info),
+                        ctypes.pointer(elements),
+                        ctypes.pointer(repetitions),
+                        ctypes.pointer(preamp_val)
+                    )
+                    if status == 0:
+                        max_spec = max(4096, int(mscan_info.SpectrumPoints) * max(1, int(mscan_info.SpectrumFrames)))
+                        max_iq = max(8192, int(mscan_info.IQStreamPoints) * 2)
+                        mscan_spec_buf = (ctypes.c_uint8 * max_spec)()
+                        mscan_iq_buf = (ctypes.c_int16 * max_iq)()
+                        st_start = dll.MSCAN_Start(ctypes.pointer(device))
+                        if st_start == 0:
+                            current_mode = "MSCAN"
+                            mscan_running = True
+                            is_running = True
+                            data_queue.put(("status", f"MSCAN active: {num_channels} channels hopping @ {dwell_time*1000:.1f}ms dwell"))
+                        else:
+                            data_queue.put(("error", f"MSCAN Start failed (Status: {st_start})"))
+                    else:
+                        data_queue.put(("error", f"MSCAN Configuration failed (Status: {status})"))
+                else:
+                    data_queue.put(("status", "MSCAN stopped: channel list empty"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "bw_config":
                 current_mode = "SWP"
@@ -918,12 +996,65 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                 except Exception as e:
                     data_queue.put(("error", f"IQS stream acquisition error: {str(e)}"))
                 time.sleep(0.035)
+            elif current_mode == "MSCAN" and mscan_running:
+                try:
+                    if mscan_spec_buf is None:
+                        mscan_spec_buf = (ctypes.c_uint8 * 4096)()
+                    if mscan_iq_buf is None:
+                        mscan_iq_buf = (ctypes.c_int16 * 8192)()
+
+                    mscan_data = MSCAN_Data_Typedef()
+                    mscan_data.SpectrumStream = ctypes.cast(mscan_spec_buf, ctypes.POINTER(ctypes.c_uint8))
+                    mscan_data.IQStream = ctypes.cast(mscan_iq_buf, ctypes.POINTER(ctypes.c_int16))
+
+                    st = dll.MSCAN_GetData(ctypes.pointer(device), ctypes.pointer(mscan_data))
+                    if st == 0:
+                        el_idx = int(mscan_data.ElementIndex)
+                        pts = int(mscan_data.SpectrumPoints)
+                        scale = float(mscan_data.ScaleTodBm)
+                        offset = float(mscan_data.OffsetTodBm)
+                        spec_dbm = None
+                        peak_power = -120.0
+                        if pts > 0:
+                            raw_u8 = np.frombuffer(mscan_spec_buf, dtype=np.uint8, count=pts)
+                            spec_dbm = raw_u8.astype(np.float32) * scale + offset
+                            peak_power = float(np.max(spec_dbm))
+                        else:
+                            peak_power = offset
+
+                        ch_freq = 0.0
+                        ch_info = {}
+                        if 0 <= el_idx < len(mscan_channels):
+                            ch_obj = mscan_channels[el_idx]
+                            if isinstance(ch_obj, dict):
+                                ch_freq = float(ch_obj.get("freq_hz", ch_obj.get("freq", 0.0)))
+                                ch_info = ch_obj
+                            else:
+                                ch_freq = float(ch_obj)
+
+                        data_queue.put(("mscan_data", (el_idx, ch_freq, peak_power, spec_dbm, {
+                            "repeat_index": int(mscan_data.RepeatIndex),
+                            "element_index": el_idx,
+                            "channel_info": ch_info,
+                            "temperature": float(mscan_data.Temperature) if mscan_data.Temperature != 0 else 0.0,
+                            "timestamp": float(mscan_data.SysTimeStamp)
+                        })))
+                    elif st == -304:
+                        # APIRETVAL_WARNING_DataNotReady: wait briefly for next frame
+                        time.sleep(0.0002)
+                    else:
+                        time.sleep(0.001)
+                except Exception as e:
+                    data_queue.put(("error", f"MSCAN acquisition error: {e}"))
+                    time.sleep(0.02)
             else:
                 time.sleep(0.01)
         else:
             time.sleep(0.01)
             
     try:
+        if current_mode == "MSCAN" and mscan_running:
+            dll.MSCAN_Stop(ctypes.pointer(device))
         dll.Device_Close(ctypes.pointer(device))
     except Exception:
         pass
@@ -933,6 +1064,7 @@ class DeviceQueueReader(QThread):
     rta_data_ready = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, dict)
     det_data_ready = pyqtSignal(np.ndarray, np.ndarray, dict)
     iqs_data_ready = pyqtSignal(np.ndarray, float, dict)
+    mscan_data_ready = pyqtSignal(int, float, float, object, dict) # el_idx, ch_freq, peak_power, spec_dbm, info
     temperature_updated = pyqtSignal(float)
     status_message = pyqtSignal(str)
     connection_status = pyqtSignal(bool)
@@ -995,6 +1127,9 @@ class DeviceQueueReader(QThread):
         elif msg_type == "iqs_data":
             iq_c, sr, info = content
             self.iqs_data_ready.emit(iq_c, sr, info)
+        elif msg_type == "mscan_data":
+            el_idx, ch_freq, peak_power, spec_dbm, info = content
+            self.mscan_data_ready.emit(el_idx, ch_freq, peak_power, spec_dbm, info)
         elif msg_type == "temperature":
             self.temperature_updated.emit(float(content))
         elif msg_type == "connected":
@@ -1030,6 +1165,7 @@ class DeviceController(QObject):
     rta_data_ready = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, dict)
     det_data_ready = pyqtSignal(np.ndarray, np.ndarray, dict)
     iqs_data_ready = pyqtSignal(np.ndarray, float, dict)
+    mscan_data_ready = pyqtSignal(int, float, float, object, dict)
     temperature_updated = pyqtSignal(float)
     status_message = pyqtSignal(str)
     connection_status = pyqtSignal(bool)
@@ -1082,6 +1218,7 @@ class DeviceController(QObject):
         self.queue_reader.rta_data_ready.connect(self.rta_data_ready)
         self.queue_reader.det_data_ready.connect(self.det_data_ready)
         self.queue_reader.iqs_data_ready.connect(self.iqs_data_ready)
+        self.queue_reader.mscan_data_ready.connect(self.mscan_data_ready)
         self.queue_reader.temperature_updated.connect(self.temperature_updated)
         self.queue_reader.status_message.connect(self.status_message)
         self.queue_reader.connection_status.connect(self.handle_connection_status)
@@ -1314,6 +1451,10 @@ class DeviceController(QObject):
     def configure_iqs(self, center_freq_hz: float, decimate_factor: int = 64, ref_level: float = 0.0, trig_src: int = 2, trig_length: int = 16384, preamp: int = 0, atten: int = 0):
         if self.command_queue:
             self.command_queue.put(("iqs_config", (center_freq_hz, decimate_factor, ref_level, trig_src, trig_length, preamp, atten)))
+
+    def configure_mscan(self, channels: list, dwell_time: float = 0.001, detector: int = 1, ref_level: float = 0.0, preamp: int = 0, atten: int = 0):
+        if self.command_queue:
+            self.command_queue.put(("mscan_config", (channels, dwell_time, detector, ref_level, preamp, atten)))
 
     def set_operating_mode(self, mode_str: str, params: dict = None):
         if self.command_queue:
