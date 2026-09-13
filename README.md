@@ -1,80 +1,51 @@
 # fReqon - RF Analysis Tool for Harogic Analyzers
 
-**fReqon** is an advanced, high-performance RF Spectrum Analysis, Signal Intelligence, and Live Frequency Monitoring suite built specifically for **Harogic Technologies** Real-Time Spectrum Analyzers (SAN, SAM, SAE series). Designed for mission-critical wireless audio coordination, broadcast engineering, and RF threat intelligence, fReqon delivers real-time DPX acquisition, deep hardware control, continuous sweeping, multi-row folded spectrograms, and automated rogue transmission detection.
+**fReqon** is a high-performance RF Spectrum Analysis, Signal Intelligence, and Live Frequency Monitoring suite built specifically for **Harogic Technologies** Real-Time Spectrum Analyzers (SAN, SAM, SAE series). Designed for wireless audio coordination, broadcast engineering, and live-event RF defense, fReqon delivers real-time DPX acquisition, deep hardware control, continuous sweeping, multi-row folded spectrograms, and automated rogue transmission detection.
 
 ---
 
 ## Visual Tour
 
-### Threat Detection & Intruder Alert (UHF Band with DTV Channel Masks)
-![Threat Detection & Intruder Alert](docs/images/threat_detection_dtv_uhf.png)
-*Figure 1: Threats & Markers mode active across the 470–608 MHz UHF broadcast band. Digital TV channel allocations (Ch 14–16, 22–23, 26–27, 32, 34–36) are shaded with 6 MHz ATSC masks. The draggable magenta Intruder Threshold line (-80.0 dBm) monitors clear whitespace for unauthorized carriers.*
+### 1. Dual View (Spectrogram / Real-Time Spectrum)
+![Dual View](docs/images/main_view.png)
+*Figure 1: Main dual-viewport interface featuring a synchronized spectrogram waterfall and real-time spectrum trace across the UHF band, complete with ATSC DTV channel blocks, active Soundbase carrier masks, and full hardware sweep controls.*
 
 ---
 
-### Multi-Row Folded Spectrogram (Waterfall)
+### 2. Multi-Row Folded Spectrogram
 ![Multi-Row Folded Spectrogram](docs/images/multi_row_waterfall.png)
-*Figure 2: 4-Row Folded Spectrogram view segmenting the UHF band across stacked rows. This architecture multiplies horizontal resolution fourfold, ensuring narrowband wireless microphone signals and fast transients remain crisp and actionable without horizontal compression.*
+*Figure 2: 4-Row Folded Spectrogram view segmenting the UHF span across stacked rows. This layout multiplies horizontal resolution fourfold, ensuring narrowband microphone carriers and brief transient bursts remain sharp and distinctly visible without horizontal compression.*
 
 ---
 
-## Deep Dive: Threat Detection & Intruder Alert
+### 3. Threat Detection & Intruder Alert
+![Threat Detection](docs/images/threat_detection.png)
+*Figure 3: Threat Detection & Markers mode actively monitoring the UHF band with loaded Soundbase channel allocations, broadcast television masks, an active -80.0 dBm threshold line, and real-time identified rogue carriers cataloged in the threats table.*
 
-During live events, theatrical productions, broadcast shoots, and high-security venues, unexpected or unauthorized transmissions can degrade wireless microphone links, in-ear monitors (IEMs), and intercom systems. The **Threat Detection & Intruder Alert** engine in fReqon provides continuous, automated RF defense.
+---
 
-### 1. Interactive Visual Threshold Line
-- **Plot-Coupled Infinite Line**: A high-visibility dashed magenta threshold line is superimposed directly across the spectrum display (`INTRUDER THRESH: -xx.x dBm`).
-- **Direct Drag & Drop**: Operators can grab and drag the line vertically with the mouse to adjust the trip point on the fly, or adjust it via the dedicated numeric spinbox in the control panel.
-- **Visual Contrast**: Hovering over the threshold line highlights it with dynamic glow feedback, providing instant confirmation of the threshold level against local RF noise.
+## Threat Detection & Intruder Alert
 
-### 2. Live Peak Analysis & Signal Classification
-When Intruder Detection is enabled:
-- **Fast Peak Detection**: Sweeps are evaluated against the active threshold level to detect emerging signals in real time.
-- **Heuristic Classifier**: Each candidate signal is passed through the integrated classifier (`transmitter_classifier.py`) to categorize its spectral profile:
-  - **Digital Wireless Systems**: Recognizes distinctive flat-topped spectra such as Shure Axient Digital (Standard & High Density), Shure ADPSM, Sennheiser Digital 6000/9000, and Sennheiser EW-DX.
-  - **Analog IEM & Wireless Transmitters**: Identifies narrow-deviation analog FM carriers, pilot tones, and dual-peak MPX stereo IEM footprints (e.g., Shure PSM 1000, Sennheiser G3/G4, Wisycom MTP/MTK).
-  - **Generic Carriers & Interference**: Flags unmodulated carriers, high-power spurious emissions, and intermodulation products.
+fReqon's **Threat Detection & Intruder Alert** system provides automated, real-time protection against uncoordinated and unauthorized RF carriers during live productions:
 
-### 3. Real-Time Threats Table & Crosshair Navigation
-- **Live Inventory**: All active intruders are cataloged into a sortable table detailing **Frequency (MHz)**, **Power (dBm)**, and identified **Signal Signature**.
-- **Synchronized Reticle Alignment**: Clicking any row in the Threats Table immediately locks crosshair vertical tracking cursors on both the Real-Time Spectrum and Spectrogram/Waterfall views, centering attention on the rogue transmission.
-- **Top Bar Alert Banner**: A high-contrast alert badge in the application header notifies the operator of the number of detected threats, with navigation steppers (`<` / `>`) for rapid cycling through active intruders during hectic live setups.
-
-### 4. Promotion to Markers & Frequency Coordination
-- **"Add to Markers..."**: With a single click, detected threats can be converted into persistent session channel markers or avoidance zones.
-- **Soundbase Site Coordination Integration**: Import `.sbcoordsite` coordination files directly into the Threats panel to automatically compare live detected carriers against authorized stage frequencies, immediately distinguishing scheduled wireless gear from rogue interlopers.
-- **DTV Regulatory Channel Masks**: Overlays North American (ATSC 6 MHz) or European (OFCOM 8 MHz) broadcast channel allocations directly on the sweep display. Channels can be toggled on or off to verify whether unknown carriers fall into broadcast white spaces or co-channel television guard bands.
+- **Approved Carrier Masking via Soundbase**: Import a Soundbase frequency coordination file (`.sbcoordsite` / JSON) to load your authorized production frequencies. fReqon automatically creates protective channel masks around all approved transmitters.
+- **Broadcast DTV Masking**: Overlay North American (ATSC 6 MHz) or European (OFCOM 8 MHz) television allocations to account for known licensed broadcast stations.
+- **Dynamic Threshold Evaluation**: An interactive threshold line on the spectrum display defines the trip level. Any live RF peak exceeding this threshold that is **not** inside an approved Soundbase mask or active DTV mask is immediately flagged as a potential threat.
+- **Spectral Signature Analysis**: For every flagged threat, the engine analyzes the signal’s occupied bandwidth, shape, and modulation characteristics to identify candidate transmitter types (e.g., Shure Axient Digital, Wisycom, Sennheiser, analog FM, or generic carriers).
+- **Rapid Navigation & Mitigation**: Operators can click any entry in the live Threats Table to snap tracking crosshairs and HUD readouts directly onto the rogue carrier, cycle through active alerts via top-bar steppers, or convert threats into permanent avoidance markers with one click.
 
 ---
 
 ## Core Capabilities
 
-### Real-Time Spectrum Analysis (RTSA)
-- Utilizes Harogic hardware DPX engines to stream high-density persistence spectra at over 100 FPS.
-- Ultra-low latency acquisition reveals transient burts, frequency-hopping transmitters, and brief dropouts invisible to standard sweeping analyzers.
-
-### Multi-Row Folded Spectrogram (Waterfall)
-- Wideband frequency sweeps often compress hundreds of megahertz into a few hundred horizontal screen pixels, obscuring narrow 200 kHz mic signals.
-- fReqon's **Folded Waterfall** splits the sweep into **2, 3, 4, or 8 stacked rows**, effectively multiplying display resolution by the row factor.
-- Each row includes aligned DTV and custom marker bars, frequency ticks, and double-click frequency centering.
-
-### Analog & Digital Demodulation Engine
-- Listen and identify audio carriers directly inside the software.
-- High-fidelity demodulation modes: **AM**, **FM**, **WFM** (broadcast wideband), **LSB**, and **USB**.
-- Bandpass filtering, variable gain control, audio squelch, and low-latency local audio output.
-
-### Zero-Span Time Domain (DET)
-- High-speed pulsed RF analysis and time-domain oscilloscopic burst capture.
-- Analyzes pulse repetition intervals, duty cycles, and burst timing.
-
-### Digital Protocol Analyzers
-- **DECT Analyzer**: Time-slot occupancy matrix, channel activity, and RF frame analysis for DECT 6.0 and European DECT intercoms (Riedel Bolero, Clear-Com FreeSpeak, etc.).
-- **ShowLink & CRMX Analyzer**: Continuous 2.4 GHz channel tracking for Shure ShowLink access points and LumenRadio CRMX wireless DMX fixtures.
-
-### Hardware Multi-Device & Topology Management
-- Single, Diversity, and Split-Sweep multi-unit topologies.
-- Seamless control of USB and Gigabit Ethernet connected Harogic analyzers.
-- Integrated calibration table loading and hardware temperature/fan speed regulation.
+- **Real-Time Spectrum Analysis (RTSA)**: High-speed hardware DPX acquisition streaming dense persistence sweeps at over 150 FPS.
+- **Multi-Row Folded Waterfall**: Splits wideband spans across 2, 3, 4, or 8 rows to preserve critical horizontal pixel density for narrowband wireless channels.
+- **Audio Demodulation Engine**: High-fidelity live demodulation for AM, FM, WFM, LSB, and USB signals with bandpass filtering and low-latency audio playback.
+- **Zero-Span Time Domain (DET)**: High-speed oscilloscope-style burst and pulse repetition analysis.
+- **Digital Intercom & Protocol Analyzers**:
+  - **DECT Analysis**: Timeslot occupancy matrices and channel activity for DECT 6.0 and European wireless intercoms (Riedel Bolero, Clear-Com FreeSpeak).
+  - **ShowLink & CRMX**: Continuous 2.4 GHz monitoring for Shure ShowLink access points and LumenRadio wireless DMX fixtures.
+- **Multi-Device Orchestration**: Manage multiple Harogic analyzers across Single, Diversity, and Split-Sweep topologies over USB or Gigabit Ethernet.
 
 ---
 
@@ -99,7 +70,7 @@ When Intruder Detection is enabled:
 ├── API/                      # Harogic Linux API, SDK drivers, and examples
 ├── CalFile/                  # Hardware calibration tables
 └── docs/                     # Documentation assets and screenshots
-    └── images/               # Repository figures and visual references
+    └── images/               # Visual Tour figures and documentation captures
 ```
 
 ---
