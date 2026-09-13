@@ -2142,13 +2142,16 @@ class MainWindow(QMainWindow):
                 break
         self._update_hud_readout(freq, pwr)
 
-    def load_soundbase_json(self):
-        default_dir = "/home/parallels/Documents/Harogic Projects/Soundbase Resources"
-        if not os.path.exists(default_dir):
-            default_dir = ""
-        fp, _ = QFileDialog.getOpenFileName(
-            self, "Load Soundbase Site Coordination", default_dir, "Soundbase Files (*.sbcoordsite *.json);;All Files (*.*)"
-        )
+    def load_soundbase_json(self, filepath: str = None):
+        if filepath:
+            fp = filepath
+        else:
+            default_dir = "/home/parallels/Documents/Harogic Projects/Soundbase Resources"
+            if not os.path.exists(default_dir):
+                default_dir = ""
+            fp, _ = QFileDialog.getOpenFileName(
+                self, "Load Soundbase Site Coordination", default_dir, "Soundbase Files (*.sbcoordsite *.json);;All Files (*.*)"
+            )
         if fp:
             try:
                 parsed = SoundbaseParser.parse_file(fp)

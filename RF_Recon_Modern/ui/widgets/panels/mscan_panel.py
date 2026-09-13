@@ -159,8 +159,14 @@ class MSCANPanel(QWidget):
 
         # Channel Filter Tree (Site -> Zone -> Group -> Channel)
         self.channel_tree = QTreeWidget()
-        self.channel_tree.setHeaderHidden(True)
-        self.channel_tree.setFixedHeight(180)
+        self.channel_tree.setColumnCount(2)
+        self.channel_tree.setHeaderLabels(["Item / Channel", "Freq (MHz)"])
+        self.channel_tree.setHeaderHidden(False)
+        self.channel_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.channel_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.channel_tree.setColumnWidth(1, 80)
+        self.channel_tree.setIndentation(14)
+        self.channel_tree.setFixedHeight(220)
         self.channel_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #0d1117;
@@ -169,12 +175,24 @@ class MSCANPanel(QWidget):
                 color: #c9d1d9;
                 font-size: 11px;
             }
+            QTreeWidget::item {
+                padding: 2px 2px;
+            }
             QTreeWidget::item:hover {
                 background-color: #161b22;
             }
             QTreeWidget::item:selected {
                 background-color: #1f6feb;
                 color: #ffffff;
+            }
+            QHeaderView::section {
+                background-color: #161b22;
+                color: #8b949e;
+                font-weight: 700;
+                font-size: 10px;
+                border: none;
+                border-bottom: 1px solid #30363d;
+                padding: 3px 4px;
             }
         """)
         self.channel_tree.itemChanged.connect(self._on_tree_item_changed)
@@ -313,39 +331,74 @@ class MSCANPanel(QWidget):
 
         sites = parsed_data.get("sites", [])
         for site in sites:
-            site_item = QTreeWidgetItem(self.channel_tree)
-            site_item.setText(0, site.get("name", "Site"))
+            total_site_ch = sum(len(g.get('carriers', [])) for z in site.get('zones', []) for g in z.get('groups', []))
+            site_item = QTreeWidgetItem([site.get("name", "Site"), f"{total_site_ch} ch"])
             site_item.setFlags(site_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             site_item.setCheckState(0, Qt.CheckState.Checked)
+            s_font = site_item.font(0)
+            s_font.setBold(True)
+            site_item.setFont(0, s_font)
+            site_item.setForeground(0, QBrush(QColor("#f0f6fc")))
+            site_item.setForeground(1, QBrush(QColor("#8b949e")))
+            self.channel_tree.addTopLevelItem(site_item)
 
             for zone in site.get("zones", []):
-                zone_item = QTreeWidgetItem(site_item)
-                zone_item.setText(0, zone.get("name", "Zone"))
+                z_ch_count = sum(len(g.get('carriers', [])) for g in zone.get('groups', []))
+                zone_item = QTreeWidgetItem([zone.get("name", "Zone"), f"{z_ch_count} ch"])
                 zone_item.setFlags(zone_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 zone_item.setCheckState(0, Qt.CheckState.Checked)
+                z_font = zone_item.font(0)
+                z_font.setBold(True)
+                zone_item.setFont(0, z_font)
+                zone_item.setForeground(0, QBrush(QColor("#c9d1d9")))
+                zone_item.setForeground(1, QBrush(QColor("#8b949e")))
+                site_item.addChild(zone_item)
 
                 for group in zone.get("groups", []):
-                    group_item = QTreeWidgetItem(zone_item)
+                    g_color = group.get("color", "#38bdf8")
                     g_name = group.get("name", "Group")
-                    group_item.setText(0, f"{g_name} ({len(group.get('carriers', []))})")
+                    g_carriers = group.get("carriers", [])
+                    group_item = QTreeWidgetItem([g_name, f"{len(g_carriers)} ch"])
                     group_item.setFlags(group_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     group_item.setCheckState(0, Qt.CheckState.Checked)
+                    group_item.setForeground(0, QBrush(QColor(g_color)))
+                    group_item.setForeground(1, QBrush(QColor("#8b949e")))
+                    zone_item.addChild(group_item)
 
-                    for carrier in group.get("carriers", []):
-                        ch_item = QTreeWidgetItem(group_item)
+                    for carrier in g_carriers:
                         ch_name = carrier.get("name", "Mic")
                         f_mhz = carrier.get("freq_mhz", 0.0)
-                        ch_item.setText(0, f"{ch_name} - {f_mhz:.3f} MHz")
+                        c_bw = carrier.get("bandwidth_mhz", 0.2) * 1000.0
+                        c_model = carrier.get("model", "")
+                        c_color = carrier.get("color", g_color)
+
+                        ch_item = QTreeWidgetItem([ch_name, f"{f_mhz:.3f}"])
                         ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                         ch_item.setCheckState(0, Qt.CheckState.Checked)
                         ch_item.setData(0, Qt.ItemDataRole.UserRole, carrier)
+                        ch_item.setForeground(0, QBrush(QColor(c_color)))
+                        ch_item.setForeground(1, QBrush(QColor("#f0f6fc")))
+
+                        tooltip = (
+                            f"Channel: {ch_name}\n"
+                            f"Frequency: {f_mhz:.3f} MHz\n"
+                            f"Bandwidth: {c_bw:.0f} kHz\n"
+                            f"Model: {c_model}\n"
+                            f"Group: {g_name}\n"
+                            f"Zone: {zone.get('name', 'Zone')}"
+                        )
+                        ch_item.setToolTip(0, tooltip)
+                        ch_item.setToolTip(1, tooltip)
+                        group_item.addChild(ch_item)
 
         self.channel_tree.expandAll()
         self.channel_tree.blockSignals(False)
         self._update_selected_carriers()
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
-        state = item.checkState(column)
+        if column != 0:
+            return
+        state = item.checkState(0)
         def cascade(parent_item, st):
             for i in range(parent_item.childCount()):
                 child = parent_item.child(i)
