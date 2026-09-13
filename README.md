@@ -26,6 +26,12 @@
 
 ---
 
+### 4. Demodulation Analysis Dashboard
+![Demodulation Dashboard](docs/images/demodulation.png)
+*Figure 4: Real-time Demodulation Analysis Dashboard performing baseband I/Q demodulation (16-QAM shown). Features synchronized Constellation and Eye diagrams, demodulated IF spectrum with 99% OBW/power metrics, real-time EVM/SNR measurements, and decoded symbol/hex bitstream display.*
+
+---
+
 ## Threat Detection & Intruder Alert
 
 fReqon's **Threat Detection & Intruder Alert** system provides automated, real-time protection against uncoordinated and unauthorized RF carriers during live productions:
@@ -35,6 +41,22 @@ fReqon's **Threat Detection & Intruder Alert** system provides automated, real-t
 - **Dynamic Threshold Evaluation**: An interactive threshold line on the spectrum display defines the trip level. Any live RF peak exceeding this threshold that is **not** inside an approved Soundbase mask or active DTV mask is immediately flagged as a potential threat.
 - **Spectral Signature Analysis**: For every flagged threat, the engine analyzes the signal’s occupied bandwidth, shape, and modulation characteristics to identify candidate transmitter types (e.g., Shure Axient Digital, Wisycom, Sennheiser, analog FM, or generic carriers).
 - **Rapid Navigation & Mitigation**: Operators can click any entry in the live Threats Table to snap tracking crosshairs and HUD readouts directly onto the rogue carrier, cycle through active alerts via top-bar steppers, or convert threats into permanent avoidance markers with one click.
+
+---
+
+## Demodulation Analysis Engine
+
+fReqon includes a comprehensive Digital and Analog Demodulation suite, enabling deep signal inspection, modulation verification, and audio monitoring:
+
+- **Digital I/Q Demodulation Schemes**: Hardware I/Q streaming demodulation supporting **QAM** (16-QAM, 64-QAM, 256-QAM), **PSK** (BPSK, QPSK, 8-PSK), **FSK/GFSK**, and **ASK**.
+- **Interactive Tuning & Matched Filters**: Click any carrier directly on the spectrum or waterfall to tune instantly. Select symbol rates (from 100 kBd to multi-MBd), configure Root-Raised Cosine (RRC) matched filter alpha roll-offs, and set channel decimation bandwidths.
+- **Deep Signal Quality Metrics**: Live dashboard displaying **Sync Lock**, **EVM RMS / Peak (%)**, **SNR (dB)**, **Carrier Frequency Offset (kHz)**, **Received Carrier Power (dBm)**, and **99% Occupied Bandwidth (OBW)**.
+- **Visual Signal Diagnostics**:
+  - **Constellation Diagram**: Real-time I/Q scatter plot visualizing symbol clustering and phase noise against ideal target points.
+  - **Eye Diagram (I & Q)**: Synchronized time-domain multi-trace overlay highlighting symbol transition jitter, timing margins, and eye openings.
+  - **Baseband / IF Spectrum**: Centered FFT showing passband flatness, filter boundaries, and spectral leakage.
+  - **Bitstream & Hex Inspector**: Real-time symbol decoder extracting raw bit tables and formatted hex dumps with instant copy-to-clipboard functionality.
+- **Analog Audio Demodulation**: Listen directly to broadcast FM, communications AM, wideband broadcast (WFM), and single-sideband (LSB/USB) transmissions with real-time bandpass filtering and low-latency audio output.
 
 ---
 
