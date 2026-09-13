@@ -105,6 +105,15 @@ python3 RF_Recon_Modern/main.py
 
 ---
 
+## Network & Remote Analyzers
+
+fReqon natively supports Harogic Ethernet network analyzers (e.g., Raspberry Pi Compute Module 5 based Model 67/828) across local subnets:
+- **Subnet Auto-Discovery**: The Connection Dialog queries all local network interfaces and ARP tables to detect remote Harogic devices on ports 5000/9000 with zero manual IP entry required.
+- **Hardware & Firmware Setup Guide**: For embedded analyzer provisioning, bootloader power rail configurations, and daemon stability patches, see the [Harogic Network Analyzer Setup & Fix Guide](docs/hardware/harogic_network_analyzer_fix.md).
+- **Automated Provisioning Tool**: Use [`tools/remote_analyzer/provision_harogic_network_server.py`](tools/remote_analyzer/provision_harogic_network_server.py) to diagnose and configure remote analyzers over SSH.
+
+---
+
 ## License
 
 This project is licensed under the **[Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0)](LICENSE)**.
