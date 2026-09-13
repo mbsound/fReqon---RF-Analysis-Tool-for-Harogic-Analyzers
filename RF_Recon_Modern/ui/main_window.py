@@ -1932,7 +1932,7 @@ class MainWindow(QMainWindow):
             self._jump_to_current_intruder()
 
     def _on_intruder_badge_clicked(self):
-        self.nav_rail.set_active_mode(6) # Switch to Threats Panel
+        self.nav_rail.set_active_mode(7) # Switch to Threats Panel
 
     def _jump_to_current_intruder(self):
         sorted_intruders = sorted(self.intruders.items(), key=lambda kv: kv[1]["power"], reverse=True)
