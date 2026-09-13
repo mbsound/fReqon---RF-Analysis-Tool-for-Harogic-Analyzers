@@ -212,9 +212,9 @@ class ChannelCard(QFrame):
 
     def _update_card_style(self):
         if self.is_dropout:
-            border_css = "border: 1px solid #ef4444;"
+            border_css = "border: 2px solid #ef4444;"
         else:
-            border_css = "border: 1px solid #30363d;"
+            border_css = f"border: 1.5px solid {self.color_hex};"
 
         self.setStyleSheet(f"""
             QFrame#channelCard {{
@@ -223,7 +223,8 @@ class ChannelCard(QFrame):
                 border-radius: 6px;
             }}
             QFrame#channelCard:hover {{
-                border-color: #58a6ff;
+                border: 2px solid {self.color_hex};
+                background-color: #1c2128;
             }}
         """)
 
