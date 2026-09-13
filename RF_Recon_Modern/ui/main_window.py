@@ -761,13 +761,18 @@ class MainWindow(QMainWindow):
         self._last_operating_mode = "SWP"
         if hasattr(self, 'det_panel'):
             self.det_panel.set_active_state(False)
+        if hasattr(self, 'mscan_panel') and (self.mscan_panel.is_scanning or self.mscan_panel.scan_btn.isChecked()):
+            self.mscan_panel.stop_scan()
         if not self.is_connected:
             if self.nav_rail.btn_group.checkedId() == 3:
                 self.viewport_stack.setCurrentIndex(4)
+            elif self.nav_rail.btn_group.checkedId() == 8:
+                self.viewport_stack.setCurrentIndex(5)
             else:
                 self._on_view_mode_changed(self.top_bar.view_mode_combo.currentText())
             return
             
+        self.multi_device_manager.stop_mscan()
         self.multi_device_manager.set_operating_mode("SWP")
         self.apply_frequencies()
         self.apply_amplitude_settings()
@@ -776,6 +781,8 @@ class MainWindow(QMainWindow):
         self.apply_detect_settings()
         if self.nav_rail.btn_group.checkedId() == 3:
             self.viewport_stack.setCurrentIndex(4) # Keep DemodView active
+        elif self.nav_rail.btn_group.checkedId() == 8:
+            self.viewport_stack.setCurrentIndex(5) # Keep MSCANView active
         else:
             self._on_view_mode_changed(self.top_bar.view_mode_combo.currentText())
         self.is_sweeping = True
@@ -815,6 +822,9 @@ class MainWindow(QMainWindow):
         self._on_det_trigger_requested(params)
 
     def _on_nav_mode_changed(self, mode_idx: int):
+        if mode_idx != 8 and hasattr(self, 'mscan_panel') and (self.mscan_panel.is_scanning or self.mscan_panel.scan_btn.isChecked()):
+            self.mscan_panel.stop_scan()
+
         self.panel_stack.setCurrentIndex(mode_idx)
         
         if mode_idx == 0: # RF & Sweep
@@ -1014,6 +1024,7 @@ class MainWindow(QMainWindow):
             self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten, decimate)
             self.top_bar.dev_label.setText(f"Hardware MSCAN: {len(channels)} channels hopping @ {dwell*1000:.1f}ms")
         else:
+            self.multi_device_manager.stop_mscan()
             self.multi_device_manager.set_operating_mode("SWP")
             self.resume_rf_sweep()
 

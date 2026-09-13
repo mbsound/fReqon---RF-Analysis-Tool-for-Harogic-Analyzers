@@ -417,50 +417,92 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
     is_running = False
     consecutive_errors = 0
     last_temp_check_time = 0.0
+
+    def stop_mscan_if_running():
+        nonlocal mscan_running, mscan_profiles_in, mscan_channels
+        if mscan_running:
+            try:
+                dll.MSCAN_Stop(ctypes.pointer(device))
+            except Exception:
+                pass
+            if mscan_profiles_in is not None and len(mscan_channels) > 0:
+                try:
+                    deinit_cnt = ctypes.c_int32(len(mscan_channels))
+                    dll.MSCAN_ProfileDeinit(ctypes.pointer(device), mscan_profiles_in, ctypes.pointer(deinit_cnt))
+                except Exception:
+                    pass
+            mscan_running = False
+            time.sleep(0.015)
+
+    def rearm_swp():
+        nonlocal full_sweep_points, partial_sweep_points, total_hops
+        nonlocal partial_freq_ctypes, partial_spec_ctypes, full_freq_ctypes, full_spec_ctypes
+        nonlocal freq_np, power_np, last_valid_power
+        swp_profile_in.TraceAlign = TraceAlign_TypeDef.AlignToStart
+        status = dll.SWP_Configuration(ctypes.pointer(device), ctypes.pointer(swp_profile_in), ctypes.pointer(swp_profile_out), ctypes.pointer(trace_info))
+        if status != 0:
+            dll.SWP_ProfileDeInit(ctypes.pointer(device), ctypes.pointer(swp_profile_in))
+            swp_profile_in.TraceAlign = TraceAlign_TypeDef.AlignToStart
+            status = dll.SWP_Configuration(ctypes.pointer(device), ctypes.pointer(swp_profile_in), ctypes.pointer(swp_profile_out), ctypes.pointer(trace_info))
+        if status == 0:
+            full_sweep_points = trace_info.FullsweepTracePoints
+            partial_sweep_points = trace_info.PartialsweepTracePoints
+            total_hops = trace_info.TotalHops
+            max_buffer_pts = max(full_sweep_points, partial_sweep_points * total_hops, 32768)
+            partial_freq_ctypes = (ctypes.c_double * max_buffer_pts)()
+            partial_spec_ctypes = (ctypes.c_float * max_buffer_pts)()
+            full_freq_ctypes = (ctypes.c_double * max_buffer_pts)()
+            full_spec_ctypes = (ctypes.c_float * max_buffer_pts)()
+            if trace_info.TraceBinBW_Hz > 0:
+                freq_np = trace_info.StartFreq_Hz + np.arange(full_sweep_points, dtype=np.float64) * trace_info.TraceBinBW_Hz
+            else:
+                freq_np = np.linspace(swp_profile_in.StartFreq_Hz, swp_profile_in.StopFreq_Hz, full_sweep_points)
+            power_np = np.full(full_sweep_points, -120.0, dtype=np.float32)
+            last_valid_power = None
+            data_queue.put(("trace_points", full_sweep_points))
+            data_queue.put(("hw_rbw_updated", (float(swp_profile_out.RBW_Hz), float(swp_profile_out.VBW_Hz))))
+            if abs(swp_profile_out.RefLevel_dBm - swp_profile_in.RefLevel_dBm) > 0.1:
+                data_queue.put(("amplitude_clamped", (float(swp_profile_out.RefLevel_dBm), int(swp_profile_out.Atten))))
+        return status
     
     while True:
         # Check for commands
         try:
             cmd = command_queue.get_nowait()
             if isinstance(cmd, tuple) and cmd[0] == "close":
+                stop_mscan_if_running()
                 break
                 
             if cmd == "stop":
+                stop_mscan_if_running()
                 break
             elif cmd == "start":
+                if current_mode == "SWP" and mscan_running:
+                    stop_mscan_if_running()
+                    rearm_swp()
                 is_running = True
                 consecutive_errors = 0
             elif cmd == "pause":
+                if mscan_running:
+                    stop_mscan_if_running()
                 is_running = False
+            elif cmd == "stop_mscan":
+                stop_mscan_if_running()
+                current_mode = "SWP"
+                rearm_swp()
+                data_queue.put(("status", "MSCAN stopped, returning to Swept Spectrum"))
                 
             elif isinstance(cmd, tuple) and cmd[0] == "set_mode":
                 target_mode, mode_params = cmd[1]
-                current_mode = target_mode.upper()
+                new_mode = target_mode.upper()
+                if new_mode != "MSCAN" and mscan_running:
+                    stop_mscan_if_running()
+                current_mode = new_mode
                 is_running = True
                 consecutive_errors = 0
                 
                 if current_mode == "SWP":
-                    swp_profile_in.TraceAlign = TraceAlign_TypeDef.AlignToStart
-                    status = dll.SWP_Configuration(ctypes.pointer(device), ctypes.pointer(swp_profile_in), ctypes.pointer(swp_profile_out), ctypes.pointer(trace_info))
-                    if status == 0:
-                        full_sweep_points = trace_info.FullsweepTracePoints
-                        partial_sweep_points = trace_info.PartialsweepTracePoints
-                        total_hops = trace_info.TotalHops
-                        max_buffer_pts = max(full_sweep_points, partial_sweep_points * total_hops, 32768)
-                        partial_freq_ctypes = (ctypes.c_double * max_buffer_pts)()
-                        partial_spec_ctypes = (ctypes.c_float * max_buffer_pts)()
-                        full_freq_ctypes = (ctypes.c_double * max_buffer_pts)()
-                        full_spec_ctypes = (ctypes.c_float * max_buffer_pts)()
-                        if trace_info.TraceBinBW_Hz > 0:
-                            freq_np = trace_info.StartFreq_Hz + np.arange(full_sweep_points, dtype=np.float64) * trace_info.TraceBinBW_Hz
-                        else:
-                            freq_np = np.linspace(swp_profile_in.StartFreq_Hz, swp_profile_in.StopFreq_Hz, full_sweep_points)
-                        power_np = np.full(full_sweep_points, -120.0, dtype=np.float32)
-                        last_valid_power = None
-                        data_queue.put(("trace_points", full_sweep_points))
-                        data_queue.put(("hw_rbw_updated", (float(swp_profile_out.RBW_Hz), float(swp_profile_out.VBW_Hz))))
-                        if abs(swp_profile_out.RefLevel_dBm - swp_profile_in.RefLevel_dBm) > 0.1:
-                            data_queue.put(("amplitude_clamped", (float(swp_profile_out.RefLevel_dBm), int(swp_profile_out.Atten))))
+                    rearm_swp()
                     data_queue.put(("status", "Switched to Swept Spectrum (SWP) mode"))
                 elif current_mode == "RTA":
                     data_queue.put(("status", "Switched to Real-Time Spectrum (RTSA) mode"))
@@ -481,6 +523,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"Failed to set fan state: {e}"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "rta_config":
+                stop_mscan_if_running()
                 args = cmd[1]
                 c_freq = args[0]
                 dec_factor = args[1]
@@ -511,6 +554,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"RTA configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "det_config":
+                stop_mscan_if_running()
                 c_freq, dec_factor, r_lvl, trig_src, trig_mode, trig_len = cmd[1]
                 current_mode = "DET"
                 dll.DET_ProfileDeInit(ctypes.pointer(device), ctypes.pointer(det_profile_in))
@@ -530,6 +574,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"DET configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "iqs_config":
+                stop_mscan_if_running()
                 c_freq, dec_factor, r_lvl, trig_src, trig_len, preamp, atten = cmd[1]
                 current_mode = "IQS"
                 dll.IQS_ProfileDeInit(ctypes.pointer(device), ctypes.pointer(iqs_profile_in))
@@ -625,6 +670,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("status", "MSCAN stopped: channel list empty"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "bw_config":
+                stop_mscan_if_running()
                 current_mode = "SWP"
                 rbw_m, rbw_h, vbw_m, vbw_h = cmd[1]
                 current_rbw_mode = rbw_m
@@ -692,6 +738,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"SWP RBW configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "sweep_config":
+                stop_mscan_if_running()
                 current_mode = "SWP"
                 swt_mode, swt_time, trace_points, spur, window = cmd[1]
                 swp_profile_in.SweepTimeMode = swt_mode
@@ -724,6 +771,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"SWP sweep configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "detect_config":
+                stop_mscan_if_running()
                 current_mode = "SWP"
                 detector, trace_detector = cmd[1]
                 swp_profile_in.Detector = detector
@@ -752,6 +800,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"SWP detector configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "config":
+                stop_mscan_if_running()
                 current_mode = "SWP"
                 start_f, stop_f, r_level, att, pamp, if_agc, ifagc_tgt, ifagc_per, if_o = cmd[1]
                 dll.SWP_ProfileDeInit(ctypes.pointer(device), ctypes.pointer(swp_profile_in))
@@ -1066,8 +1115,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
             time.sleep(0.01)
             
     try:
-        if current_mode == "MSCAN" and mscan_running:
-            dll.MSCAN_Stop(ctypes.pointer(device))
+        stop_mscan_if_running()
         dll.Device_Close(ctypes.pointer(device))
     except Exception:
         pass
@@ -1213,7 +1261,7 @@ class DeviceController(QObject):
             self.process = None
 
         self.command_queue = multiprocessing.Queue()
-        self.data_queue = multiprocessing.Queue(maxsize=4)
+        self.data_queue = multiprocessing.Queue(maxsize=64)
         
         self.process = multiprocessing.Process(
             target=hardware_process,
@@ -1468,6 +1516,10 @@ class DeviceController(QObject):
     def configure_mscan(self, channels: list, dwell_time: float = 0.001, detector: int = 1, ref_level: float = 0.0, preamp: int = 0, atten: int = 0, decimate: int = 256):
         if self.command_queue:
             self.command_queue.put(("mscan_config", (channels, dwell_time, detector, ref_level, preamp, atten, decimate)))
+
+    def stop_mscan(self):
+        if self.command_queue:
+            self.command_queue.put("stop_mscan")
 
     def set_operating_mode(self, mode_str: str, params: dict = None):
         if self.command_queue:
