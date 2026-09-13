@@ -5,6 +5,7 @@ Spectrogram & Spectrum Viewports, RF Hardware Engine, and Specialized Telemetry 
 """
 
 import sys
+import os
 import math
 import json
 import time
