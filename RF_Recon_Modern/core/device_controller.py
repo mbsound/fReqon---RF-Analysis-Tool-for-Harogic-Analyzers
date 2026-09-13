@@ -579,7 +579,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                         p.CenterFreq_Hz = f_hz
                         p.RefLevel_dBm = float(r_lvl)
                         p.DwellTime = float(dwell_time)
-                        p.DecimateFactor = 1
+                        p.DecimateFactor = 64
                         p.FFTSize = 512
                         p.DetectCount = 1
                         p.Detector = det_enum
@@ -1018,7 +1018,10 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                         if pts > 0:
                             raw_u8 = np.frombuffer(mscan_spec_buf, dtype=np.uint8, count=pts)
                             spec_dbm = raw_u8.astype(np.float32) * scale + offset
-                            peak_power = float(np.max(spec_dbm))
+                            # Channel bandwidth window: ±26 bins around center frequency (~200 kHz carrier mask)
+                            center_bin = pts // 2
+                            ch_bins = spec_dbm[max(0, center_bin - 26): min(pts, center_bin + 27)]
+                            peak_power = float(np.max(ch_bins)) if len(ch_bins) > 0 else float(spec_dbm[center_bin])
                         else:
                             peak_power = offset
 
