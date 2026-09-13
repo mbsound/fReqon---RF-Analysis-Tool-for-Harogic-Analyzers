@@ -51,6 +51,7 @@ from .widgets.panels.dect_panel import DECTPanel
 from .widgets.panels.showlink_panel import ShowLinkPanel
 from .widgets.panels.threats_panel import ThreatsPanel, NumericTableWidgetItem
 from core.demod_engine import DemodEngine, DemodResult
+from core.soundbase_parser import SoundbaseParser
 
 from .dialogs.cal_dialogs import CalibrationManagerDialog, MissingCalDialog, DragDropCalDialog, ClearCalDialog
 from .dialogs.connection_dialog import ConnectionDialog
@@ -421,6 +422,7 @@ class MainWindow(QMainWindow):
         self.threats_panel.addIntruderToMarkersClicked.connect(self._add_intruders_to_markers)
         self.threats_panel.loadSoundbaseClicked.connect(self.load_soundbase_json)
         self.threats_panel.markerItemChanged.connect(self._on_marker_tree_item_changed)
+        self.threats_panel.carrierSelected.connect(self._on_soundbase_carrier_selected)
 
     def _init_state(self):
         # Active regional presets & channels
@@ -2019,21 +2021,49 @@ class MainWindow(QMainWindow):
         for f, info in self.intruders.items():
             item = QTreeWidgetItem([f"Threat: {f:.3f} MHz", f"{info['power']:.1f} dBm"])
             item.setCheckState(0, Qt.CheckState.Checked)
+            item.setData(0, Qt.ItemDataRole.UserRole, float(f))
             self.threats_panel.markers_tree.addTopLevelItem(item)
 
     def _on_marker_tree_item_changed(self, item, col):
-        pass
+        if col != 0:
+            return
+        def update_item_masks(node):
+            c_id = node.data(0, Qt.ItemDataRole.UserRole + 1)
+            if c_id is not None:
+                is_checked = (node.checkState(0) == Qt.CheckState.Checked)
+                self.spectrum_view.set_soundbase_mask_visible(str(c_id), is_checked)
+            for i in range(node.childCount()):
+                update_item_masks(node.child(i))
+
+        update_item_masks(item)
+
+    def _on_soundbase_carrier_selected(self, freq: float):
+        self.spectrum_view.v_line.setPos(freq)
+        self.spectrum_view.v_line.show()
+        self.waterfall_view.v_line.setPos(freq)
+        self.waterfall_view.v_line.show()
+        pwr = -85.0
+        for f_key, info in self.intruders.items():
+            if abs(f_key - freq) < 0.10:
+                pwr = info.get("power", -85.0)
+                break
+        self._update_hud_readout(freq, pwr)
 
     def load_soundbase_json(self):
+        default_dir = "/home/parallels/Documents/Harogic Projects/Soundbase Resources"
+        if not os.path.exists(default_dir):
+            default_dir = ""
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Load Soundbase Site Coordination", "", "Soundbase Files (*.sbcoordsite *.json);;All Files (*.*)"
+            self, "Load Soundbase Site Coordination", default_dir, "Soundbase Files (*.sbcoordsite *.json);;All Files (*.*)"
         )
         if fp:
             try:
-                with open(fp, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                channels = data.get("channels", data.get("frequencies", []))
-                self.threats_panel.set_soundbase_active(Path(fp).name, len(channels))
+                parsed = SoundbaseParser.parse_file(fp)
+                carriers = parsed.get("all_carriers", [])
+                self.spectrum_view.set_soundbase_masks(carriers)
+                self.threats_panel.populate_soundbase_tree(parsed)
+                site_name = parsed["sites"][0]["name"] if parsed.get("sites") else Path(fp).stem
+                self.threats_panel.set_soundbase_active(site_name, len(carriers))
             except Exception as e:
                 QMessageBox.warning(self, "Import Notice", f"Failed to parse Soundbase file: {e}")
 
