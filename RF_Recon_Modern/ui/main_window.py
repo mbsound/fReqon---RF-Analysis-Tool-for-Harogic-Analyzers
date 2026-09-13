@@ -1014,7 +1014,7 @@ class MainWindow(QMainWindow):
             params = self.mscan_panel.get_params()
             channels = params.get("channels", [])
             if not channels:
-                QMessageBox.information(self, "Rapid Channel Monitoring", "Please load a Soundbase coordination file or select channels to monitor.")
+                QMessageBox.information(self, "Rapid Channel Monitor", "Please load a Soundbase coordination file or select channels to monitor.")
                 self.mscan_panel.scan_btn.setChecked(False)
                 self.mscan_panel._update_scan_btn_style()
                 return

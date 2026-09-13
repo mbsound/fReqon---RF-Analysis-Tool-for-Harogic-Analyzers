@@ -18,7 +18,7 @@ class NavRail(QWidget):
     MODES = [
         ("RF & Sweep", "RF hardware parameters, wide sweep ranges, and multi-row waterfall"),
         ("Threats & Markers", "Intruder alerts, Soundbase JSON and custom markers"),
-        ("Rapid Channel Monitoring", "Ultra-fast discrete channel hopping across Soundbase coordinated carriers"),
+        ("Rapid Channel Monitor", "Ultra-fast discrete channel hopping across Soundbase coordinated carriers"),
         ("Real-Time (RTSA)", "Real-Time Spectrum Analysis with 2D persistence density heatmap and 100% POI"),
         ("Zero-Span (DET)", "High-rate time-domain Power vs. Time oscilloscope and TDMA burst analysis"),
         ("Demodulation", "Digital signal demodulation (ASK, FSK, PSK, QAM), constellation, eye diagram, bit table"),
