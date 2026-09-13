@@ -148,7 +148,14 @@ class MultiDeviceManager(QObject):
         if slot and slot.is_connected:
             slot.controller.configure_mscan(channels, dwell_time, detector, ref_level, preamp, atten, decimate)
 
+    def stop_mscan(self):
+        for slot in self.slots.values():
+            if slot.is_connected:
+                slot.controller.stop_mscan()
+
     def set_operating_mode(self, mode_str: str, params: dict = None):
+        if mode_str.upper() != "MSCAN":
+            self.stop_mscan()
         slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")
         if slot and slot.is_connected:
             slot.controller.set_operating_mode(mode_str, params)
