@@ -44,7 +44,7 @@ class MSCANPanel(QWidget):
         outer_layout.addWidget(scroll)
 
         # --- 1. PRIMARY SCAN ACTION & TELEMETRY ---
-        self.scan_btn = QPushButton("Start Channel Scan (MSCAN)")
+        self.scan_btn = QPushButton("Start Rapid Channel Monitoring")
         self.scan_btn.setObjectName("triggerBtn")
         self.scan_btn.setFixedHeight(36)
         self.scan_btn.setCheckable(True)
@@ -216,7 +216,7 @@ class MSCANPanel(QWidget):
 
         sb_layout.addLayout(btn_row)
 
-        self.channel_summary_lbl = QLabel("0 / 0 Channels Selected for MSCAN")
+        self.channel_summary_lbl = QLabel("0 / 0 Channels Selected for Monitoring")
         self.channel_summary_lbl.setStyleSheet("color: #10b981; font-size: 10px; font-weight: 600;")
         sb_layout.addWidget(self.channel_summary_lbl)
 
@@ -266,7 +266,7 @@ class MSCANPanel(QWidget):
 
     def _update_scan_btn_style(self):
         if self.scan_btn.isChecked():
-            self.scan_btn.setText("Scanning Active (Stop MSCAN)")
+            self.scan_btn.setText("Monitoring Active (Stop)")
             self.scan_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #238636;
@@ -281,7 +281,7 @@ class MSCANPanel(QWidget):
                 }
             """)
         else:
-            self.scan_btn.setText("Start Channel Scan (MSCAN)")
+            self.scan_btn.setText("Start Rapid Channel Monitoring")
             self.scan_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #1f6feb;
@@ -435,7 +435,7 @@ class MSCANPanel(QWidget):
         self.selected_carriers = selected
         total = len(self.carriers)
         count = len(selected)
-        self.channel_summary_lbl.setText(f"{count} / {total} Channels Selected for MSCAN")
+        self.channel_summary_lbl.setText(f"{count} / {total} Channels Selected for Monitoring")
         self.channelsSelectionChanged.emit(self.selected_carriers)
         if self.is_scanning:
             self._emit_params_changed()

@@ -43,7 +43,7 @@ class ChannelCard(QFrame):
 
         self.setObjectName("channelCard")
         self.setFixedHeight(125)
-        self.setMinimumWidth(210)
+        self.setMinimumWidth(140)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self._init_ui()
@@ -254,7 +254,7 @@ class MSCANView(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
-        lbl_title = QLabel("HARDWARE DISCRETE CHANNEL SCAN (MSCAN)")
+        lbl_title = QLabel("RAPID CHANNEL MONITORING")
         lbl_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #38bdf8; letter-spacing: 0.5px;")
         top_bar.addWidget(lbl_title)
 
@@ -397,13 +397,11 @@ class MSCANView(QWidget):
             self.last_cycle_time = now
 
     def _reflow_grid(self):
-        """Dynamically computes number of columns based on scroll viewport width and lays out cards."""
+        """Lays out cards in a consistent 5-column grid across the viewport."""
         if not self.channel_cards:
             return
 
-        vp_w = max(250, self.grid_scroll.viewport().width() - 20)
-        col_width = 240
-        num_cols = max(1, vp_w // col_width)
+        num_cols = 5
 
         # Detach items from layout before placing in new grid positions
         while self.grid_layout.count():
