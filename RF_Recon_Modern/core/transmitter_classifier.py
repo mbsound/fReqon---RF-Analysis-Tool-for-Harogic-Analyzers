@@ -1,11 +1,22 @@
 """
 transmitter_classifier.py - Automatic Transmitter Signature Classification & RF Fingerprinting Engine
 Analyzes physical layer occupied bandwidth, spectral shape factors, subcarriers/pilot tones,
-and modulation features to identify unknown RF carriers (Shure Axient Digital, ADPSM modes,
-Sennheiser Spectera WMAS, PSM1000, D6000, Wisycom, Sony DWX, Lectrosonics, DTV, etc.).
+and modulation features to identify unknown RF carriers:
+- Shure PSM 1000 (P10T analog FM stereo IEM with 19 kHz pilot)
+- Shure Axient Digital PSM (ADPSM: Narrowband Digital & Multichannel Wideband WMAS)
+- Shure Axient Digital (AD1/AD2/ADX: Standard 350 kHz & High Density 135 kHz)
+- Sennheiser Digital 6000 / 9000 (Intermod-free 400 kHz digital pedestal)
+- Sennheiser Spectera (6/8 MHz Wideband WMAS OFDM block)
+- Wisycom MTK952 / MTK982 (Wide dynamic deviation stereo FM)
+- Sony UWP-D Series (Digital Processing FM with 32.382 kHz tone squelch)
+- Sennheiser evolution wireless G3/G4 (Analog FM with 32.768 kHz tone squelch)
+- Shure UHF-R / ULX (Analog FM with 32.000 kHz tone squelch)
+- Wisycom MTP (Narrowband FM ~100 kHz)
+- Broadcast DTV (ATSC 1.0 pilot tone at Lower Edge + 309.44 kHz)
 """
 
 import numpy as np
+from scipy.interpolate import interp1d
 
 class TransmitterClassifier:
     """
@@ -29,11 +40,18 @@ class TransmitterClassifier:
             "details": str
         }
         """
+        if freq_mhz_array is None or power_dbm_array is None:
+            return TransmitterClassifier._unknown_result(peak_freq_mhz, peak_power_dbm)
+
         if len(freq_mhz_array) < 10 or len(power_dbm_array) < 10:
             return TransmitterClassifier._unknown_result(peak_freq_mhz, peak_power_dbm)
 
-        freqs = np.asarray(freq_mhz_array)
-        powers = np.asarray(power_dbm_array)
+        freqs = np.asarray(freq_mhz_array, dtype=np.float64)
+        powers = np.asarray(power_dbm_array, dtype=np.float64)
+
+        # Ensure freqs are in MHz (if in Hz, convert)
+        if len(freqs) > 0 and freqs[0] > 1e5:
+            freqs = freqs / 1e6
 
         # Check dynamic range: must be an actual signal rising above noise
         valid_powers = powers[np.isfinite(powers)]
@@ -42,152 +60,265 @@ class TransmitterClassifier:
             
         p_min = float(np.min(valid_powers))
         p_max = float(np.max(valid_powers))
-        if p_max - p_min < 5.0 or peak_power_dbm < -95.0:
+        if p_max - p_min < 4.0 or peak_power_dbm < -95.0:
             return TransmitterClassifier._unknown_result(peak_freq_mhz, peak_power_dbm)
 
-        # Slice a window around the peak
-        # For wideband WMAS / DTV check, slice +/- 5.0 MHz; for narrowband, focus locally
-        window_mask = (freqs >= peak_freq_mhz - 5.5) & (freqs <= peak_freq_mhz + 5.5)
-        if not np.any(window_mask):
-            return TransmitterClassifier._unknown_result(peak_freq_mhz, peak_power_dbm)
+        # ---------------------------------------------------------------------
+        # 1. Check for Wideband Channels: Sennheiser Spectera vs Broadcast DTV vs ADPSM Wideband
+        # ---------------------------------------------------------------------
+        wb_mask = (freqs >= peak_freq_mhz - 5.5) & (freqs <= peak_freq_mhz + 5.5)
+        if np.sum(wb_mask) >= 20:
+            f_wb = freqs[wb_mask]
+            p_wb = powers[wb_mask]
+            wide_result = TransmitterClassifier._check_wideband_wmas_or_dtv(
+                f_wb, p_wb, peak_freq_mhz, peak_power_dbm, region
+            )
+            if wide_result is not None:
+                return wide_result
 
-        f_win = freqs[window_mask]
-        p_win = powers[window_mask]
-
-        # 1. Check for Wideband 6.0 MHz (US) or 8.0 MHz (EU) Channels: Sennheiser Spectera vs Broadcast DTV
-        wide_result = TransmitterClassifier._check_wideband_wmas_or_dtv(f_win, p_win, peak_freq_mhz, peak_power_dbm, region)
-        if wide_result:
-            return wide_result
-
-        # Narrowband slice: +/- 1.2 MHz around peak
-        nb_mask = (f_win >= peak_freq_mhz - 1.2) & (f_win <= peak_freq_mhz + 1.2)
-        f_nb = f_win[nb_mask]
-        p_nb = p_win[nb_mask]
+        # ---------------------------------------------------------------------
+        # 2. Narrowband Slice & Sub-Bin Interpolation (+/- 1.2 MHz around peak)
+        # ---------------------------------------------------------------------
+        nb_mask = (freqs >= peak_freq_mhz - 1.2) & (freqs <= peak_freq_mhz + 1.2)
+        f_nb = freqs[nb_mask]
+        p_nb = powers[nb_mask]
 
         if len(f_nb) < 5:
             return TransmitterClassifier._unknown_result(peak_freq_mhz, peak_power_dbm)
 
-        # 2. Extract Key Physical Metrics (OBW -3dB, -10dB, -20dB, Shape Factor)
-        metrics = TransmitterClassifier._extract_rf_metrics(f_nb, p_nb, peak_freq_mhz, peak_power_dbm)
-        obw_3db = metrics["obw_3db_khz"]
-        obw_20db = metrics["obw_20db_khz"]
-        sf = metrics["shape_factor"]
-        is_digital = sf < 1.85 # Steep digital roll-off vs gradual analog FM bell
+        # Extract continuous physical metrics via 2 kHz spline interpolation
+        metrics, f_fine, p_fine = TransmitterClassifier._extract_rf_metrics_interpolated(
+            f_nb, p_nb, peak_freq_mhz, peak_power_dbm
+        )
 
         # 3. Detect Ultrasonic Pilot Tones & Subcarrier Peaks
-        pilot_info = TransmitterClassifier._detect_subcarriers(f_nb, p_nb, peak_freq_mhz, peak_power_dbm)
+        pilot_info = TransmitterClassifier._detect_subcarriers(
+            f_fine, p_fine, peak_freq_mhz, peak_power_dbm
+        )
 
-        # 4. Multi-Dimensional Pattern Match Matrix
+        # 4. Rigorous Digital vs. Analog Decision
+        # True digital carriers (Axient Digital, ADPSM, D6000) have:
+        # - Steep Nyquist/RRC skirts (shape factor SF_20/3 <= 1.50)
+        # - Flat passband top (std of power in central zone <= 1.5 dB)
+        # - High Spectral Flatness Measure (SFM >= 0.52)
+        # - NO analog pilot tones (no 19k stereo pilot, no 32k/32.768k squelch)
+        sf = metrics["shape_factor"]
+        sigma_top = metrics.get("sigma_top", 3.0)
+        sfm = metrics.get("sfm", 0.3)
+        has_analog_pilot = (
+            pilot_info["has_stereo_iem_19k"] or
+            pilot_info["has_senn_32768k"] or
+            pilot_info["has_shure_32k"] or
+            pilot_info["has_sony_32382k"]
+        )
+
+        is_digital = bool(
+            (sf <= 1.50) and
+            (sigma_top <= 1.55) and
+            (sfm >= 0.52) and
+            not has_analog_pilot
+        )
+
+        # 5. Multi-Dimensional Pattern Match Matrix
         return TransmitterClassifier._match_signature(
             peak_freq_mhz, peak_power_dbm, metrics, is_digital, pilot_info, region
         )
 
     @staticmethod
-    def _extract_rf_metrics(freqs, powers, peak_f, peak_p):
+    def _extract_rf_metrics_interpolated(f_slice, p_slice, peak_f, peak_p):
         """
-        Calculates -3 dB, -10 dB, -20 dB Occupied Bandwidths, Shape Factor,
-        Spectral Flatness Measure (SFM), and Crest Factor (PAPR).
+        Interpolates narrowband slice to a fine 2 kHz grid to eliminate
+        FFT bin-spacing quantization errors. Computes true continuous OBW,
+        shape factor, passband flatness, and PAPR.
         """
-        # Find points exceeding thresholds
-        m3_mask = powers >= (peak_p - 3.0)
-        m10_mask = powers >= (peak_p - 10.0)
-        m20_mask = powers >= (peak_p - 20.0)
+        valid = np.isfinite(p_slice)
+        f_clean = f_slice[valid]
+        p_clean = p_slice[valid]
 
-        obw_3db_khz = (freqs[m3_mask][-1] - freqs[m3_mask][0]) * 1000.0 if np.any(m3_mask) else 50.0
-        obw_10db_khz = (freqs[m10_mask][-1] - freqs[m10_mask][0]) * 1000.0 if np.any(m10_mask) else 100.0
-        obw_20db_khz = (freqs[m20_mask][-1] - freqs[m20_mask][0]) * 1000.0 if np.any(m20_mask) else 200.0
+        if len(f_clean) < 4:
+            return {
+                "obw_3db_khz": 100.0,
+                "obw_6db_khz": 150.0,
+                "obw_10db_khz": 180.0,
+                "obw_20db_khz": 240.0,
+                "shape_factor": 2.4,
+                "sigma_top": 3.0,
+                "sfm": 0.3,
+                "papr_db": 1.0
+            }, f_clean, p_clean
 
-        # Prevent div zero
+        # Estimate local noise floor from outer skirts (|f - peak_f| > 0.6 MHz)
+        outer_mask = np.abs(f_clean - peak_f) >= 0.6
+        if np.any(outer_mask):
+            p_floor = float(np.median(p_clean[outer_mask]))
+        else:
+            p_floor = float(np.min(p_clean))
+
+        # Uniform 2 kHz fine grid across slice span
+        f_span = f_clean[-1] - f_clean[0]
+        num_points = max(200, int(f_span / 0.002))
+        f_fine = np.linspace(f_clean[0], f_clean[-1], num_points)
+
+        try:
+            interp = interp1d(f_clean, p_clean, kind='cubic', fill_value='extrapolate')
+            p_fine = interp(f_fine)
+        except Exception:
+            p_fine = np.interp(f_fine, f_clean, p_clean)
+
+        # Continuous crossing widths
+        m3_mask = p_fine >= (peak_p - 3.0)
+        m6_mask = p_fine >= (peak_p - 6.0)
+        m10_mask = p_fine >= (peak_p - 10.0)
+
+        # Bound -20 dB above local noise floor so floor doesn't inflate bandwidth
+        level_20 = max(peak_p - 20.0, p_floor + 2.5)
+        m20_mask = p_fine >= level_20
+
+        obw_3db_khz = (f_fine[m3_mask][-1] - f_fine[m3_mask][0]) * 1000.0 if np.any(m3_mask) else 40.0
+        obw_6db_khz = (f_fine[m6_mask][-1] - f_fine[m6_mask][0]) * 1000.0 if np.any(m6_mask) else 70.0
+        obw_10db_khz = (f_fine[m10_mask][-1] - f_fine[m10_mask][0]) * 1000.0 if np.any(m10_mask) else 120.0
+        obw_20db_khz = (f_fine[m20_mask][-1] - f_fine[m20_mask][0]) * 1000.0 if np.any(m20_mask) else 200.0
+
+        # Prevent divide-by-zero
         obw_3db_khz = max(30.0, obw_3db_khz)
         shape_factor = obw_20db_khz / obw_3db_khz
 
-        # Convert passband power from dBm to linear Watts for statistical analysis
-        lin_powers = 10.0 ** (powers[m10_mask] / 10.0) if np.any(m10_mask) else np.array([1.0])
-        
-        # Crest Factor / PAPR (Peak-to-Average Power Ratio in dB)
-        p_peak = np.max(lin_powers)
-        p_avg = np.mean(lin_powers)
-        papr_db = 10.0 * np.log10(max(1e-12, p_peak / max(1e-12, p_avg)))
+        # Passband Top Curvature: Standard deviation across central 50% of -3 dB region
+        half_zone = max(0.015, (obw_3db_khz / 2000.0) * 0.5)
+        top_mask = np.abs(f_fine - peak_f) <= half_zone
+        if np.sum(top_mask) >= 3:
+            sigma_top = float(np.std(p_fine[top_mask]))
+        else:
+            sigma_top = 2.5
 
-        # Spectral Flatness Measure (SFM = Geometric Mean / Arithmetic Mean)
-        # SFM near 1.0 indicates flat multi-carrier OFDM; lower indicates single-carrier or analog peak
-        log_mean = np.mean(np.log(np.maximum(1e-12, lin_powers)))
-        geo_mean = np.exp(log_mean)
-        arith_mean = np.maximum(1e-12, np.mean(lin_powers))
-        sfm = float(geo_mean / arith_mean)
+        # Spectral Flatness Measure (SFM) over -10 dB region
+        passband_powers = p_fine[m10_mask] if np.any(m10_mask) else p_fine[m3_mask]
+        if len(passband_powers) >= 3:
+            lin_powers = 10.0 ** (passband_powers / 10.0)
+            log_mean = np.mean(np.log(np.maximum(1e-12, lin_powers)))
+            geo_mean = np.exp(log_mean)
+            arith_mean = np.maximum(1e-12, np.mean(lin_powers))
+            sfm = float(geo_mean / arith_mean)
 
-        return {
+            p_peak = np.max(lin_powers)
+            papr_db = 10.0 * np.log10(max(1e-12, p_peak / arith_mean))
+        else:
+            sfm = 0.3
+            papr_db = 1.0
+
+        metrics = {
             "obw_3db_khz": obw_3db_khz,
+            "obw_6db_khz": obw_6db_khz,
             "obw_10db_khz": obw_10db_khz,
             "obw_20db_khz": obw_20db_khz,
             "shape_factor": shape_factor,
+            "sigma_top": sigma_top,
+            "sfm": sfm,
             "papr_db": papr_db,
-            "sfm": sfm
+            "p_floor": p_floor
         }
+        return metrics, f_fine, p_fine
 
     @staticmethod
-    def _detect_subcarriers(freqs, powers, peak_f, peak_p):
+    def _detect_subcarriers(f_fine, p_fine, peak_f, peak_p):
         """
-        Scans for prominent localized pilot tone spikes (19 kHz stereo, 32.0 kHz Shure, 32.768 kHz Sennheiser).
+        Analyzes the fine interpolated spectrum for continuous pilot tones and tone squelch:
+        - 19.0 kHz (+/- 3.5 kHz): Analog FM Stereo IEM Pilot Tone (PSM 1000, PSM 900, ew IEM)
+        - 32.382 kHz (+/- 3.0 kHz): Sony UWP-D Tone Squelch
+        - 32.768 kHz (+/- 3.0 kHz): Sennheiser G3/G4 Tone Squelch
+        - 32.000 kHz (+/- 2.5 kHz): Shure UHF-R / ULX Tone Squelch
         """
-        df_khz = (freqs - peak_f) * 1000.0
-        
-        def has_localized_spike(target_khz, tol_khz=2.5, prom_db=2.5):
-            idx_target = np.where(np.abs(df_khz - target_khz) <= tol_khz)[0]
-            if len(idx_target) == 0:
-                return False
-            
-            p_target = np.max(powers[idx_target])
-            # Check surrounding baseline at target +/- (4 to 10 kHz)
-            idx_low = np.where((df_khz >= target_khz - 10.0) & (df_khz <= target_khz - 4.0))[0]
-            idx_high = np.where((df_khz >= target_khz + 4.0) & (df_khz <= target_khz + 10.0))[0]
-            
-            if len(idx_low) > 0 and len(idx_high) > 0:
-                baseline = (np.mean(powers[idx_low]) + np.mean(powers[idx_high])) / 2.0
-                if p_target >= baseline + prom_db and p_target >= peak_p - 25.0:
-                    return True
-            return False
+        if len(f_fine) < 20:
+            return {
+                "has_stereo_iem_19k": False,
+                "has_sony_32382k": False,
+                "has_senn_32768k": False,
+                "has_shure_32k": False
+            }
 
-        has_19k = has_localized_spike(19.0) or has_localized_spike(-19.0)
-        has_32k = has_localized_spike(32.0) or has_localized_spike(-32.0)
-        has_32768k = has_localized_spike(32.768) or has_localized_spike(-32.768)
+        df_khz = (f_fine - peak_f) * 1000.0
+
+        def check_subcarrier_energy(target_khz, tol_khz=3.5, delta_khz=9.0, min_prom_db=1.2):
+            hits = 0
+            for sign in (-1.0, 1.0):
+                center = sign * target_khz
+                idx_target = np.where(np.abs(df_khz - center) <= tol_khz)[0]
+                if len(idx_target) == 0:
+                    continue
+
+                best_i = idx_target[np.argmax(p_fine[idx_target])]
+                f_p = df_khz[best_i]
+                p_p = p_fine[best_i]
+
+                # Symmetric baselines at +/- delta_khz eliminate the carrier's natural slope
+                idx_l = np.argmin(np.abs(df_khz - (f_p - delta_khz)))
+                idx_r = np.argmin(np.abs(df_khz - (f_p + delta_khz)))
+                baseline = 0.5 * (p_fine[idx_l] + p_fine[idx_r])
+                prom = p_p - baseline
+
+                if prom >= min_prom_db and p_p >= peak_p - 30.0:
+                    hits += 1
+
+            return hits >= 1
+
+        has_19k = check_subcarrier_energy(19.0, tol_khz=3.5, delta_khz=8.0, min_prom_db=0.8)
+        has_sony_32k = check_subcarrier_energy(32.382, tol_khz=3.5, delta_khz=9.0, min_prom_db=0.8)
+        has_senn_32k = check_subcarrier_energy(32.768, tol_khz=3.0, delta_khz=9.0, min_prom_db=0.8)
+        has_shure_32k = check_subcarrier_energy(32.000, tol_khz=2.5, delta_khz=9.0, min_prom_db=0.8)
 
         return {
             "has_stereo_iem_19k": has_19k,
-            "has_shure_32k": has_32k,
-            "has_senn_32768k": has_32768k
+            "has_sony_32382k": has_sony_32k,
+            "has_senn_32768k": has_senn_32k,
+            "has_shure_32k": has_shure_32k
         }
 
     @staticmethod
     def _check_wideband_wmas_or_dtv(freqs, powers, peak_f, peak_p, region):
         """
-        Differentiates Sennheiser Spectera (WMAS Wideband) from Broadcast DTV.
-        ATSC 1.0 DTV has a sharp pilot carrier at (Lower Edge + 309.44 kHz).
-        Sennheiser Spectera lacks this ATSC pilot tone.
+        Differentiates wideband channels:
+        - Broadcast DTV (6/8 MHz with ATSC 1.0 Pilot at Lower Edge + 309.44 kHz)
+        - Sennheiser Spectera WMAS (6/8 MHz continuous bidirectional OFDM block)
+        - Shure Axient Digital PSM Multichannel Wideband WMAS Mode (500-750 kHz or 1.0-2.5 MHz)
         """
-        # Look for wideband pedestal across +/- 15 dB from peak
         valid_p = powers[np.isfinite(powers)]
-        if len(valid_p) < 10 or (np.max(valid_p) - np.min(valid_p) < 6.0):
+        if len(valid_p) < 15 or (np.max(valid_p) - np.min(valid_p) < 8.0):
             return None
 
-        m15_mask = powers >= (peak_p - 15.0)
-        if not np.any(m15_mask):
+        p_floor = float(np.percentile(valid_p, 20))
+        snr = peak_p - p_floor
+        if snr < 10.0:
             return None
 
-        span_mhz = freqs[m15_mask][-1] - freqs[m15_mask][0]
-        
-        # Check if energy spans a full 4.2 MHz - 8.5 MHz channel block
-        if span_mhz >= 4.2:
-            lower_edge_f = freqs[m15_mask][0]
-            
-            # Look for ATSC 1.0 Pilot Tone (+309.44 kHz from lower edge)
+        block_threshold = max(peak_p - 12.0, p_floor + 6.0)
+        in_block = powers >= block_threshold
+
+        if not np.any(in_block):
+            return None
+
+        peak_idx = int(np.argmin(np.abs(freqs - peak_f)))
+        if not in_block[peak_idx]:
+            return None
+
+        left = peak_idx
+        while left > 0 and in_block[left - 1]:
+            left -= 1
+
+        right = peak_idx
+        while right < len(in_block) - 1 and in_block[right + 1]:
+            right += 1
+
+        contiguous_span_mhz = freqs[right] - freqs[left]
+
+        # Case 1: Full 4.5 MHz - 8.5 MHz Block -> Broadcast DTV vs Sennheiser Spectera WMAS
+        if contiguous_span_mhz >= 4.5:
+            lower_edge_f = freqs[left]
             atsc_pilot_target = lower_edge_f + 0.30944
             pilot_window = (freqs >= atsc_pilot_target - 0.05) & (freqs <= atsc_pilot_target + 0.05)
             
             has_atsc_pilot = False
             if np.any(pilot_window):
                 pilot_peak = np.max(powers[pilot_window])
-                # In ATSC, pilot rises prominently above average channel flat top (around + 600 kHz to + 2 MHz)
                 surround_window = (freqs >= atsc_pilot_target + 0.15) & (freqs <= atsc_pilot_target + 1.5)
                 if np.any(surround_window):
                     surround_avg = np.mean(powers[surround_window])
@@ -198,242 +329,265 @@ class TransmitterClassifier:
                 return {
                     "device": "Broadcast DTV (ATSC 1.0 Pilot)",
                     "category": "Television Broadcast",
-                    "confidence": 95,
-                    "obw_3db_khz": span_mhz * 1000.0,
-                    "obw_20db_khz": (span_mhz + 0.6) * 1000.0,
-                    "shape_factor": 1.15,
+                    "confidence": 96,
+                    "obw_3db_khz": contiguous_span_mhz * 1000.0,
+                    "obw_20db_khz": (contiguous_span_mhz + 0.5) * 1000.0,
+                    "shape_factor": 1.12,
                     "is_digital": True,
                     "color": "#e53935",
                     "details": f"ATSC 1.0 Pilot detected at {atsc_pilot_target:.3f} MHz (+309.4 kHz)"
                 }
             else:
-                # Flat 6/8 MHz block lacking ATSC pilot carrier -> Sennheiser Spectera WMAS
                 return {
                     "device": "Sennheiser Spectera (WMAS Wideband)",
                     "category": "Wideband Multi-Channel Intercom / Mic",
-                    "confidence": 92,
-                    "obw_3db_khz": span_mhz * 1000.0,
-                    "obw_20db_khz": (span_mhz + 0.4) * 1000.0,
-                    "shape_factor": 1.10,
+                    "confidence": 95,
+                    "obw_3db_khz": contiguous_span_mhz * 1000.0,
+                    "obw_20db_khz": (contiguous_span_mhz + 0.4) * 1000.0,
+                    "shape_factor": 1.08,
                     "is_digital": True,
                     "color": "#00e676",
                     "details": "Broadband flat OFDM block (6/8 MHz) without ATSC pilot"
                 }
 
-        # Check for Shure ADPSM Multi-Channel Wideband (0.8 MHz - 2.5 MHz)
-        if 0.8 <= span_mhz < 4.2:
-            return {
-                "device": "Shure ADPSM (Wideband WMAS Mode)",
-                "category": "Digital Multi-Channel IEM",
-                "confidence": 90,
-                "obw_3db_khz": span_mhz * 1000.0,
-                "obw_20db_khz": (span_mhz + 0.3) * 1000.0,
-                "shape_factor": 1.25,
-                "is_digital": True,
-                "color": "#9c27b0",
-                "details": f"Wideband Digital Multi-Channel IEM ({span_mhz:.2f} MHz BW)"
-            }
+        # Case 2: Shure Axient Digital PSM Multichannel Wideband Mode (500 kHz - 2.5 MHz)
+        if 0.50 <= contiguous_span_mhz < 4.5:
+            block_powers = powers[left:right+1]
+            lin_powers = 10.0 ** (block_powers / 10.0)
+            log_mean = np.mean(np.log(np.maximum(1e-12, lin_powers)))
+            geo_mean = np.exp(log_mean)
+            arith_mean = np.maximum(1e-12, np.mean(lin_powers))
+            block_sfm = float(geo_mean / arith_mean)
+
+            if block_sfm >= 0.65:
+                return {
+                    "device": "Shure ADPSM (Wideband WMAS Mode)",
+                    "category": "Digital Multi-Channel IEM",
+                    "confidence": 94,
+                    "obw_3db_khz": contiguous_span_mhz * 1000.0,
+                    "obw_20db_khz": (contiguous_span_mhz + 0.15) * 1000.0,
+                    "shape_factor": 1.15,
+                    "is_digital": True,
+                    "color": "#ab47bc",
+                    "details": f"Axient Digital PSM Multichannel Wideband ({contiguous_span_mhz*1000.0:.0f} kHz | SFM: {block_sfm:.2f})"
+                }
 
         return None
 
     @staticmethod
     def _match_signature(peak_f, peak_p, metrics, is_digital, pilot_info, region):
         """
-        Matches narrowband RF metrics to specific manufacturer transmitter models.
+        Precision matching matrix for:
+        - Shure PSM 1000 (Analog FM Stereo IEM)
+        - Shure Axient Digital PSM (ADPSM: Narrowband Digital Mode)
+        - Shure Axient Digital (AD1/AD2 Standard & High Density)
+        - Sennheiser Digital 6000 / 9000
+        - Wisycom MTK (Interleaved FM Stereo)
+        - Sony UWP-D (Digital Audio Processing FM)
+        - Sennheiser ew G3/G4 (Analog FM)
+        - Shure UHF-R / ULX (Analog FM)
+        - Wisycom MTP (Narrowband FM)
+        - Lectrosonics Digital Hybrid
         """
         obw = metrics["obw_3db_khz"]
+        obw20 = metrics["obw_20db_khz"]
         sf = metrics["shape_factor"]
-        sfm = metrics.get("sfm", 0.5)
-        papr_db = metrics.get("papr_db", 3.0)
+        sfm = metrics.get("sfm", 0.3)
+        papr_db = metrics.get("papr_db", 2.0)
 
-        # ----------------------------------------------------
+        # ---------------------------------------------------------------------
         # 1. DIGITAL TRANSMITTER CLASSIFICATION
-        # ----------------------------------------------------
+        # ---------------------------------------------------------------------
         if is_digital:
-            # A. Shure Axient Digital (High Density Mode: ~125 - 166 kHz)
-            if 100.0 <= obw <= 170.0 and sf <= 1.60:
+            # A. Shure Axient Digital (High Density Mode: ~120 - 165 kHz digital pedestal)
+            if 95.0 <= obw <= 165.0 and sf <= 1.50:
                 return {
                     "device": "Shure Axient Digital (High Density)",
                     "category": "Digital Wireless Mic",
                     "confidence": 96,
                     "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
+                    "obw_20db_khz": obw20,
                     "shape_factor": sf,
                     "is_digital": True,
                     "color": "#00bcd4",
-                    "details": f"High-Density digital pedestal (~135 kHz | SFM: {sfm:.2f})"
+                    "details": f"High-Density digital pedestal ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # B. Shure ADPSM Single Carrier (SC) Narrowband (~180 - 265 kHz)
-            if 170.0 <= obw <= 265.0 and sf <= 1.65 and not pilot_info["has_senn_32768k"]:
-                conf = 94 if sfm < 0.75 else 88
-                return {
-                    "device": "Shure ADPSM (SC Narrowband)",
-                    "category": "Digital IEM / Single Carrier",
-                    "confidence": conf,
-                    "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
-                    "shape_factor": sf,
-                    "is_digital": True,
-                    "color": "#ba68c8",
-                    "details": f"Single-Carrier Digital IEM mode (200 kHz | PAPR: {papr_db:.1f} dB)"
-                }
-
-            # C. Shure ADPSM Standard Digital Narrowband (~265 - 330 kHz)
-            if 265.0 < obw <= 330.0 and sf <= 1.60:
-                conf = 96 if sfm >= 0.70 else 92
+            # B. Shure Axient Digital PSM - Narrowband Digital Mode (~165 - 245 kHz)
+            # Certified under FCC as 181KG7E (Point-to-Point digital IEM pedestal)
+            if 165.0 < obw <= 245.0 and sf <= 1.48:
                 return {
                     "device": "Shure ADPSM (Narrowband Digital)",
                     "category": "Digital In-Ear Monitor",
-                    "confidence": conf,
+                    "confidence": 95,
                     "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
+                    "obw_20db_khz": obw20,
                     "shape_factor": sf,
                     "is_digital": True,
-                    "color": "#ab47bc",
-                    "details": f"Axient Digital PSM Spatial Diversity OFDM (~300 kHz | SFM: {sfm:.2f})"
+                    "color": "#ba68c8",
+                    "details": f"Axient Digital PSM Point-to-Point Digital ({obw:.0f} kHz | SFM: {sfm:.2f})"
                 }
 
-            # D. Shure Axient Digital (Standard Mode: ~350 kHz)
-            if 330.0 < obw <= 385.0 and sf <= 1.55:
+            # C. Shure Axient Digital Mic (Standard Mode: ~250 - 365 kHz, 350KD2E emission)
+            if 250.0 <= obw <= 365.0 and obw20 < 380.0 and sf <= 1.50:
                 return {
                     "device": "Shure Axient Digital (Standard)",
                     "category": "Digital Wireless Mic",
-                    "confidence": 95,
+                    "confidence": 96,
                     "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
+                    "obw_20db_khz": obw20,
                     "shape_factor": sf,
                     "is_digital": True,
                     "color": "#0288d1",
-                    "details": f"Standard Axient Digital QAM profile (~350 kHz | SFM: {sfm:.2f})"
+                    "details": f"Standard Axient Digital QAM profile ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # E. Sennheiser Digital 6000 / 9000 (~385 - 460 kHz)
-            if 385.0 < obw <= 480.0 and sf <= 1.50:
+            # D. Sennheiser Digital 6000 / 9000 (~365 - 470 kHz, 400KD2E emission)
+            if ((335.0 <= obw <= 470.0 and obw20 >= 380.0) or (365.0 < obw <= 470.0)) and sf <= 1.45:
                 return {
                     "device": "Sennheiser Digital 6000/9000",
                     "category": "Digital Wireless Mic",
-                    "confidence": 93,
+                    "confidence": 95,
                     "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
+                    "obw_20db_khz": obw20,
                     "shape_factor": sf,
                     "is_digital": True,
                     "color": "#fbc02d",
-                    "details": "Equidistant Intermod-Free digital plateau (~400 kHz)"
+                    "details": f"Equidistant Intermod-Free digital plateau ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # F. Sony DWX Digital (~360 - 410 kHz)
-            if 355.0 <= obw <= 420.0:
-                return {
-                    "device": "Sony DWX Digital",
-                    "category": "Digital Wireless Mic",
-                    "confidence": 85,
-                    "obw_3db_khz": obw,
-                    "obw_20db_khz": metrics["obw_20db_khz"],
-                    "shape_factor": sf,
-                    "is_digital": True,
-                    "color": "#26a69a",
-                    "details": "Sony DWX digital modulation envelope"
-                }
+            # Generic Digital Fallback
+            return {
+                "device": "Generic Digital Wireless",
+                "category": "Digital Transmitter",
+                "confidence": 75,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": True,
+                "color": "#00acc1",
+                "details": f"Digital Pedestal ({obw:.0f} kHz -3dB | SF: {sf:.2f})"
+            }
 
-        # ----------------------------------------------------
-        # 2. ANALOG FM & HYBRID CLASSIFICATION
-        # ----------------------------------------------------
-        # A. Shure PSM 1000 / Analog Stereo IEM (19 kHz pilot / 38 kHz L-R subcarrier)
-        if pilot_info["has_stereo_iem_19k"] or (180.0 <= obw <= 280.0 and sf >= 2.1):
+        # ---------------------------------------------------------------------
+        # 2. ANALOG FM & HYBRID TRANSMITTER CLASSIFICATION
+        # ---------------------------------------------------------------------
+        # A. Shure PSM 1000 (P10T Analog FM Stereo IEM)
+        is_psm1000 = (
+            pilot_info["has_stereo_iem_19k"] or
+            (160.0 <= obw20 <= 275.0 and sf >= 1.65 and not pilot_info["has_sony_32382k"])
+        )
+        if is_psm1000:
+            confidence = 96 if pilot_info["has_stereo_iem_19k"] else 90
+            pilot_detail = "19 kHz MPX Pilot" if pilot_info["has_stereo_iem_19k"] else "Stereo MPX Envelope"
             return {
                 "device": "Shure PSM 1000 (Stereo IEM)",
                 "category": "Analog FM Stereo In-Ear",
-                "confidence": 94 if pilot_info["has_stereo_iem_19k"] else 86,
+                "confidence": confidence,
                 "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
+                "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#ff9800",
-                "details": "Stereo multiplex subcarriers (19 kHz pilot / 38 kHz L-R)"
+                "details": f"Analog FM Stereo IEM ({pilot_detail} | {obw20:.0f} kHz Carson BW)"
             }
 
-        # B. Sennheiser G3 / G4 (32.768 kHz Tone Squelch)
+        # B. Wisycom MTK952 / MTK982 (Wideband Interleaved Stereo FM)
+        if obw20 >= 275.0 and sf >= 2.1:
+            return {
+                "device": "Wisycom MTK (Interleaved FM)",
+                "category": "Wideband FM Stereo Transmitter",
+                "confidence": 92,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#e91e63",
+                "details": f"Wide dynamic FM stereo deviation ({obw20:.0f} kHz BW | SF: {sf:.2f})"
+            }
+
+        # C. Sony UWP-D (Digital Processing FM)
+        if pilot_info["has_sony_32382k"] or (150.0 <= obw20 <= 215.0 and 1.60 <= sf <= 2.20):
+            confidence = 95 if pilot_info["has_sony_32382k"] else 86
+            return {
+                "device": "Sony UWP-D (Digital Processing FM)",
+                "category": "Hybrid DSP / FM Wireless",
+                "confidence": confidence,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#00897b",
+                "details": "Sony UWP-D Series (DSP companding / 32.382 kHz tone squelch)"
+            }
+
+        # D. Sennheiser evolution wireless G3/G4 / 2000 Series (Analog FM)
         if pilot_info["has_senn_32768k"]:
             return {
                 "device": "Sennheiser G3/G4 (Analog FM)",
                 "category": "Analog Wireless Mic / IEM",
                 "confidence": 96,
                 "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
+                "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#4caf50",
                 "details": "32.768 kHz ultrasonic pilot tone detected"
             }
 
-        # C. Shure UHF-R / ULX-D Analog Pilot (32.000 kHz Tone)
+        # E. Shure UHF-R / ULX (Analog FM)
         if pilot_info["has_shure_32k"]:
             return {
                 "device": "Shure UHF-R / ULX (Analog FM)",
                 "category": "Analog Wireless Mic",
-                "confidence": 93,
+                "confidence": 94,
                 "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
+                "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#03a9f4",
                 "details": "32.000 kHz tone squelch detected"
             }
 
-        # D. Wisycom MTK952 / MTK982 (Wideband Interleaved Stereo)
-        if obw >= 280.0 and sf >= 2.4:
-            return {
-                "device": "Wisycom MTK (Interleaved FM)",
-                "category": "Wideband FM Stereo Transmitter",
-                "confidence": 88,
-                "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
-                "shape_factor": sf,
-                "is_digital": False,
-                "color": "#e91e63",
-                "details": "Wide dynamic FM deviation with stereo subcarrier"
-            }
-
-        # E. Wisycom MTP60 (Narrowband Mode: ~80 - 130 kHz)
-        if obw <= 140.0 and sf >= 1.9:
+        # F. Wisycom MTP60 / MTP40 (Narrowband FM Mode: ~80 - 140 kHz)
+        if obw20 <= 145.0 and sf >= 1.75:
             return {
                 "device": "Wisycom MTP (Narrowband FM)",
                 "category": "Analog Narrowband Wireless Mic",
-                "confidence": 90,
+                "confidence": 91,
                 "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
+                "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#ff5722",
-                "details": "Ultra-narrowband FM profile (~100 kHz)"
+                "details": f"Ultra-narrowband FM profile ({obw20:.0f} kHz BW)"
             }
 
-        # F. Lectrosonics Digital Hybrid (Companded FM envelope)
-        if 160.0 <= obw <= 240.0:
+        # G. Lectrosonics Digital Hybrid Wireless
+        if 160.0 <= obw20 <= 235.0:
             return {
                 "device": "Lectrosonics Digital Hybrid",
                 "category": "Hybrid Digital/FM Wireless",
-                "confidence": 84,
+                "confidence": 85,
                 "obw_3db_khz": obw,
-                "obw_20db_khz": metrics["obw_20db_khz"],
+                "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#795548",
-                "details": "Companded hybrid envelope (~200 kHz)"
+                "details": f"Companded hybrid envelope ({obw20:.0f} kHz BW | SF: {sf:.2f})"
             }
 
-        # Generic Fallback
+        # Generic Analog Fallback
         return {
-            "device": "Generic Digital Wireless" if is_digital else "Generic Analog FM Wireless",
-            "category": "Unknown Transmitter",
+            "device": "Generic Analog FM Wireless",
+            "category": "Analog Transmitter",
             "confidence": 70,
             "obw_3db_khz": obw,
-            "obw_20db_khz": metrics["obw_20db_khz"],
+            "obw_20db_khz": obw20,
             "shape_factor": sf,
-            "is_digital": is_digital,
+            "is_digital": False,
             "color": "#9e9e9e",
-            "details": f"OBW: {obw:.0f} kHz, Shape Factor: {sf:.2f}"
+            "details": f"Analog FM Bell ({obw20:.0f} kHz -20dB | SF: {sf:.2f})"
         }
 
     @staticmethod
