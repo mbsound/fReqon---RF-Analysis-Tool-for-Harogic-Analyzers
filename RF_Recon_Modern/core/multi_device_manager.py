@@ -73,6 +73,7 @@ class MultiDeviceManager(QObject):
     rta_data_ready = pyqtSignal(str, np.ndarray, np.ndarray, np.ndarray, dict) # slot_id, freq, trace, bitmap, info
     det_data_ready = pyqtSignal(str, np.ndarray, np.ndarray, dict) # slot_id, time_ns, power, info
     iqs_data_ready = pyqtSignal(str, np.ndarray, float, dict) # slot_id, iq_complex, sample_rate, info
+    mscan_data_ready = pyqtSignal(str, int, float, float, object, dict) # slot_id, channel_idx, freq_hz, power_dbm, spec_data, info
     temperature_updated = pyqtSignal(str, float) # slot_id, temp_c
     slot_status_changed = pyqtSignal(str, bool, str)  # slot_id, is_connected, status_msg
     slot_info_received = pyqtSignal(str, int, object)  # slot_id, model, uid
@@ -118,6 +119,7 @@ class MultiDeviceManager(QObject):
         c.rta_data_ready.connect(lambda f, t, b, inf, s=slot_id: self.rta_data_ready.emit(s, f, t, b, inf))
         c.det_data_ready.connect(lambda t_ns, p, inf, s=slot_id: self.det_data_ready.emit(s, t_ns, p, inf))
         c.iqs_data_ready.connect(lambda iq, sr, inf, s=slot_id: self.iqs_data_ready.emit(s, iq, sr, inf))
+        c.mscan_data_ready.connect(lambda idx, f, p, s, inf, s_id=slot_id: self.mscan_data_ready.emit(s_id, idx, f, p, s, inf))
         c.temperature_updated.connect(lambda temp, s=slot_id: self.temperature_updated.emit(s, temp))
         c.status_message.connect(lambda msg, s=slot_id: self._on_slot_status(s, msg))
         c.connection_status.connect(lambda conn, s=slot_id: self._on_slot_connection(s, conn))
@@ -140,6 +142,11 @@ class MultiDeviceManager(QObject):
         slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")
         if slot and slot.is_connected:
             slot.controller.configure_iqs(center_freq_hz, decimate_factor, ref_level, trig_src, trig_length, preamp, atten)
+
+    def configure_mscan(self, channels: list, dwell_time: float = 0.001, detector: int = 1, ref_level: float = 0.0, preamp: int = 0, atten: int = 0):
+        slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")
+        if slot and slot.is_connected:
+            slot.controller.configure_mscan(channels, dwell_time, detector, ref_level, preamp, atten)
 
     def set_operating_mode(self, mode_str: str, params: dict = None):
         slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")

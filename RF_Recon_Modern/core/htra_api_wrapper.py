@@ -1012,3 +1012,100 @@ if hasattr(dll, 'ASD_Demodulate_FM'):
 if hasattr(dll, 'ASD_Demodulate_AM'):
     dll.ASD_Demodulate_AM.argtypes = [POINTER(IQStream_TypeDef), POINTER(c_float)]
     dll.ASD_Demodulate_AM.restype = c_int
+
+# ---------------------------------------------------------------------------
+# MSCAN Mode (Stored / Hardware Discrete Channel Scanning) Interfaces
+# ---------------------------------------------------------------------------
+class ProcType_TypeDef(c_int):
+    ProcType_MaxHold = 0x00
+    ProcType_MinHold = 0x01
+    ProcType_Average = 0x02
+
+class IFAGC_TypeDef(c_int):
+    IFAGC_Off = 0x00
+    IFAGC_On = 0x01
+
+class XPPSTrigger_TypeDef(c_int):
+    XPPSTrigger_Off = 0x00
+    XPPSTrigger_On = 0x01
+
+class IQPlayBack_TypeDef(c_int):
+    IQPlayBack_Off = 0x00
+    IQPlayBack_On = 0x01
+
+class MSCAN_Profile_TypeDef(Structure):
+    _fields_ = [
+        ("CenterFreq_Hz", c_double),
+        ("RefLevel_dBm", c_double),
+        ("DwellTime", c_double),
+        ("DecimateFactor", c_uint32),
+        ("FFTSize", c_uint32),
+        ("DetectCount", c_uint32),
+        ("Detector", Detector_TypeDef),
+        ("IFAGC", IFAGC_TypeDef),
+        ("XPPSTrigger", XPPSTrigger_TypeDef),
+        ("IQPlayBack", IQPlayBack_TypeDef),
+        ("Window", Window_TypeDef),
+    ]
+
+class MSCAN_Info_Typedef(Structure):
+    _fields_ = [
+        ("SpectrumFrames", c_int32),
+        ("SpectrumPoints", c_int32),
+        ("IQStreamPoints", c_int32),
+        ("CenterFreq_Hz", c_double),
+        ("Span_Hz", c_double),
+        ("IQSampleRate", c_double),
+    ]
+
+class MSCAN_Data_Typedef(Structure):
+    _fields_ = [
+        ("RepeatIndex", c_int64),
+        ("ElementIndex", c_int32),
+        ("Status", c_int),
+        ("SpectrumFrames", c_uint32),
+        ("SpectrumPoints", c_uint32),
+        ("IQStreamPoints", c_uint32),
+        ("ScaleTodBm", c_float),
+        ("OffsetTodBm", c_float),
+        ("ScaleToV", c_float),
+        ("SpectrumStream", POINTER(c_uint8)),
+        ("IQStream", POINTER(c_int16)),
+        ("Temperature", c_double),
+        ("SysTimeStamp", c_double),
+        ("AbsoluteTimeStamp", c_double),
+        ("Latitude", c_double),
+        ("Longitude", c_double),
+        ("Altitude", c_double),
+        ("SATHealth", c_double),
+        ("RefClkFreqOffset", c_double),
+        ("nsSinceEpoch", c_uint64),
+    ]
+
+if hasattr(dll, 'MSCAN_ProfileDeinit'):
+    dll.MSCAN_ProfileDeinit.argtypes = [POINTER(c_void_p), POINTER(MSCAN_Profile_TypeDef), POINTER(c_int32)]
+    dll.MSCAN_ProfileDeinit.restype = c_int
+
+if hasattr(dll, 'MSCAN_Configuration'):
+    dll.MSCAN_Configuration.argtypes = [
+        POINTER(c_void_p),
+        POINTER(MSCAN_Profile_TypeDef),
+        POINTER(MSCAN_Profile_TypeDef),
+        POINTER(MSCAN_Info_Typedef),
+        POINTER(c_int32),
+        POINTER(c_int64),
+        POINTER(PreamplifierState_TypeDef)
+    ]
+    dll.MSCAN_Configuration.restype = c_int
+
+if hasattr(dll, 'MSCAN_Start'):
+    dll.MSCAN_Start.argtypes = [POINTER(c_void_p)]
+    dll.MSCAN_Start.restype = c_int
+
+if hasattr(dll, 'MSCAN_Stop'):
+    dll.MSCAN_Stop.argtypes = [POINTER(c_void_p)]
+    dll.MSCAN_Stop.restype = c_int
+
+if hasattr(dll, 'MSCAN_GetData'):
+    dll.MSCAN_GetData.argtypes = [POINTER(c_void_p), POINTER(MSCAN_Data_Typedef)]
+    dll.MSCAN_GetData.restype = c_int
