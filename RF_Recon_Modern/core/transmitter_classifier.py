@@ -352,28 +352,6 @@ class TransmitterClassifier:
                     "details": "Broadband flat OFDM block (6/8 MHz) without ATSC pilot"
                 }
 
-        # Case 2: Shure Axient Digital PSM Multichannel Wideband Mode (500 kHz - 2.5 MHz)
-        if 0.50 <= contiguous_span_mhz < 4.5:
-            block_powers = powers[left:right+1]
-            lin_powers = 10.0 ** (block_powers / 10.0)
-            log_mean = np.mean(np.log(np.maximum(1e-12, lin_powers)))
-            geo_mean = np.exp(log_mean)
-            arith_mean = np.maximum(1e-12, np.mean(lin_powers))
-            block_sfm = float(geo_mean / arith_mean)
-
-            if block_sfm >= 0.65:
-                return {
-                    "device": "Shure ADPSM (Wideband WMAS Mode)",
-                    "category": "Digital Multi-Channel IEM",
-                    "confidence": 94,
-                    "obw_3db_khz": contiguous_span_mhz * 1000.0,
-                    "obw_20db_khz": (contiguous_span_mhz + 0.15) * 1000.0,
-                    "shape_factor": 1.15,
-                    "is_digital": True,
-                    "color": "#ab47bc",
-                    "details": f"Axient Digital PSM Multichannel Wideband ({contiguous_span_mhz*1000.0:.0f} kHz | SFM: {block_sfm:.2f})"
-                }
-
         return None
 
     @staticmethod
@@ -381,8 +359,8 @@ class TransmitterClassifier:
         """
         Precision matching matrix for:
         - Shure PSM 1000 (Analog FM Stereo IEM)
-        - Shure Axient Digital PSM (ADPSM: Narrowband Digital Mode)
-        - Shure Axient Digital (AD1/AD2 Standard & High Density)
+        - Shure Digital (Axient Digital AD1/AD2/ADX, ULX-D, QLX-D)
+        - Shure ADPSM (Strictly >= 450 kHz Wideband WMAS Mode)
         - Sennheiser Digital 6000 / 9000
         - Wisycom MTK (Interleaved FM Stereo)
         - Sony UWP-D (Digital Audio Processing FM)
@@ -401,22 +379,23 @@ class TransmitterClassifier:
         # 1. DIGITAL TRANSMITTER CLASSIFICATION
         # ---------------------------------------------------------------------
         if is_digital:
-            # A. Shure Axient Digital (High Density Mode: ~100 - 165 kHz digital pedestal)
-            if 95.0 <= obw <= 165.0 and sf <= 1.50:
+            # A. Shure ADPSM (Wideband WMAS Mode: >= 450 kHz occupied bandwidth)
+            # Strictly reserved for true wideband multichannel WMAS blocks
+            if obw >= 450.0 and obw20 >= 500.0 and sf <= 1.35 and sfm >= 0.55:
                 return {
-                    "device": "Shure Axient Digital (High Density)",
-                    "category": "Digital Wireless Mic",
-                    "confidence": 96,
+                    "device": "Shure ADPSM (Wideband Mode)",
+                    "category": "Digital Multi-Channel IEM",
+                    "confidence": 95,
                     "obw_3db_khz": obw,
                     "obw_20db_khz": obw20,
                     "shape_factor": sf,
                     "is_digital": True,
-                    "color": "#00bcd4",
-                    "details": f"High-Density digital pedestal ({obw:.0f} kHz | SF: {sf:.2f})"
+                    "color": "#ab47bc",
+                    "details": f"Axient Digital PSM Wideband WMAS ({obw:.0f} kHz -3dB | SF: {sf:.2f})"
                 }
 
-            # B. Sennheiser Digital 6000 / 9000 (~365 - 470 kHz, 400KD2E emission)
-            if ((335.0 <= obw <= 470.0 and obw20 >= 380.0) or (365.0 < obw <= 470.0)) and sf <= 1.45:
+            # B. Sennheiser Digital 6000 / 9000 (~335 - 450 kHz, 400KD2E emission)
+            if ((335.0 <= obw < 450.0 and obw20 >= 380.0) or (365.0 < obw < 450.0)) and sf <= 1.45:
                 return {
                     "device": "Sennheiser Digital 6000/9000",
                     "category": "Digital Wireless Mic",
@@ -429,11 +408,11 @@ class TransmitterClassifier:
                     "details": f"Equidistant Intermod-Free digital plateau ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # C. Shure Axient Digital (Standard Mode: covers AD1, AD2, ADX1, ADX2, ADX1M, and narrowband carriers)
-            # Per engineering rules, ADPSM is ONLY reported for wideband WMAS mode. Narrowband pedestals are Axient Digital.
-            if 165.0 < obw <= 365.0 and obw20 < 380.0 and sf <= 1.52:
+            # C. Shure Digital (Narrowband: covers Axient Digital AD1/AD2/ADX, ULX-D, QLX-D)
+            # Differentiated from Sennheiser D6000 and Sony UWP
+            if obw <= 165.0 and sf <= 1.50:
                 return {
-                    "device": "Shure Axient Digital (Standard)",
+                    "device": "Shure Digital",
                     "category": "Digital Wireless Mic",
                     "confidence": 96,
                     "obw_3db_khz": obw,
@@ -441,20 +420,33 @@ class TransmitterClassifier:
                     "shape_factor": sf,
                     "is_digital": True,
                     "color": "#0288d1",
-                    "details": f"Standard Axient Digital QAM profile ({obw:.0f} kHz | covers AD1/AD2/ADX)"
+                    "details": f"Shure Digital High-Density ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # Generic Digital Fallback -> Shure Axient Digital
+            if obw < 450.0 and sf <= 1.52:
+                return {
+                    "device": "Shure Digital",
+                    "category": "Digital Wireless Mic",
+                    "confidence": 96,
+                    "obw_3db_khz": obw,
+                    "obw_20db_khz": obw20,
+                    "shape_factor": sf,
+                    "is_digital": True,
+                    "color": "#0288d1",
+                    "details": f"Shure Digital Standard ({obw:.0f} kHz | covers AD/ULXD/QLXD)"
+                }
+
+            # Generic Digital Fallback -> Shure Digital
             return {
-                "device": "Shure Axient Digital",
+                "device": "Shure Digital",
                 "category": "Digital Wireless Mic",
-                "confidence": 88,
+                "confidence": 90,
                 "obw_3db_khz": obw,
                 "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": True,
                 "color": "#0288d1",
-                "details": f"Axient Digital Pedestal ({obw:.0f} kHz -3dB | SF: {sf:.2f})"
+                "details": f"Shure Digital Pedestal ({obw:.0f} kHz | SF: {sf:.2f})"
             }
 
         # ---------------------------------------------------------------------
