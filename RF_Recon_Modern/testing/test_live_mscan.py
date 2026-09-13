@@ -46,7 +46,8 @@ def on_conn(connected):
             detector=1,       # MaxPeak
             ref_level=-10.0,
             preamp=0,
-            atten=0
+            atten=0,
+            decimate=256
         )
 
 def on_mscan_data(el_idx, ch_freq, peak_power, spec_data, info):

@@ -102,6 +102,16 @@ class MSCANPanel(QWidget):
         self.detector_combo.currentIndexChanged.connect(self._emit_params_changed)
         param_layout.addRow("Detector:", self.detector_combo)
 
+        # Hardware Channel Filter / Decimation
+        self.channel_filter_combo = QComboBox()
+        self.channel_filter_combo.addItem("400 kHz (High Density 375k Grid)", 256)
+        self.channel_filter_combo.addItem("200 kHz (Ultra Narrow 200k Grid)", 512)
+        self.channel_filter_combo.addItem("800 kHz (Standard 500k+ Grid)", 128)
+        self.channel_filter_combo.addItem("1.6 MHz (Wideband Overview)", 64)
+        self.channel_filter_combo.setCurrentIndex(0) # Default to 400 kHz / Decimate 256
+        self.channel_filter_combo.currentIndexChanged.connect(self._emit_params_changed)
+        param_layout.addRow("IF Filter:", self.channel_filter_combo)
+
         # Reference Level
         self.ref_level_spin = QDoubleSpinBox()
         self.ref_level_spin.setRange(-100.0, 30.0)
@@ -282,6 +292,7 @@ class MSCANPanel(QWidget):
         return {
             "dwell_time": float(self.dwell_combo.currentData() or 0.001),
             "detector": int(self.detector_combo.currentData() or 1),
+            "decimate": int(self.channel_filter_combo.currentData() or 256),
             "ref_level": float(self.ref_level_spin.value()),
             "preamp": 0x01 if self.preamp_cb.isChecked() else 0x00,
             "atten": 0,
