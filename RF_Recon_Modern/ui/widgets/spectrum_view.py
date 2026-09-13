@@ -117,6 +117,9 @@ class SpectrumView(QWidget):
         self._last_standard = None
         self._last_ps_dict = {}
         
+        # Soundbase Narrowband Carrier Masks
+        self.soundbase_masks = {}
+        
         # Traces
         self.curves = {
             "Real-Time": self.plot_widget.plot(pen=pg.mkPen('#eab308', width=1.8)),
@@ -512,3 +515,49 @@ class SpectrumView(QWidget):
                 getattr(self, '_last_ps_dict', {}),
                 self._channel_names
             )
+
+    # --- Soundbase Narrowband Carrier Masks ---
+    def set_soundbase_masks(self, carriers: list):
+        """
+        Creates or updates narrowband LinearRegionItem masks for Soundbase carriers.
+        """
+        self.clear_soundbase_masks()
+        for c in carriers:
+            c_id = str(c.get("id"))
+            f_start = float(c.get("f_start_mhz", 0.0))
+            f_stop = float(c.get("f_stop_mhz", 0.0))
+            if f_stop <= f_start:
+                continue
+
+            color_str = c.get("color", "#38bdf8")
+            qcol = QColor(color_str)
+            if not qcol.isValid():
+                qcol = QColor("#38bdf8")
+
+            # Semi-transparent brush and solid border pen
+            brush = pg.mkBrush(QColor(qcol.red(), qcol.green(), qcol.blue(), 55))
+            pen = pg.mkPen(QColor(qcol.red(), qcol.green(), qcol.blue(), 200), width=1.2, style=Qt.PenStyle.SolidLine)
+
+            region = pg.LinearRegionItem(
+                values=[f_start, f_stop],
+                orientation='vertical',
+                movable=False,
+                brush=brush,
+                pen=pen
+            )
+            region.setZValue(-4)
+            region.setAcceptHoverEvents(False)
+            region.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.plot_widget.addItem(region)
+            self.soundbase_masks[c_id] = region
+
+    def set_soundbase_mask_visible(self, carrier_id: str, visible: bool):
+        c_id = str(carrier_id)
+        if c_id in self.soundbase_masks:
+            self.soundbase_masks[c_id].setVisible(visible)
+
+    def clear_soundbase_masks(self):
+        for region in self.soundbase_masks.values():
+            self.plot_widget.removeItem(region)
+        self.soundbase_masks.clear()
+
