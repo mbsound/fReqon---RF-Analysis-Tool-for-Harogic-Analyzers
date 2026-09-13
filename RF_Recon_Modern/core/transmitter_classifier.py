@@ -16,7 +16,7 @@ and modulation features to identify unknown RF carriers:
 """
 
 import numpy as np
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, PchipInterpolator
 
 class TransmitterClassifier:
     """
@@ -160,10 +160,12 @@ class TransmitterClassifier:
         f_fine = np.linspace(f_clean[0], f_clean[-1], num_points)
 
         try:
-            interp = interp1d(f_clean, p_clean, kind='cubic', fill_value='extrapolate')
+            interp = PchipInterpolator(f_clean, p_clean)
             p_fine = interp(f_fine)
         except Exception:
             p_fine = np.interp(f_fine, f_clean, p_clean)
+
+        p_fine = np.clip(p_fine, p_floor - 10.0, peak_p + 1.5)
 
         # Continuous crossing widths
         m3_mask = p_fine >= (peak_p - 3.0)
@@ -399,7 +401,7 @@ class TransmitterClassifier:
         # 1. DIGITAL TRANSMITTER CLASSIFICATION
         # ---------------------------------------------------------------------
         if is_digital:
-            # A. Shure Axient Digital (High Density Mode: ~120 - 165 kHz digital pedestal)
+            # A. Shure Axient Digital (High Density Mode: ~100 - 165 kHz digital pedestal)
             if 95.0 <= obw <= 165.0 and sf <= 1.50:
                 return {
                     "device": "Shure Axient Digital (High Density)",
@@ -413,36 +415,7 @@ class TransmitterClassifier:
                     "details": f"High-Density digital pedestal ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # B. Shure Axient Digital PSM - Narrowband Digital Mode (~165 - 245 kHz)
-            # Certified under FCC as 181KG7E (Point-to-Point digital IEM pedestal)
-            if 165.0 < obw <= 245.0 and sf <= 1.48:
-                return {
-                    "device": "Shure ADPSM (Narrowband Digital)",
-                    "category": "Digital In-Ear Monitor",
-                    "confidence": 95,
-                    "obw_3db_khz": obw,
-                    "obw_20db_khz": obw20,
-                    "shape_factor": sf,
-                    "is_digital": True,
-                    "color": "#ba68c8",
-                    "details": f"Axient Digital PSM Point-to-Point Digital ({obw:.0f} kHz | SFM: {sfm:.2f})"
-                }
-
-            # C. Shure Axient Digital Mic (Standard Mode: ~250 - 365 kHz, 350KD2E emission)
-            if 250.0 <= obw <= 365.0 and obw20 < 380.0 and sf <= 1.50:
-                return {
-                    "device": "Shure Axient Digital (Standard)",
-                    "category": "Digital Wireless Mic",
-                    "confidence": 96,
-                    "obw_3db_khz": obw,
-                    "obw_20db_khz": obw20,
-                    "shape_factor": sf,
-                    "is_digital": True,
-                    "color": "#0288d1",
-                    "details": f"Standard Axient Digital QAM profile ({obw:.0f} kHz | SF: {sf:.2f})"
-                }
-
-            # D. Sennheiser Digital 6000 / 9000 (~365 - 470 kHz, 400KD2E emission)
+            # B. Sennheiser Digital 6000 / 9000 (~365 - 470 kHz, 400KD2E emission)
             if ((335.0 <= obw <= 470.0 and obw20 >= 380.0) or (365.0 < obw <= 470.0)) and sf <= 1.45:
                 return {
                     "device": "Sennheiser Digital 6000/9000",
@@ -456,27 +429,96 @@ class TransmitterClassifier:
                     "details": f"Equidistant Intermod-Free digital plateau ({obw:.0f} kHz | SF: {sf:.2f})"
                 }
 
-            # Generic Digital Fallback
+            # C. Shure Axient Digital (Standard Mode: covers AD1, AD2, ADX1, ADX2, ADX1M, and narrowband carriers)
+            # Per engineering rules, ADPSM is ONLY reported for wideband WMAS mode. Narrowband pedestals are Axient Digital.
+            if 165.0 < obw <= 365.0 and obw20 < 380.0 and sf <= 1.52:
+                return {
+                    "device": "Shure Axient Digital (Standard)",
+                    "category": "Digital Wireless Mic",
+                    "confidence": 96,
+                    "obw_3db_khz": obw,
+                    "obw_20db_khz": obw20,
+                    "shape_factor": sf,
+                    "is_digital": True,
+                    "color": "#0288d1",
+                    "details": f"Standard Axient Digital QAM profile ({obw:.0f} kHz | covers AD1/AD2/ADX)"
+                }
+
+            # Generic Digital Fallback -> Shure Axient Digital
             return {
-                "device": "Generic Digital Wireless",
-                "category": "Digital Transmitter",
-                "confidence": 75,
+                "device": "Shure Axient Digital",
+                "category": "Digital Wireless Mic",
+                "confidence": 88,
                 "obw_3db_khz": obw,
                 "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": True,
-                "color": "#00acc1",
-                "details": f"Digital Pedestal ({obw:.0f} kHz -3dB | SF: {sf:.2f})"
+                "color": "#0288d1",
+                "details": f"Axient Digital Pedestal ({obw:.0f} kHz -3dB | SF: {sf:.2f})"
             }
 
         # ---------------------------------------------------------------------
         # 2. ANALOG FM & HYBRID TRANSMITTER CLASSIFICATION
         # ---------------------------------------------------------------------
-        # A. Shure PSM 1000 / Sennheiser IEM (Analog FM Stereo In-Ear Monitor)
-        # Carson's rule for stereo MPX (19 kHz pilot + 38 kHz L-R subcarrier) gives 150 - 275 kHz BW
+        # A. Wisycom MTK952 / MTK982 (Wideband Interleaved Stereo FM)
+        if obw20 >= 275.0 and sf >= 2.1:
+            return {
+                "device": "Wisycom MTK (Interleaved FM)",
+                "category": "Wideband FM Stereo Transmitter",
+                "confidence": 92,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#e91e63",
+                "details": f"Wide dynamic FM stereo deviation ({obw20:.0f} kHz BW | SF: {sf:.2f})"
+            }
+
+        # B. Specific Mono Wireless Mics with Verified Ultrasonic Squelch Tones (< 140 kHz BW)
+        if pilot_info["has_sony_32382k"] and obw20 < 140.0:
+            return {
+                "device": "Sony UWP-D (Digital Processing FM)",
+                "category": "Hybrid DSP / FM Wireless",
+                "confidence": 95,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#00897b",
+                "details": f"Sony UWP-D Series (DSP companding / 32.382 kHz tone squelch | {obw20:.0f} kHz BW)"
+            }
+
+        if pilot_info["has_senn_32768k"] and obw20 < 140.0:
+            return {
+                "device": "Sennheiser G3/G4 (Analog FM)",
+                "category": "Analog Wireless Mic",
+                "confidence": 96,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#4caf50",
+                "details": "32.768 kHz ultrasonic pilot tone detected"
+            }
+
+        if pilot_info["has_shure_32k"] and obw20 < 140.0:
+            return {
+                "device": "Shure UHF-R / ULX (Analog FM)",
+                "category": "Analog Wireless Mic",
+                "confidence": 94,
+                "obw_3db_khz": obw,
+                "obw_20db_khz": obw20,
+                "shape_factor": sf,
+                "is_digital": False,
+                "color": "#03a9f4",
+                "details": "32.000 kHz tone squelch detected"
+            }
+
+        # C. Shure PSM 1000 / Sennheiser IEM (Analog FM Stereo In-Ear Monitor)
+        # Carson bandwidth spans ~100 kHz (idle / low deviation) to 275 kHz (full stereo MPX deviation)
         is_stereo_iem = (
             pilot_info["has_stereo_iem_19k"] or
-            (150.0 <= obw20 <= 275.0 and sf >= 1.60)
+            (95.0 <= obw20 <= 275.0 and sf >= 1.30)
         )
         if is_stereo_iem:
             confidence = 96 if pilot_info["has_stereo_iem_19k"] else 92
@@ -491,63 +533,6 @@ class TransmitterClassifier:
                 "is_digital": False,
                 "color": "#ff9800",
                 "details": f"Analog FM Stereo IEM ({pilot_detail} | {obw20:.0f} kHz Carson BW)"
-            }
-
-        # B. Wisycom MTK952 / MTK982 (Wideband Interleaved Stereo FM)
-        if obw20 >= 275.0 and sf >= 2.1:
-            return {
-                "device": "Wisycom MTK (Interleaved FM)",
-                "category": "Wideband FM Stereo Transmitter",
-                "confidence": 92,
-                "obw_3db_khz": obw,
-                "obw_20db_khz": obw20,
-                "shape_factor": sf,
-                "is_digital": False,
-                "color": "#e91e63",
-                "details": f"Wide dynamic FM stereo deviation ({obw20:.0f} kHz BW | SF: {sf:.2f})"
-            }
-
-        # C. Sony UWP-D (Digital Processing FM Mono Mic)
-        # Mono wireless mic (< 150 kHz BW) with verified 32.382 kHz tone squelch
-        if pilot_info["has_sony_32382k"] and obw20 < 150.0:
-            return {
-                "device": "Sony UWP-D (Digital Processing FM)",
-                "category": "Hybrid DSP / FM Wireless",
-                "confidence": 95,
-                "obw_3db_khz": obw,
-                "obw_20db_khz": obw20,
-                "shape_factor": sf,
-                "is_digital": False,
-                "color": "#00897b",
-                "details": f"Sony UWP-D Series (DSP companding / 32.382 kHz tone squelch | {obw20:.0f} kHz BW)"
-            }
-
-        # D. Sennheiser evolution wireless G3/G4 / 2000 Series (Analog FM Mono Mic)
-        if pilot_info["has_senn_32768k"] and obw20 < 150.0:
-            return {
-                "device": "Sennheiser G3/G4 (Analog FM)",
-                "category": "Analog Wireless Mic",
-                "confidence": 96,
-                "obw_3db_khz": obw,
-                "obw_20db_khz": obw20,
-                "shape_factor": sf,
-                "is_digital": False,
-                "color": "#4caf50",
-                "details": "32.768 kHz ultrasonic pilot tone detected"
-            }
-
-        # E. Shure UHF-R / ULX (Analog FM Mono Mic)
-        if pilot_info["has_shure_32k"] and obw20 < 150.0:
-            return {
-                "device": "Shure UHF-R / ULX (Analog FM)",
-                "category": "Analog Wireless Mic",
-                "confidence": 94,
-                "obw_3db_khz": obw,
-                "obw_20db_khz": obw20,
-                "shape_factor": sf,
-                "is_digital": False,
-                "color": "#03a9f4",
-                "details": "32.000 kHz tone squelch detected"
             }
 
         # F. Wisycom MTP60 / MTP40 (Narrowband FM Mode: ~80 - 140 kHz)
