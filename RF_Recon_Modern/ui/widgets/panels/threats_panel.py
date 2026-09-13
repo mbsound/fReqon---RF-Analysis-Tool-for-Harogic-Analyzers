@@ -76,22 +76,27 @@ class ThreatsPanel(QWidget):
         intr_card = self._create_card("INTRUDER THREAT DETECTION", layout)
         
         t_layout = QHBoxLayout()
+        t_layout.setContentsMargins(0, 0, 0, 0)
+        t_layout.setSpacing(6)
+        
         t_lbl = QLabel("Threshold:")
         t_lbl.setStyleSheet("font-size: 11px;")
+        
+        self.show_thresh_cb = QCheckBox()
+        self.show_thresh_cb.setChecked(True)
+        self.show_thresh_cb.setToolTip("Display Threshold Line on Spectrum")
+        self.show_thresh_cb.toggled.connect(self.showThresholdToggled.emit)
+        
         self.intruder_thresh_spin = QDoubleSpinBox()
         self.intruder_thresh_spin.setRange(-150.0, 20.0)
         self.intruder_thresh_spin.setValue(-80.0)
         self.intruder_thresh_spin.setSuffix(" dBm")
         self.intruder_thresh_spin.valueChanged.connect(self.intruderThresholdChanged.emit)
-        t_layout.addWidget(t_lbl)
-        t_layout.addWidget(self.intruder_thresh_spin)
-        intr_card.layout().addLayout(t_layout)
         
-        # Display Threshold Line on Spectrum Checkbox
-        self.show_thresh_cb = QCheckBox("Display Threshold Line on Spectrum")
-        self.show_thresh_cb.setChecked(True)
-        self.show_thresh_cb.toggled.connect(self.showThresholdToggled.emit)
-        intr_card.layout().addWidget(self.show_thresh_cb)
+        t_layout.addWidget(t_lbl)
+        t_layout.addWidget(self.show_thresh_cb)
+        t_layout.addWidget(self.intruder_thresh_spin, 1)
+        intr_card.layout().addLayout(t_layout)
         
         self.intruder_table = QTableWidget(0, 3)
         self.intruder_table.setHorizontalHeaderLabels(["Freq (MHz)", "Power", "Signature"])
