@@ -49,7 +49,7 @@ from .widgets.panels.demod_panel import DemodPanel
 from .widgets.panels.dtv_panel import DTVPanel
 from .widgets.panels.dect_panel import DECTPanel
 from .widgets.panels.showlink_panel import ShowLinkPanel
-from .widgets.panels.threats_panel import ThreatsPanel
+from .widgets.panels.threats_panel import ThreatsPanel, NumericTableWidgetItem
 from core.demod_engine import DemodEngine, DemodResult
 
 from .dialogs.cal_dialogs import CalibrationManagerDialog, MissingCalDialog, DragDropCalDialog, ClearCalDialog
@@ -415,6 +415,7 @@ class MainWindow(QMainWindow):
         # Threats Panel
         self.threats_panel.intruderAlertToggled.connect(self._on_intruder_alert_toggled)
         self.threats_panel.intruderThresholdChanged.connect(self._on_intruder_threshold_changed)
+        self.threats_panel.showThresholdToggled.connect(self._on_intruder_show_threshold_toggled)
         self.threats_panel.intruder_table.cellClicked.connect(self._on_intruder_row_clicked)
         self.threats_panel.clearIntrudersClicked.connect(self._clear_intruders)
         self.threats_panel.addIntruderToMarkersClicked.connect(self._add_intruders_to_markers)
@@ -851,6 +852,14 @@ class MainWindow(QMainWindow):
                 )
                 if is_showlink:
                     self.spectrum_view.showlink_threshold_line.setPos(self.showlink_panel.thresh_spin.value())
+
+            if hasattr(self.spectrum_view, 'intruder_threshold_line'):
+                is_threats = (mode_idx == 7)
+                self.spectrum_view.intruder_threshold_line.setVisible(
+                    is_threats and self.threats_panel.show_thresh_cb.isChecked()
+                )
+                if is_threats:
+                    self.spectrum_view.intruder_threshold_line.setPos(self.threats_panel.intruder_thresh_spin.value())
 
     def _on_demod_requested(self, params: dict):
         self._last_operating_mode = "IQS"
@@ -1778,12 +1787,24 @@ class MainWindow(QMainWindow):
 
     # --- Threats & Intruder Alert Engine ---
     def _on_intruder_alert_toggled(self, active: bool):
-        self.spectrum_view.intruder_threshold_line.setVisible(active)
+        is_threats = (self.nav_rail.btn_group.checkedId() == 7)
+        if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'intruder_threshold_line'):
+            self.spectrum_view.intruder_threshold_line.setVisible(
+                is_threats and self.threats_panel.show_thresh_cb.isChecked()
+            )
         if not active:
             self._clear_intruders()
 
+    def _on_intruder_show_threshold_toggled(self, checked: bool):
+        is_threats = (self.nav_rail.btn_group.checkedId() == 7)
+        if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'intruder_threshold_line'):
+            self.spectrum_view.intruder_threshold_line.setVisible(checked and is_threats)
+
     def _on_intruder_threshold_changed(self, val: float):
-        self.spectrum_view.intruder_threshold_line.setPos(val)
+        if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'intruder_threshold_line'):
+            self.spectrum_view.intruder_threshold_line.blockSignals(True)
+            self.spectrum_view.intruder_threshold_line.setPos(val)
+            self.spectrum_view.intruder_threshold_line.blockSignals(False)
         thresh = float(val)
         to_del = [f for f, info in self.intruders.items() if info.get("power", -150.0) < thresh]
         if to_del:
@@ -1792,9 +1813,30 @@ class MainWindow(QMainWindow):
             self._update_intruders_ui(force=True)
 
     def _on_intruder_row_clicked(self, row: int, col: int):
-        sorted_intruders = sorted(self.intruders.items(), key=lambda kv: kv[1]["power"], reverse=True)
-        if 0 <= row < len(sorted_intruders):
-            self.current_intruder_index = row
+        tbl = self.threats_panel.intruder_table
+        item0 = tbl.item(row, 0)
+        if item0 is None:
+            return
+        freq_val = item0.data(Qt.ItemDataRole.UserRole)
+        if freq_val is None:
+            try:
+                freq_val = float(item0.text())
+            except ValueError:
+                return
+        
+        target_f = float(freq_val)
+        matched_key = None
+        for k in self.intruders.keys():
+            if abs(k - target_f) < 0.005:
+                matched_key = k
+                break
+                
+        if matched_key is not None:
+            sorted_intruders = sorted(self.intruders.items(), key=lambda kv: kv[1]["power"], reverse=True)
+            for idx, (f, _) in enumerate(sorted_intruders):
+                if f == matched_key:
+                    self.current_intruder_index = idx
+                    break
             self._jump_to_current_intruder()
 
     def _process_intruder_sweep(self, x_data, y_data):
@@ -1877,12 +1919,19 @@ class MainWindow(QMainWindow):
         self.top_bar.set_intruders_banner(count, self.current_intruder_index, cur_freq)
         
         tbl = self.threats_panel.intruder_table
+        
+        # Preserve sorting indicator state while repopulating
+        header = tbl.horizontalHeader()
+        sort_col = header.sortIndicatorSection()
+        sort_order = header.sortIndicatorOrder()
+        tbl.setSortingEnabled(False)
+        
         tbl.setRowCount(count)
         for r_idx, (f, info) in enumerate(sorted_intruders):
-            f_item = QTableWidgetItem(f"{f:.3f}")
+            f_item = NumericTableWidgetItem(f"{f:.3f}", f)
             f_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             
-            p_item = QTableWidgetItem(f"{info['power']:.1f} dBm")
+            p_item = NumericTableWidgetItem(f"{info['power']:.1f} dBm", info['power'])
             p_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             
             sig_name = info.get("signature", "Unknown Carrier")
@@ -1910,8 +1959,19 @@ class MainWindow(QMainWindow):
             tbl.setItem(r_idx, 1, p_item)
             tbl.setItem(r_idx, 2, s_item)
             
-        if 0 <= self.current_intruder_index < count:
-            tbl.selectRow(self.current_intruder_index)
+        tbl.setSortingEnabled(True)
+        if sort_col >= 0:
+            tbl.sortByColumn(sort_col, sort_order)
+            
+        # Re-highlight current intruder row if active
+        if cur_freq is not None:
+            for r in range(tbl.rowCount()):
+                it = tbl.item(r, 0)
+                if it:
+                    val = it.data(Qt.ItemDataRole.UserRole)
+                    if val is not None and abs(val - cur_freq) < 0.005:
+                        tbl.selectRow(r)
+                        break
 
     def _clear_intruders(self):
         self.intruders.clear()
@@ -1944,7 +2004,16 @@ class MainWindow(QMainWindow):
             self.waterfall_view.v_line.show()
             self._update_hud_readout(f, info["power"])
             self.top_bar.set_intruders_banner(len(sorted_intruders), self.current_intruder_index, f)
-            self.threats_panel.intruder_table.selectRow(self.current_intruder_index)
+            
+            # Select matching row in table regardless of sort order
+            tbl = self.threats_panel.intruder_table
+            for r in range(tbl.rowCount()):
+                it = tbl.item(r, 0)
+                if it:
+                    val = it.data(Qt.ItemDataRole.UserRole)
+                    if val is not None and abs(val - f) < 0.005:
+                        tbl.selectRow(r)
+                        break
 
     def _add_intruders_to_markers(self):
         for f, info in self.intruders.items():
