@@ -1,5 +1,7 @@
 # fReqon - RF Analysis Tool for Harogic Analyzers
 
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
+
 **fReqon** is a high-performance RF Spectrum Analysis, Signal Intelligence, and Live Frequency Monitoring suite built specifically for **Harogic Technologies** Real-Time Spectrum Analyzers (SAN, SAM, SAE series). Designed for wireless audio coordination, broadcast engineering, and live-event RF defense, fReqon delivers real-time DPX acquisition, deep hardware control, continuous sweeping, multi-row folded spectrograms, and automated rogue transmission detection.
 
 ---
@@ -100,3 +102,9 @@ Launch the modern suite:
 ```bash
 python3 RF_Recon_Modern/main.py
 ```
+
+---
+
+## License
+
+This project is dedicated to the public domain under **[The Unlicense](LICENSE)** — the freest open source license possible. You are completely free to copy, modify, publish, use, compile, sell, or distribute this software for any purpose, commercial or non-commercial, without any restrictions or attribution required. See the [LICENSE](LICENSE) file for the full text.
