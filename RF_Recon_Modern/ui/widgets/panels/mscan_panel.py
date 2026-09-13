@@ -296,14 +296,15 @@ class MSCANPanel(QWidget):
                 }
             """)
 
-    def stop_scan(self):
+    def stop_scan(self, emit_signal: bool = True):
         if self.is_scanning or self.scan_btn.isChecked():
             self.is_scanning = False
             self.scan_btn.setChecked(False)
             self._update_scan_btn_style()
             self.lbl_telem_status.setText("Status: Standby")
             self.lbl_telem_status.setStyleSheet("color: #8b949e; font-weight: 600;")
-            self.scanToggled.emit(False)
+            if emit_signal:
+                self.scanToggled.emit(False)
 
     def _on_scan_btn_clicked(self):
         self.is_scanning = self.scan_btn.isChecked()
