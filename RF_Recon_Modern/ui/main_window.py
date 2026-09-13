@@ -223,14 +223,14 @@ class MainWindow(QMainWindow):
         self.mscan_panel = MSCANPanel(self.panel_stack)
         
         self.panel_stack.addWidget(self.sweep_panel)
+        self.panel_stack.addWidget(self.threats_panel)
+        self.panel_stack.addWidget(self.mscan_panel)
         self.panel_stack.addWidget(self.rtsa_panel)
         self.panel_stack.addWidget(self.det_panel)
         self.panel_stack.addWidget(self.demod_panel)
         self.panel_stack.addWidget(self.dtv_panel)
         self.panel_stack.addWidget(self.dect_panel)
         self.panel_stack.addWidget(self.showlink_panel)
-        self.panel_stack.addWidget(self.threats_panel)
-        self.panel_stack.addWidget(self.mscan_panel)
         
         left_hub_layout.addWidget(self.panel_stack)
         self.main_h_splitter.addWidget(self.left_hub)
@@ -764,9 +764,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'mscan_panel') and (self.mscan_panel.is_scanning or self.mscan_panel.scan_btn.isChecked()):
             self.mscan_panel.stop_scan()
         if not self.is_connected:
-            if self.nav_rail.btn_group.checkedId() == 3:
+            if self.nav_rail.btn_group.checkedId() == 5:
                 self.viewport_stack.setCurrentIndex(4)
-            elif self.nav_rail.btn_group.checkedId() == 8:
+            elif self.nav_rail.btn_group.checkedId() == 2:
                 self.viewport_stack.setCurrentIndex(5)
             else:
                 self._on_view_mode_changed(self.top_bar.view_mode_combo.currentText())
@@ -779,9 +779,9 @@ class MainWindow(QMainWindow):
         self.apply_bw_settings()
         self.apply_sweep_settings()
         self.apply_detect_settings()
-        if self.nav_rail.btn_group.checkedId() == 3:
+        if self.nav_rail.btn_group.checkedId() == 5:
             self.viewport_stack.setCurrentIndex(4) # Keep DemodView active
-        elif self.nav_rail.btn_group.checkedId() == 8:
+        elif self.nav_rail.btn_group.checkedId() == 2:
             self.viewport_stack.setCurrentIndex(5) # Keep MSCANView active
         else:
             self._on_view_mode_changed(self.top_bar.view_mode_combo.currentText())
@@ -811,7 +811,7 @@ class MainWindow(QMainWindow):
 
     def _on_spectrum_trigger_zero_span(self, freq_mhz: float):
         self.det_panel.cf_spin.setValue(freq_mhz)
-        self.nav_rail.set_active_mode(2)
+        self.nav_rail.set_active_mode(4)
         params = self.det_panel.get_params()
         params["center_freq_hz"] = freq_mhz * 1e6
         self._on_det_trigger_requested(params)
@@ -822,14 +822,25 @@ class MainWindow(QMainWindow):
         self._on_det_trigger_requested(params)
 
     def _on_nav_mode_changed(self, mode_idx: int):
-        if mode_idx != 8 and hasattr(self, 'mscan_panel') and (self.mscan_panel.is_scanning or self.mscan_panel.scan_btn.isChecked()):
+        if mode_idx != 2 and hasattr(self, 'mscan_panel') and (self.mscan_panel.is_scanning or self.mscan_panel.scan_btn.isChecked()):
             self.mscan_panel.stop_scan()
 
         self.panel_stack.setCurrentIndex(mode_idx)
         
         if mode_idx == 0: # RF & Sweep
             self.resume_rf_sweep()
-        elif mode_idx == 1: # Real-Time (RTSA)
+        elif mode_idx == 1: # Threats & Markers
+            if self._last_operating_mode != "SWP":
+                self.resume_rf_sweep()
+            else:
+                self._on_view_mode_changed(self.top_bar.view_mode_combo.currentText())
+        elif mode_idx == 2: # Rapid Channel Monitoring (MSCAN)
+            self.viewport_stack.setCurrentIndex(5) # MSCANView
+            if self.mscan_panel.is_scanning:
+                self._on_mscan_toggled(True)
+            elif self._last_operating_mode != "SWP":
+                self.resume_rf_sweep()
+        elif mode_idx == 3: # Real-Time (RTSA)
             self._last_operating_mode = "RTA"
             if hasattr(self, 'det_panel'):
                 self.det_panel.set_active_state(False)
@@ -841,10 +852,10 @@ class MainWindow(QMainWindow):
             self.rtsa_view.set_active_channels(self.active_channels, ps_dict)
             self.rtsa_view.update_channel_masks(self.active_channels, std, ps_dict, self.station_db_names)
             self._on_rtsa_params_changed(self.rtsa_panel.get_params())
-        elif mode_idx == 2: # Zero-Span (DET)
+        elif mode_idx == 4: # Zero-Span (DET)
             # View Zero-Span canvas without immediately interrupting or taking hold of RF hardware
             self.viewport_stack.setCurrentIndex(3)
-        elif mode_idx == 3: # Demodulation (IQS)
+        elif mode_idx == 5: # Demodulation (IQS)
             self.viewport_stack.setCurrentIndex(4) # DemodView
             cf = self.demod_panel.cf_spin.value()
             self.demod_view.set_channel_params(cf, self.demod_view.current_channel_bw_mhz)
@@ -862,13 +873,7 @@ class MainWindow(QMainWindow):
             if not self.demod_panel.is_active:
                 if self._last_operating_mode != "SWP" or not self.is_sweeping:
                     self.resume_rf_sweep()
-        elif mode_idx == 8: # Channel Scan (MSCAN)
-            self.viewport_stack.setCurrentIndex(5) # MSCANView
-            if self.mscan_panel.is_scanning:
-                self._on_mscan_toggled(True)
-            elif self._last_operating_mode != "SWP":
-                self.resume_rf_sweep()
-        else: # Broadcast/DTV (4), DECT (5), ShowLink (6), Threats (7)
+        else: # Broadcast/DTV (6), DECT (7), ShowLink (8)
             if self._last_operating_mode != "SWP":
                 self.resume_rf_sweep()
             else:
@@ -876,8 +881,16 @@ class MainWindow(QMainWindow):
                 
         # Update mode-specific spectrum threshold lines
         if hasattr(self, 'spectrum_view'):
+            if hasattr(self.spectrum_view, 'intruder_threshold_line'):
+                is_threats = (mode_idx == 1)
+                self.spectrum_view.intruder_threshold_line.setVisible(
+                    is_threats and self.threats_panel.show_thresh_cb.isChecked()
+                )
+                if is_threats:
+                    self.spectrum_view.intruder_threshold_line.setPos(self.threats_panel.intruder_thresh_spin.value())
+
             if hasattr(self.spectrum_view, 'dect_threshold_line'):
-                is_dect = (mode_idx == 5)
+                is_dect = (mode_idx == 7)
                 self.spectrum_view.dect_threshold_line.setVisible(
                     is_dect and self.dect_panel.show_thresh_cb.isChecked()
                 )
@@ -885,20 +898,12 @@ class MainWindow(QMainWindow):
                     self.spectrum_view.dect_threshold_line.setPos(self.dect_panel.thresh_spin.value())
 
             if hasattr(self.spectrum_view, 'showlink_threshold_line'):
-                is_showlink = (mode_idx == 6)
+                is_showlink = (mode_idx == 8)
                 self.spectrum_view.showlink_threshold_line.setVisible(
                     is_showlink and self.showlink_panel.show_thresh_cb.isChecked()
                 )
                 if is_showlink:
                     self.spectrum_view.showlink_threshold_line.setPos(self.showlink_panel.thresh_spin.value())
-
-            if hasattr(self.spectrum_view, 'intruder_threshold_line'):
-                is_threats = (mode_idx == 7)
-                self.spectrum_view.intruder_threshold_line.setVisible(
-                    is_threats and self.threats_panel.show_thresh_cb.isChecked()
-                )
-                if is_threats:
-                    self.spectrum_view.intruder_threshold_line.setPos(self.threats_panel.intruder_thresh_spin.value())
 
     def _on_demod_requested(self, params: dict):
         self._last_operating_mode = "IQS"
@@ -1009,7 +1014,7 @@ class MainWindow(QMainWindow):
             params = self.mscan_panel.get_params()
             channels = params.get("channels", [])
             if not channels:
-                QMessageBox.information(self, "MSCAN Notice", "Please load a Soundbase coordination file or select channels to scan.")
+                QMessageBox.information(self, "Rapid Channel Monitoring", "Please load a Soundbase coordination file or select channels to monitor.")
                 self.mscan_panel.scan_btn.setChecked(False)
                 self.mscan_panel._update_scan_btn_style()
                 return
@@ -1022,7 +1027,7 @@ class MainWindow(QMainWindow):
             atten = params.get("atten", 0)
             decimate = params.get("decimate", 256)
             self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten, decimate)
-            self.top_bar.dev_label.setText(f"Hardware MSCAN: {len(channels)} channels hopping @ {dwell*1000:.1f}ms")
+            self.top_bar.dev_label.setText(f"Rapid Monitoring: {len(channels)} channels hopping @ {dwell*1000:.1f}ms")
         else:
             self.multi_device_manager.stop_mscan()
             self.multi_device_manager.set_operating_mode("SWP")
@@ -1056,7 +1061,7 @@ class MainWindow(QMainWindow):
         self.audio_demod_dialog.activateWindow()
 
     def inspect_rtsa_carrier(self, freq_mhz: float):
-        self.nav_rail.set_active_mode(1)
+        self.nav_rail.set_active_mode(3)
         self.rtsa_panel.cf_spin.setValue(freq_mhz)
 
     def _on_temperature_updated(self, slot_id: str, temp_c: float):
@@ -1097,7 +1102,7 @@ class MainWindow(QMainWindow):
 
     def open_audio_demod_dialog(self):
         # Carry over center frequency from Demodulation panel if active, else from RF & Sweep panel
-        if self.nav_rail.btn_group.checkedId() == 3:
+        if self.nav_rail.btn_group.checkedId() == 5:
             cf_hz = self.demod_panel.cf_spin.value() * 1e6
         else:
             cf_hz = self.sweep_panel.center_spin.value() * 1e6
@@ -1137,7 +1142,7 @@ class MainWindow(QMainWindow):
         self.top_bar.dev_label.setText(f"Audio Demod Stopped")
         if self._pre_audio_mode == "SWP":
             self.resume_rf_sweep()
-        elif self._pre_audio_mode == "IQS" and self.nav_rail.btn_group.checkedId() == 3 and self.demod_panel.is_active:
+        elif self._pre_audio_mode == "IQS" and self.nav_rail.btn_group.checkedId() == 5 and self.demod_panel.is_active:
             params = self.demod_panel.get_params()
             self._on_demod_requested(params)
         else:
@@ -1160,8 +1165,8 @@ class MainWindow(QMainWindow):
             self.top_bar.dev_label.setText(f"Audio Demod: {mode.upper()} @ {freq_hz/1e6:.3f} MHz")
 
     def _on_view_mode_changed(self, mode: str):
-        if self.nav_rail.btn_group.checkedId() in (1, 2, 3, 8):
-            # If in RTSA, DET, Demodulation, or MSCAN, selecting a view mode combo switches back to RF & Sweep
+        if self.nav_rail.btn_group.checkedId() in (2, 3, 4, 5):
+            # If in MSCAN(2), RTSA(3), DET(4), or Demodulation(5), selecting a view mode combo switches back to RF & Sweep
             self.nav_rail.set_active_mode(0)
             return
             
@@ -1740,7 +1745,7 @@ class MainWindow(QMainWindow):
         self.dect_engine.set_threshold(val)
 
     def _on_dect_show_threshold_toggled(self, checked: bool):
-        is_dect = (self.nav_rail.btn_group.checkedId() == 5)
+        is_dect = (self.nav_rail.btn_group.checkedId() == 7)
         if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'dect_threshold_line'):
             self.spectrum_view.dect_threshold_line.setVisible(checked and is_dect)
 
@@ -1810,7 +1815,7 @@ class MainWindow(QMainWindow):
         self.showlink_engine.threshold_dbm = val
 
     def _on_showlink_show_threshold_toggled(self, checked: bool):
-        is_showlink = (self.nav_rail.btn_group.checkedId() == 6)
+        is_showlink = (self.nav_rail.btn_group.checkedId() == 8)
         if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'showlink_threshold_line'):
             self.spectrum_view.showlink_threshold_line.setVisible(checked and is_showlink)
 
@@ -1876,8 +1881,8 @@ class MainWindow(QMainWindow):
             peak_dbm = s_data.get("peak_dbm", -120.0)
             avg_dbm = s_data.get("avg_dbm", -120.0)
             health_item.setToolTip(
-                f"Channel {ch_num} ({s_data.get('freq_mhz', 0.0):.1f} MHz)\n"
-                f"Status: {raw_status}\n"
+                f"Channel {ch_num} ({freq_mhz:.1f} MHz)\n"
+                f"Status: {state_text}\n"
                 f"Wi-Fi Overlap: {overlap}\n"
                 f"Peak Power: {peak_dbm:.1f} dBm\n"
                 f"Average Power: {avg_dbm:.1f} dBm"
@@ -1893,7 +1898,7 @@ class MainWindow(QMainWindow):
 
     # --- Threats & Intruder Alert Engine ---
     def _on_intruder_alert_toggled(self, active: bool):
-        is_threats = (self.nav_rail.btn_group.checkedId() == 7)
+        is_threats = (self.nav_rail.btn_group.checkedId() == 1)
         if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'intruder_threshold_line'):
             self.spectrum_view.intruder_threshold_line.setVisible(
                 is_threats and self.threats_panel.show_thresh_cb.isChecked()
@@ -1902,7 +1907,7 @@ class MainWindow(QMainWindow):
             self._clear_intruders()
 
     def _on_intruder_show_threshold_toggled(self, checked: bool):
-        is_threats = (self.nav_rail.btn_group.checkedId() == 7)
+        is_threats = (self.nav_rail.btn_group.checkedId() == 1)
         if hasattr(self, 'spectrum_view') and hasattr(self.spectrum_view, 'intruder_threshold_line'):
             self.spectrum_view.intruder_threshold_line.setVisible(checked and is_threats)
 
@@ -2098,7 +2103,7 @@ class MainWindow(QMainWindow):
             self._jump_to_current_intruder()
 
     def _on_intruder_badge_clicked(self):
-        self.nav_rail.set_active_mode(7) # Switch to Threats Panel
+        self.nav_rail.set_active_mode(1) # Switch to Threats Panel
 
     def _jump_to_current_intruder(self):
         sorted_intruders = sorted(self.intruders.items(), key=lambda kv: kv[1]["power"], reverse=True)
