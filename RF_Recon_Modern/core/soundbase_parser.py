@@ -170,50 +170,60 @@ class SoundbaseParser:
             f_start_mhz = freq_mhz - (bw_mhz / 2.0)
             f_stop_mhz = freq_mhz + (bw_mhz / 2.0)
 
-            name = f_val.get("name") or f_val.get("identifier") or f"Ch {freq_mhz:.3f}"
             model_name = model_info.get("model", "")
             mfg_name = model_info.get("manufacturer", "")
+            raw_name = str(f_val.get("name") or "").strip()
+            raw_ident = str(f_val.get("identifier") or "").strip()
+            if raw_name:
+                name = raw_name
+            elif raw_ident and raw_ident not in ("RF 000", ""):
+                name = raw_ident
+            elif model_name:
+                name = f"{model_name} ({freq_mhz:.3f})"
+            elif raw_ident:
+                name = f"{raw_ident} ({freq_mhz:.3f})"
+            else:
+                name = f"Ch {freq_mhz:.3f}"
             f_id = f_val.get("_id") or f"carrier_{f_idx}"
 
             s_id = f_val.get("siteId")
             z_id = f_val.get("zoneId")
             g_id = f_val.get("groupId")
 
-            # Locate destination group
+            # Locate destination zone and group
             target_group = None
-            if s_id in sites and z_id in sites[s_id]["zones"] and g_id in sites[s_id]["zones"][z_id]["groups"]:
-                target_group = sites[s_id]["zones"][z_id]["groups"][g_id]
+            target_zone = None
+
+            # First, check direct site + zone mapping
+            if s_id in sites and z_id in sites[s_id]["zones"]:
+                target_zone = sites[s_id]["zones"][z_id]
+                if g_id in target_zone["groups"]:
+                    target_group = target_zone["groups"][g_id]
             else:
+                # Search zone by z_id across all sites
                 for s in sites.values():
-                    for z in s["zones"].values():
-                        if g_id in z["groups"]:
-                            target_group = z["groups"][g_id]
-                            break
-                    if target_group:
+                    if z_id in s["zones"]:
+                        target_zone = s["zones"][z_id]
+                        if g_id in target_zone["groups"]:
+                            target_group = target_zone["groups"][g_id]
                         break
 
-            # If still orphaned, place in an Other Carriers group
+            # If the carrier points to a non-existent / deleted zone not present in coordZone, skip it
+            if target_zone is None:
+                continue
+
+            # If the zone is valid but the group is missing or unassigned, place under an Unassigned group in that specific zone
             if target_group is None:
-                fallback_site = sites[first_site_id]
-                if not fallback_site["zones"]:
-                    fallback_site["zones"]["auto_z"] = {
-                        "id": "auto_z",
-                        "siteId": first_site_id,
-                        "name": "General Zone",
-                        "color": "#38bdf8",
-                        "groups": {}
-                    }
-                first_z = next(iter(fallback_site["zones"].values()))
-                if "other_group" not in first_z["groups"]:
-                    first_z["groups"]["other_group"] = {
-                        "id": "other_group",
-                        "siteId": first_site_id,
-                        "zoneId": first_z["id"],
-                        "name": "Other Carriers",
+                if "unassigned" not in target_zone["groups"]:
+                    target_zone["groups"]["unassigned"] = {
+                        "id": "unassigned",
+                        "siteId": target_zone["siteId"],
+                        "zoneId": target_zone["id"],
+                        "name": "Unassigned",
                         "color": "#94a3b8",
                         "carriers": []
                     }
-                target_group = first_z["groups"]["other_group"]
+                target_group = target_zone["groups"]["unassigned"]
 
             carrier_color = f_val.get("color") or target_group["color"]
 
