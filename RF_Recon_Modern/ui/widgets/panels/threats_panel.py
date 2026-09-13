@@ -6,9 +6,29 @@ Soundbase frequency coordination JSON imports, and active channel markers.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
-    QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QTreeWidget, QFrame, QScrollArea
+    QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QTreeWidget, QFrame, QScrollArea,
+    QTableWidgetItem
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """
+    QTableWidgetItem subclass that sorts numerically based on UserRole data.
+    """
+    def __init__(self, text: str, sort_value: float):
+        super().__init__(text)
+        self.setData(Qt.ItemDataRole.UserRole, float(sort_value))
+
+    def __lt__(self, other):
+        if other is not None:
+            v1 = self.data(Qt.ItemDataRole.UserRole)
+            v2 = other.data(Qt.ItemDataRole.UserRole)
+            if v1 is not None and v2 is not None:
+                try:
+                    return float(v1) < float(v2)
+                except (ValueError, TypeError):
+                    pass
+        return super().__lt__(other)
 
 class ThreatsPanel(QWidget):
     """
@@ -16,6 +36,7 @@ class ThreatsPanel(QWidget):
     """
     intruderAlertToggled = pyqtSignal(bool)
     intruderThresholdChanged = pyqtSignal(float)
+    showThresholdToggled = pyqtSignal(bool)
     clearIntrudersClicked = pyqtSignal()
     addIntruderToMarkersClicked = pyqtSignal()
     loadSoundbaseClicked = pyqtSignal()
@@ -66,16 +87,25 @@ class ThreatsPanel(QWidget):
         t_layout.addWidget(self.intruder_thresh_spin)
         intr_card.layout().addLayout(t_layout)
         
+        # Display Threshold Line on Spectrum Checkbox
+        self.show_thresh_cb = QCheckBox("Display Threshold Line on Spectrum")
+        self.show_thresh_cb.setChecked(True)
+        self.show_thresh_cb.toggled.connect(self.showThresholdToggled.emit)
+        intr_card.layout().addWidget(self.show_thresh_cb)
+        
         self.intruder_table = QTableWidget(0, 3)
         self.intruder_table.setHorizontalHeaderLabels(["Freq (MHz)", "Power", "Signature"])
         self.intruder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.intruder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.intruder_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.intruder_table.setColumnWidth(0, 68)
-        self.intruder_table.setColumnWidth(1, 68)
+        self.intruder_table.setColumnWidth(0, 78)
+        self.intruder_table.setColumnWidth(1, 78)
         self.intruder_table.verticalHeader().setVisible(False)
         self.intruder_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.intruder_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.intruder_table.setSortingEnabled(True)
+        self.intruder_table.horizontalHeader().setSortIndicatorShown(True)
+        self.intruder_table.horizontalHeader().setSortIndicator(1, Qt.SortOrder.DescendingOrder)
         self.intruder_table.setMinimumHeight(200)
         self.intruder_table.setStyleSheet("""
             QTableWidget {
@@ -93,6 +123,10 @@ class ThreatsPanel(QWidget):
                 border: none;
                 border-bottom: 1px solid #30363d;
                 padding: 3px 2px;
+            }
+            QHeaderView::section:hover {
+                background-color: #21262d;
+                color: #f0f6fc;
             }
             QTableWidget::item {
                 padding: 2px 3px;
