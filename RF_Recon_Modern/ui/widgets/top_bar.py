@@ -247,6 +247,7 @@ class TopBar(QWidget):
         intr_layout.addWidget(self.intr_prev_btn)
         intr_layout.addWidget(self.intr_label)
         intr_layout.addWidget(self.intr_next_btn)
+        self.intruder_frame.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         main_layout.addWidget(self.intruder_frame)
         
         main_layout.addStretch()
@@ -480,7 +481,7 @@ class TopBar(QWidget):
             if current_freq is not None:
                 self.intr_label.setText(f"Threat {current_idx + 1}/{count}: {current_freq:.2f} MHz")
             else:
-                self.intr_label.setText(f"Intruders Detected ({count})")
+                self.intr_label.setText(f"Threats Detected ({count})")
         else:
             self.intruder_frame.hide()
 

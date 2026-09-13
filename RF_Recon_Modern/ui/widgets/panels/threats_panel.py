@@ -71,12 +71,12 @@ class ThreatsPanel(QWidget):
         self.intruder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.intruder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.intruder_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.intruder_table.setColumnWidth(0, 78)
-        self.intruder_table.setColumnWidth(1, 66)
+        self.intruder_table.setColumnWidth(0, 68)
+        self.intruder_table.setColumnWidth(1, 68)
         self.intruder_table.verticalHeader().setVisible(False)
         self.intruder_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.intruder_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.intruder_table.setMinimumHeight(160)
+        self.intruder_table.setMinimumHeight(200)
         self.intruder_table.setStyleSheet("""
             QTableWidget {
                 background-color: #0d1117;
