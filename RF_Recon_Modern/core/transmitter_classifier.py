@@ -472,16 +472,17 @@ class TransmitterClassifier:
         # ---------------------------------------------------------------------
         # 2. ANALOG FM & HYBRID TRANSMITTER CLASSIFICATION
         # ---------------------------------------------------------------------
-        # A. Shure PSM 1000 (P10T Analog FM Stereo IEM)
-        is_psm1000 = (
+        # A. Shure PSM 1000 / Sennheiser IEM (Analog FM Stereo In-Ear Monitor)
+        # Carson's rule for stereo MPX (19 kHz pilot + 38 kHz L-R subcarrier) gives 150 - 275 kHz BW
+        is_stereo_iem = (
             pilot_info["has_stereo_iem_19k"] or
-            (160.0 <= obw20 <= 275.0 and sf >= 1.65 and not pilot_info["has_sony_32382k"])
+            (150.0 <= obw20 <= 275.0 and sf >= 1.60)
         )
-        if is_psm1000:
-            confidence = 96 if pilot_info["has_stereo_iem_19k"] else 90
+        if is_stereo_iem:
+            confidence = 96 if pilot_info["has_stereo_iem_19k"] else 92
             pilot_detail = "19 kHz MPX Pilot" if pilot_info["has_stereo_iem_19k"] else "Stereo MPX Envelope"
             return {
-                "device": "Shure PSM 1000 (Stereo IEM)",
+                "device": "Shure PSM 1000 / Sennheiser IEM",
                 "category": "Analog FM Stereo In-Ear",
                 "confidence": confidence,
                 "obw_3db_khz": obw,
@@ -506,26 +507,26 @@ class TransmitterClassifier:
                 "details": f"Wide dynamic FM stereo deviation ({obw20:.0f} kHz BW | SF: {sf:.2f})"
             }
 
-        # C. Sony UWP-D (Digital Processing FM)
-        if pilot_info["has_sony_32382k"] or (150.0 <= obw20 <= 215.0 and 1.60 <= sf <= 2.20):
-            confidence = 95 if pilot_info["has_sony_32382k"] else 86
+        # C. Sony UWP-D (Digital Processing FM Mono Mic)
+        # Mono wireless mic (< 150 kHz BW) with verified 32.382 kHz tone squelch
+        if pilot_info["has_sony_32382k"] and obw20 < 150.0:
             return {
                 "device": "Sony UWP-D (Digital Processing FM)",
                 "category": "Hybrid DSP / FM Wireless",
-                "confidence": confidence,
+                "confidence": 95,
                 "obw_3db_khz": obw,
                 "obw_20db_khz": obw20,
                 "shape_factor": sf,
                 "is_digital": False,
                 "color": "#00897b",
-                "details": "Sony UWP-D Series (DSP companding / 32.382 kHz tone squelch)"
+                "details": f"Sony UWP-D Series (DSP companding / 32.382 kHz tone squelch | {obw20:.0f} kHz BW)"
             }
 
-        # D. Sennheiser evolution wireless G3/G4 / 2000 Series (Analog FM)
-        if pilot_info["has_senn_32768k"]:
+        # D. Sennheiser evolution wireless G3/G4 / 2000 Series (Analog FM Mono Mic)
+        if pilot_info["has_senn_32768k"] and obw20 < 150.0:
             return {
                 "device": "Sennheiser G3/G4 (Analog FM)",
-                "category": "Analog Wireless Mic / IEM",
+                "category": "Analog Wireless Mic",
                 "confidence": 96,
                 "obw_3db_khz": obw,
                 "obw_20db_khz": obw20,
@@ -535,8 +536,8 @@ class TransmitterClassifier:
                 "details": "32.768 kHz ultrasonic pilot tone detected"
             }
 
-        # E. Shure UHF-R / ULX (Analog FM)
-        if pilot_info["has_shure_32k"]:
+        # E. Shure UHF-R / ULX (Analog FM Mono Mic)
+        if pilot_info["has_shure_32k"] and obw20 < 150.0:
             return {
                 "device": "Shure UHF-R / ULX (Analog FM)",
                 "category": "Analog Wireless Mic",
