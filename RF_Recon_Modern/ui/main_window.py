@@ -1010,7 +1010,8 @@ class MainWindow(QMainWindow):
             ref_lvl = params.get("ref_level", -10.0)
             preamp = params.get("preamp", 0)
             atten = params.get("atten", 0)
-            self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten)
+            decimate = params.get("decimate", 256)
+            self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten, decimate)
             self.top_bar.dev_label.setText(f"Hardware MSCAN: {len(channels)} channels hopping @ {dwell*1000:.1f}ms")
         else:
             self.multi_device_manager.set_operating_mode("SWP")
@@ -1025,7 +1026,8 @@ class MainWindow(QMainWindow):
                 ref_lvl = params.get("ref_level", -10.0)
                 preamp = params.get("preamp", 0)
                 atten = params.get("atten", 0)
-                self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten)
+                decimate = params.get("decimate", 256)
+                self.multi_device_manager.configure_mscan(channels, dwell, det, ref_lvl, preamp, atten, decimate)
 
     def _on_mscan_channels_selected(self, selected_channels: list):
         self.mscan_view.set_channels(selected_channels)

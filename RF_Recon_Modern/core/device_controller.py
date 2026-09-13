@@ -552,7 +552,12 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     data_queue.put(("error", f"IQS configuration failed (Status: {status})"))
 
             elif isinstance(cmd, tuple) and cmd[0] == "mscan_config":
-                channels, dwell_time, detector, r_lvl, preamp, atten = cmd[1]
+                if len(cmd[1]) >= 7:
+                    channels, dwell_time, detector, r_lvl, preamp, atten, decimate = cmd[1]
+                else:
+                    channels, dwell_time, detector, r_lvl, preamp, atten = cmd[1]
+                    decimate = 256
+
                 if current_mode == "MSCAN" and mscan_running:
                     try:
                         dll.MSCAN_Stop(ctypes.pointer(device))
@@ -573,13 +578,14 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     mscan_profiles_in = (MSCAN_Profile_TypeDef * num_channels)()
                     mscan_profiles_out = (MSCAN_Profile_TypeDef * num_channels)()
                     det_enum = Detector_TypeDef.Detector_PosPeak if detector == 1 else (Detector_TypeDef.Detector_Average if detector == 2 else Detector_TypeDef.Detector_RMS)
+                    dec_val = int(decimate if decimate in (64, 128, 256, 512, 1024) else 256)
                     for i, ch in enumerate(channels):
                         f_hz = float(ch if isinstance(ch, (int, float)) else ch.get("freq_hz", ch.get("freq", 500e6)))
                         p = mscan_profiles_in[i]
                         p.CenterFreq_Hz = f_hz
                         p.RefLevel_dBm = float(r_lvl)
                         p.DwellTime = float(dwell_time)
-                        p.DecimateFactor = 64
+                        p.DecimateFactor = dec_val
                         p.FFTSize = 512
                         p.DetectCount = 1
                         p.Detector = det_enum
@@ -1013,18 +1019,6 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                         pts = int(mscan_data.SpectrumPoints)
                         scale = float(mscan_data.ScaleTodBm)
                         offset = float(mscan_data.OffsetTodBm)
-                        spec_dbm = None
-                        peak_power = -120.0
-                        if pts > 0:
-                            raw_u8 = np.frombuffer(mscan_spec_buf, dtype=np.uint8, count=pts)
-                            spec_dbm = raw_u8.astype(np.float32) * scale + offset
-                            # Channel bandwidth window: ±26 bins around center frequency (~200 kHz carrier mask)
-                            center_bin = pts // 2
-                            ch_bins = spec_dbm[max(0, center_bin - 26): min(pts, center_bin + 27)]
-                            peak_power = float(np.max(ch_bins)) if len(ch_bins) > 0 else float(spec_dbm[center_bin])
-                        else:
-                            peak_power = offset
-
                         ch_freq = 0.0
                         ch_info = {}
                         if 0 <= el_idx < len(mscan_channels):
@@ -1034,6 +1028,22 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                                 ch_info = ch_obj
                             else:
                                 ch_freq = float(ch_obj)
+
+                        spec_dbm = None
+                        peak_power = -120.0
+                        if pts > 0:
+                            raw_u8 = np.frombuffer(mscan_spec_buf, dtype=np.uint8, count=pts)
+                            spec_dbm = raw_u8.astype(np.float32) * scale + offset
+                            center_bin = pts // 2
+                            span_hz = float(mscan_info.Span_Hz) if mscan_info.Span_Hz > 0 else 396730.0
+                            bin_hz = span_hz / max(1, pts)
+                            # Wireless mic channel mask: 150 kHz for HD modes, 200 kHz standard
+                            target_mask_hz = 150e3 if (isinstance(ch_info, dict) and any(k in str(ch_info.get("name", "")).lower() or k in str(ch_info.get("group_name", "")).lower() for k in ("hd", "high density", "adhd", "d6000"))) else 200e3
+                            half_bins = max(1, int(round((target_mask_hz / 2.0) / bin_hz)))
+                            ch_bins = spec_dbm[max(0, center_bin - half_bins): min(pts, center_bin + half_bins + 1)]
+                            peak_power = float(np.max(ch_bins)) if len(ch_bins) > 0 else float(spec_dbm[center_bin])
+                        else:
+                            peak_power = offset
 
                         data_queue.put(("mscan_data", (el_idx, ch_freq, peak_power, spec_dbm, {
                             "repeat_index": int(mscan_data.RepeatIndex),
@@ -1455,9 +1465,9 @@ class DeviceController(QObject):
         if self.command_queue:
             self.command_queue.put(("iqs_config", (center_freq_hz, decimate_factor, ref_level, trig_src, trig_length, preamp, atten)))
 
-    def configure_mscan(self, channels: list, dwell_time: float = 0.001, detector: int = 1, ref_level: float = 0.0, preamp: int = 0, atten: int = 0):
+    def configure_mscan(self, channels: list, dwell_time: float = 0.001, detector: int = 1, ref_level: float = 0.0, preamp: int = 0, atten: int = 0, decimate: int = 256):
         if self.command_queue:
-            self.command_queue.put(("mscan_config", (channels, dwell_time, detector, ref_level, preamp, atten)))
+            self.command_queue.put(("mscan_config", (channels, dwell_time, detector, ref_level, preamp, atten, decimate)))
 
     def set_operating_mode(self, mode_str: str, params: dict = None):
         if self.command_queue:
