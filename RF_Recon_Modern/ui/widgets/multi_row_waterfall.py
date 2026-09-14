@@ -206,6 +206,9 @@ class WaterfallRowStrip(QWidget):
             if is_ps:
                 brush = pg.mkBrush(QColor(239, 68, 68, 40))
                 pen = pg.mkPen(QColor(248, 113, 113, 120), width=1, style=Qt.PenStyle.DashLine)
+            elif ch_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
+                brush = pg.mkBrush(QColor(100, 116, 139, 50))
+                pen = pg.mkPen(QColor(148, 163, 184, 130), width=1.5, style=Qt.PenStyle.DashLine)
             elif ch_type == "uplink":
                 brush = pg.mkBrush(QColor(236, 72, 153, 35))
                 pen = pg.mkPen(QColor(244, 114, 182, 110), width=1, style=Qt.PenStyle.DashLine)

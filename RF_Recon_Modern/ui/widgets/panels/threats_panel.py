@@ -7,10 +7,10 @@ Soundbase frequency coordination JSON imports, and active channel markers.
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
     QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QTreeWidget, QTreeWidgetItem,
-    QFrame, QScrollArea, QTableWidgetItem
+    QFrame, QScrollArea, QTableWidgetItem, QMenu, QColorDialog
 )
-from PyQt6.QtGui import QColor, QBrush, QFont
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush, QFont, QAction
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """
@@ -33,16 +33,18 @@ class NumericTableWidgetItem(QTableWidgetItem):
 
 class ThreatsPanel(QWidget):
     """
-    Intruder alert monitoring, Soundbase coordination file import, and marker management panel.
+    Intruder alert monitoring, Soundbase / WWB coordination file import, and marker management panel.
     """
     intruderAlertToggled = pyqtSignal(bool)
     intruderThresholdChanged = pyqtSignal(float)
     showThresholdToggled = pyqtSignal(bool)
     clearIntrudersClicked = pyqtSignal()
     addIntruderToMarkersClicked = pyqtSignal()
-    loadSoundbaseClicked = pyqtSignal()
+    loadCoordinationClicked = pyqtSignal()
+    loadSoundbaseClicked = loadCoordinationClicked # Backwards compatible alias
     markerItemChanged = pyqtSignal(object, int)
     carrierSelected = pyqtSignal(float)
+    carrierColorChanged = pyqtSignal(str, str) # carrier_id, color_hex
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -156,24 +158,27 @@ class ThreatsPanel(QWidget):
         btn_layout.addWidget(self.add_marker_btn)
         intr_card.layout().addLayout(btn_layout)
         
-        # --- 2. SOUNDBASE JSON IMPORTS CARD ---
+        # --- 2. SOUNDBASE / WWB IMPORTS CARD ---
         json_card = self._create_card("FREQUENCY COORDINATION IMPORT", layout)
         
-        self.btn_soundbase_json = QPushButton("Import Soundbase Site JSON")
+        self.btn_soundbase_json = QPushButton("SB / WWB Import")
+        self.btn_soundbase_json.setToolTip("Import Soundbase (.sbcoordsite, .json) or Wireless Workbench (.csv)")
         self.btn_soundbase_json.setStyleSheet("""
             QPushButton {
                 background-color: #21262d;
-                color: #8b949e;
+                color: #f0f6fc;
                 font-weight: 600;
                 padding: 6px;
+                border: 1px solid #30363d;
                 border-radius: 4px;
             }
             QPushButton:hover {
                 background-color: #30363d;
-                color: #f0f6fc;
+                border-color: #8b949e;
+                color: #ffffff;
             }
         """)
-        self.btn_soundbase_json.clicked.connect(self.loadSoundbaseClicked.emit)
+        self.btn_soundbase_json.clicked.connect(self.loadCoordinationClicked.emit)
         json_card.layout().addWidget(self.btn_soundbase_json)
         
         self.soundbase_status_lbl = QLabel("No coordination file active")
@@ -192,6 +197,8 @@ class ThreatsPanel(QWidget):
         self.markers_tree.setColumnWidth(1, 80)
         self.markers_tree.setIndentation(14)
         self.markers_tree.setMinimumHeight(240)
+        self.markers_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.markers_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self.markers_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #0d1117;
@@ -241,7 +248,7 @@ class ThreatsPanel(QWidget):
         return card
 
     def set_soundbase_active(self, filename: str, count: int):
-        self.btn_soundbase_json.setText("Soundbase JSON Loaded")
+        self.btn_soundbase_json.setText("Coordination Loaded")
         self.btn_soundbase_json.setStyleSheet("""
             QPushButton {
                 background-color: #238636;
@@ -392,4 +399,56 @@ class ThreatsPanel(QWidget):
         if freq is not None:
             self.carrierSelected.emit(float(freq))
 
+    def _on_tree_context_menu(self, pos: QPoint):
+        item = self.markers_tree.itemAt(pos)
+        if not item:
+            return
+        c_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if c_id is None:
+            return
 
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #1f6feb;
+                color: #ffffff;
+            }
+        """)
+        ch_name = item.text(0)
+        action_color = menu.addAction(f"Change Color for '{ch_name}'...")
+        chosen = menu.exec(self.markers_tree.viewport().mapToGlobal(pos))
+        if chosen == action_color:
+            current_brush = item.foreground(0)
+            initial_color = current_brush.color() if current_brush.color().isValid() else QColor("#38bdf8")
+            selected_color = QColorDialog.getColor(initial_color, self, f"Select Color for {ch_name}")
+            if selected_color.isValid():
+                hex_col = selected_color.name()
+                item.setForeground(0, QBrush(selected_color))
+                self.carrierColorChanged.emit(str(c_id), hex_col)
+
+    def update_carrier_color(self, carrier_id: str, new_color_hex: str):
+        c_id = str(carrier_id)
+        qcol = QColor(new_color_hex)
+        if not qcol.isValid():
+            return
+        def search_tree(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if str(child.data(0, Qt.ItemDataRole.UserRole + 1)) == c_id:
+                    child.setForeground(0, QBrush(qcol))
+                    return True
+                if search_tree(child):
+                    return True
+            return False
+
+        for idx in range(self.markers_tree.topLevelItemCount()):
+            top = self.markers_tree.topLevelItem(idx)
+            if search_tree(top):
+                break

@@ -55,6 +55,7 @@ from .widgets.panels.mscan_panel import MSCANPanel
 from .widgets.mscan_view import MSCANView
 from core.demod_engine import DemodEngine, DemodResult
 from core.soundbase_parser import SoundbaseParser
+from core.wwb_parser import WWBParser
 
 from .dialogs.cal_dialogs import CalibrationManagerDialog, MissingCalDialog, DragDropCalDialog, ClearCalDialog
 from .dialogs.connection_dialog import ConnectionDialog
@@ -137,6 +138,7 @@ class MainWindow(QMainWindow):
         self.tband_detect_active = False
         self.tband_history = []
         self.active_channels = {}
+        self.coordination_ps_channels = set()
         self.station_db_names = {}
         self.marker_items = {}
         
@@ -429,21 +431,24 @@ class MainWindow(QMainWindow):
         self.threats_panel.intruder_table.cellClicked.connect(self._on_intruder_row_clicked)
         self.threats_panel.clearIntrudersClicked.connect(self._clear_intruders)
         self.threats_panel.addIntruderToMarkersClicked.connect(self._add_intruders_to_markers)
-        self.threats_panel.loadSoundbaseClicked.connect(self.load_soundbase_json)
+        self.threats_panel.loadCoordinationClicked.connect(self.load_coordination_file)
         self.threats_panel.markerItemChanged.connect(self._on_marker_tree_item_changed)
         self.threats_panel.carrierSelected.connect(self._on_soundbase_carrier_selected)
+        self.threats_panel.carrierColorChanged.connect(self._on_carrier_color_changed)
 
         # MSCAN Panel & View
         self.multi_device_manager.mscan_data_ready.connect(self._on_mscan_data)
         self.mscan_panel.scanToggled.connect(self._on_mscan_toggled)
         self.mscan_panel.paramsChanged.connect(self._on_mscan_params_changed)
-        self.mscan_panel.loadSoundbaseClicked.connect(self.load_soundbase_json)
+        self.mscan_panel.loadCoordinationClicked.connect(self.load_coordination_file)
         self.mscan_panel.channelsSelectionChanged.connect(self._on_mscan_channels_selected)
         self.mscan_panel.tuneAudioDemodRequested.connect(self.tune_audio_demod_carrier)
         self.mscan_panel.inspectRtsaRequested.connect(self.inspect_rtsa_carrier)
+        self.mscan_panel.carrierColorChanged.connect(self._on_carrier_color_changed)
 
         self.mscan_view.tuneDemodRequested.connect(self.tune_audio_demod_carrier)
         self.mscan_view.inspectRtsaRequested.connect(self.inspect_rtsa_carrier)
+        self.mscan_view.carrierColorChanged.connect(self._on_carrier_color_changed)
 
     def _init_state(self):
         # Active regional presets & channels
@@ -2158,30 +2163,117 @@ class MainWindow(QMainWindow):
                 break
         self._update_hud_readout(freq, pwr)
 
-    def load_soundbase_json(self, filepath: str = None):
+    def load_coordination_file(self, filepath: str = None):
+        """
+        Loads frequency coordination from either Soundbase (.sbcoordsite, .json)
+        or Shure Wireless Workbench (.csv).
+        Validates file format and prompts the user if invalid.
+        """
         if filepath:
             fp = filepath
         else:
-            default_dir = "/home/parallels/Documents/Harogic Projects/Soundbase Resources"
+            default_dir = "/home/parallels/Documents/Harogic Projects"
             if not os.path.exists(default_dir):
                 default_dir = ""
             fp, _ = QFileDialog.getOpenFileName(
-                self, "Load Soundbase Site Coordination", default_dir, "Soundbase Files (*.sbcoordsite *.json);;All Files (*.*)"
+                self,
+                "Load Coordination File (Soundbase / Wireless Workbench)",
+                default_dir,
+                "Supported Files (*.sbcoordsite *.json *.csv);;Soundbase Files (*.sbcoordsite *.json);;Wireless Workbench (*.csv);;All Files (*.*)"
             )
-        if fp:
-            try:
+
+        if not fp:
+            return
+
+        ext = Path(fp).suffix.lower()
+        if ext not in [".json", ".sbcoordsite", ".csv"]:
+            QMessageBox.warning(
+                self,
+                "Invalid File Format",
+                "Unsupported file selected.\n\nPlease upload a valid Soundbase JSON file (*.json, *.sbcoordsite) or a Wireless Workbench CSV file (*.csv)."
+            )
+            return
+
+        try:
+            if ext == ".csv":
+                parsed = WWBParser.parse_file(fp)
+            else:
                 parsed = SoundbaseParser.parse_file(fp)
-                carriers = parsed.get("all_carriers", [])
-                self.spectrum_view.set_soundbase_masks(carriers)
-                self.threats_panel.populate_soundbase_tree(parsed)
-                site_name = parsed["sites"][0]["name"] if parsed.get("sites") else Path(fp).stem
-                self.threats_panel.set_soundbase_active(site_name, len(carriers))
-                if hasattr(self, 'mscan_panel'):
-                    self.mscan_panel.set_soundbase_data(parsed)
-                if hasattr(self, 'mscan_view'):
-                    self.mscan_view.set_channels(carriers)
-            except Exception as e:
-                QMessageBox.warning(self, "Import Notice", f"Failed to parse Soundbase file: {e}")
+
+            carriers = parsed.get("all_carriers", [])
+            self.spectrum_view.set_soundbase_masks(carriers)
+            self.threats_panel.populate_soundbase_tree(parsed)
+            site_name = parsed["sites"][0]["name"] if parsed.get("sites") else Path(fp).stem
+            self.threats_panel.set_soundbase_active(site_name, len(carriers))
+            if hasattr(self, 'mscan_panel'):
+                self.mscan_panel.set_soundbase_data(parsed)
+            if hasattr(self, 'mscan_view'):
+                self.mscan_view.set_channels(carriers)
+
+            # Check for exclusions imported from WWB
+            active_tv = parsed.get("active_tv_channels", [])
+            active_ps = parsed.get("active_public_safety_channels", [])
+            if active_tv or active_ps:
+                for ch in active_tv:
+                    self.active_channels[ch] = True
+                for ch in active_ps:
+                    self.coordination_ps_channels.add(ch)
+
+                # Ensure North America Channel 37 is strictly off-limits (Active)
+                if self.current_region == "North America":
+                    self.active_channels[37] = True
+
+                self._refresh_channel_masks_all_views()
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Invalid File Format",
+                f"Failed to parse coordination file:\n{e}\n\nPlease ensure you upload a valid Soundbase JSON file (*.json, *.sbcoordsite) or a Wireless Workbench CSV file (*.csv)."
+            )
+
+    def load_soundbase_json(self, filepath: str = None):
+        """Backwards compatibility wrapper for load_coordination_file."""
+        self.load_coordination_file(filepath)
+
+    def _refresh_channel_masks_all_views(self):
+        """Redraws channel and exclusion masks across all spectrum viewports."""
+        ps_dict = {ch: True for ch in range(14, 21)} if self.tband_detect_active else {}
+        for ch in self.coordination_ps_channels:
+            ps_dict[ch] = True
+
+        std = TV_CHANNEL_STANDARDS.get(self.current_region, [])
+        self.spectrum_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+        self.waterfall_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+        self.spectrum_view.update_channel_masks(self.active_channels, std, ps_dict, self.station_db_names)
+        self.waterfall_view.update_channel_masks(self.active_channels, std, ps_dict)
+        if hasattr(self, 'multi_row_view'):
+            self.multi_row_view.set_active_channels(self.active_channels, ps_dict)
+            self.multi_row_view.update_channel_masks(self.active_channels, std, ps_dict)
+        if hasattr(self, 'rtsa_view'):
+            self.rtsa_view.set_active_channels(self.active_channels, ps_dict)
+            self.rtsa_view.update_channel_masks(self.active_channels, std, ps_dict, self.station_db_names)
+        if hasattr(self, 'demod_view'):
+            self.demod_view.spectrum_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+            self.demod_view.waterfall_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+
+    def _on_carrier_color_changed(self, carrier_id: str, new_color_hex: str):
+        """
+        Synchronizes per-frequency custom color selection across:
+        1. Threats & Markers hierarchy tree
+        2. Rapid Channel Monitor (MSCAN) hierarchy tree
+        3. Main Spectrum View carrier masks
+        4. Rapid Channel Monitor card widgets & timeline curve
+        """
+        c_id = str(carrier_id)
+        if hasattr(self, 'threats_panel'):
+            self.threats_panel.update_carrier_color(c_id, new_color_hex)
+        if hasattr(self, 'mscan_panel'):
+            self.mscan_panel.update_carrier_color(c_id, new_color_hex)
+        if hasattr(self, 'spectrum_view'):
+            self.spectrum_view.update_carrier_mask_color(c_id, new_color_hex)
+        if hasattr(self, 'mscan_view'):
+            self.mscan_view.update_channel_color(c_id, new_color_hex)
 
     # --- Calibration Management ---
     def open_calibration_manager(self, model=None, uid=None):

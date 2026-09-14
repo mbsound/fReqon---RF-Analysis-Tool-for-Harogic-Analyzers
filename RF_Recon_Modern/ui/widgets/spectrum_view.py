@@ -251,7 +251,10 @@ class SpectrumView(QWidget):
         if mask_w_px < 22:
             return ""
             
-        line1 = f"DTV {ch_label}"
+        if str(ch_label).strip() == "37":
+            line1 = "CH 37 - OFF LIMITS" if mask_w_px >= 90 else ("CH 37" if mask_w_px >= 40 else "37")
+        else:
+            line1 = f"DTV {ch_label}"
         if mask_w_px >= 85:
             line2 = f"{f_start:g} - {f_stop:g} MHz"
         elif mask_w_px >= 55:
@@ -411,6 +414,12 @@ class SpectrumView(QWidget):
                 pen = pg.mkPen(QColor(248, 113, 113, 120), width=1, style=Qt.PenStyle.DashLine)
                 hdr_color = "#f87171"
                 border_color = QColor(248, 113, 113, 160)
+            elif ch_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
+                # Channel 37 is radio astronomy / medical telemetry - OFF LIMITS (Gray mask)
+                brush = pg.mkBrush(QColor(100, 116, 139, 50))
+                pen = pg.mkPen(QColor(148, 163, 184, 130), width=1.5, style=Qt.PenStyle.DashLine)
+                hdr_color = "#94a3b8"
+                border_color = QColor(148, 163, 184, 160)
             elif ch_type == "uplink":
                 brush = pg.mkBrush(QColor(236, 72, 153, 35))
                 pen = pg.mkPen(QColor(244, 114, 182, 110), width=1, style=Qt.PenStyle.DashLine)
@@ -555,6 +564,18 @@ class SpectrumView(QWidget):
         c_id = str(carrier_id)
         if c_id in self.soundbase_masks:
             self.soundbase_masks[c_id].setVisible(visible)
+
+    def update_carrier_mask_color(self, carrier_id: str, new_color_hex: str):
+        c_id = str(carrier_id)
+        if c_id in self.soundbase_masks:
+            qcol = QColor(new_color_hex)
+            if not qcol.isValid():
+                qcol = QColor("#38bdf8")
+            brush = pg.mkBrush(QColor(qcol.red(), qcol.green(), qcol.blue(), 55))
+            pen = pg.mkPen(QColor(qcol.red(), qcol.green(), qcol.blue(), 200), width=1.2, style=Qt.PenStyle.SolidLine)
+            self.soundbase_masks[c_id].setBrush(brush)
+            for line in self.soundbase_masks[c_id].lines:
+                line.setPen(pen)
 
     def clear_soundbase_masks(self):
         for region in self.soundbase_masks.values():

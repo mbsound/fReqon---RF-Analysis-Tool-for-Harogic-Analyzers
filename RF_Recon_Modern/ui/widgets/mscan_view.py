@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-    QFrame, QScrollArea, QSplitter, QMenu, QComboBox, QSizePolicy
+    QFrame, QScrollArea, QSplitter, QMenu, QComboBox, QSizePolicy, QColorDialog
 )
 from PyQt6.QtGui import QColor, QFont, QPainter, QBrush, QPen, QLinearGradient
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
@@ -23,6 +23,7 @@ class ChannelCard(QFrame):
     """
     tuneDemodRequested = pyqtSignal(float)
     inspectRtsaRequested = pyqtSignal(float)
+    carrierColorChanged = pyqtSignal(str, str) # carrier_id, new_color_hex
 
     def __init__(self, carrier: dict, parent=None):
         super().__init__(parent)
@@ -145,18 +146,33 @@ class ChannelCard(QFrame):
                 color: #ffffff;
             }
         """)
+        act_color = menu.addAction("Change Color...")
         act_demod = menu.addAction(f"Tune Audio Demod ({self.freq_mhz:.3f} MHz)")
         act_rtsa = menu.addAction(f"Inspect in RTSA ({self.freq_mhz:.3f} MHz)")
         act_reset = menu.addAction("Reset Peak Hold")
 
         action = menu.exec(event.globalPos())
-        if action == act_demod:
+        if action == act_color:
+            selected_color = QColorDialog.getColor(QColor(self.color_hex), self, f"Select Color for {self.name}")
+            if selected_color.isValid():
+                hex_col = selected_color.name()
+                self.set_color(hex_col)
+                self.carrierColorChanged.emit(self.channel_id, hex_col)
+        elif action == act_demod:
             self.tuneDemodRequested.emit(self.freq_mhz)
         elif action == act_rtsa:
             self.inspectRtsaRequested.emit(self.freq_mhz)
         elif action == act_reset:
             self.peak_power_dbm = self.current_power_dbm
             self.peak_lbl.setText(f"Pk: {self.peak_power_dbm:.1f}")
+
+    def set_color(self, new_color_hex: str):
+        self.color_hex = new_color_hex
+        self.carrier["color"] = new_color_hex
+        self.accent_lbl.setStyleSheet(f"background-color: {new_color_hex}; border-radius: 2px;")
+        pen = pg.mkPen(color=new_color_hex, width=1.5)
+        self.sparkline_curve.setPen(pen)
+        self._update_card_style()
 
     def update_power(self, power_dbm: float, dropout_threshold_dbm: float = -75.0):
         self.current_power_dbm = power_dbm
@@ -236,6 +252,7 @@ class MSCANView(QWidget):
     """
     tuneDemodRequested = pyqtSignal(float)
     inspectRtsaRequested = pyqtSignal(float)
+    carrierColorChanged = pyqtSignal(str, str) # carrier_id, color_hex
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -361,6 +378,7 @@ class MSCANView(QWidget):
             card = ChannelCard(ch)
             card.tuneDemodRequested.connect(self.tuneDemodRequested.emit)
             card.inspectRtsaRequested.connect(self.inspectRtsaRequested.emit)
+            card.carrierColorChanged.connect(self.carrierColorChanged.emit)
             self.channel_cards[idx] = card
 
             # Add timeline trace for first 8 channels
@@ -373,6 +391,17 @@ class MSCANView(QWidget):
                 self.timeline_data[idx] = np.full(120, -110.0, dtype=np.float32)
 
         self._reflow_grid()
+
+    def update_channel_color(self, carrier_id: str, new_color_hex: str):
+        """Updates the color for a specific channel across its card and timeline curve."""
+        c_id = str(carrier_id)
+        for idx, card in self.channel_cards.items():
+            if str(card.channel_id) == c_id:
+                card.set_color(new_color_hex)
+                if idx in self.timeline_curves:
+                    pen = pg.mkPen(color=new_color_hex, width=1.8)
+                    self.timeline_curves[idx].setPen(pen)
+                break
 
     def update_channel_data(self, element_idx: int, freq_hz: float, peak_power_dbm: float, spec_data, info: dict, dropout_thresh_dbm: float = -75.0):
         """Updates live RF power for a single hopped channel."""
