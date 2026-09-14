@@ -32,7 +32,8 @@ TV_CHANNEL_STANDARDS = {
             "start_ch": 37,
             "end_ch": 37,
             "start_freq": 608.0,
-            "spacing": 6.0
+            "spacing": 6.0,
+            "type": "ch37"
         },
         {
             "custom_items": [

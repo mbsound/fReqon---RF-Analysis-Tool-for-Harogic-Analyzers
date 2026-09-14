@@ -391,6 +391,11 @@ class RTSAView(QWidget):
                     pen = pg.mkPen('#ef4444', width=1, style=Qt.PenStyle.DashLine)
                     border_color = '#ef4444'
                     hdr_color = '#f87171'
+                elif c_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
+                    brush = pg.mkBrush(100, 116, 139, 50)
+                    pen = pg.mkPen('#94a3b8', width=1.5, style=Qt.PenStyle.DashLine)
+                    border_color = '#94a3b8'
+                    hdr_color = '#94a3b8'
                 elif c_type == "uplink":
                     brush = pg.mkBrush(16, 185, 129, 40)
                     pen = pg.mkPen('#10b981', width=1, style=Qt.PenStyle.DashLine)

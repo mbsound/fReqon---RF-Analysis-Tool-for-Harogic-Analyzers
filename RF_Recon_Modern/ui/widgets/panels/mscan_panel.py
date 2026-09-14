@@ -7,10 +7,11 @@ dwell timing, RF dropout alarms, and Zone/Group channel filtering.
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
     QCheckBox, QDoubleSpinBox, QComboBox, QTreeWidget, QTreeWidgetItem,
-    QFrame, QScrollArea, QHeaderView, QTableWidget, QTableWidgetItem
+    QFrame, QScrollArea, QHeaderView, QTableWidget, QTableWidgetItem,
+    QMenu, QColorDialog
 )
-from PyQt6.QtGui import QColor, QBrush, QFont
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush, QFont, QAction
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 
 class MSCANPanel(QWidget):
     """
@@ -18,10 +19,12 @@ class MSCANPanel(QWidget):
     """
     scanToggled = pyqtSignal(bool)
     paramsChanged = pyqtSignal(dict)
-    loadSoundbaseClicked = pyqtSignal()
+    loadCoordinationClicked = pyqtSignal()
+    loadSoundbaseClicked = loadCoordinationClicked # Backwards compatible alias
     channelsSelectionChanged = pyqtSignal(list) # list of selected carrier dicts
     tuneAudioDemodRequested = pyqtSignal(float)
     inspectRtsaRequested = pyqtSignal(float)
+    carrierColorChanged = pyqtSignal(str, str) # carrier_id, color_hex
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -128,13 +131,14 @@ class MSCANPanel(QWidget):
 
         layout.addWidget(param_card)
 
-        # --- 3. SOUNDBASE COORDINATION CARD ---
+        # --- 3. SOUNDBASE / WWB COORDINATION CARD ---
         sb_card = self._create_card("COORDINATION & CHANNELS")
         sb_layout = QVBoxLayout(sb_card)
         sb_layout.setContentsMargins(8, 8, 8, 8)
         sb_layout.setSpacing(6)
 
-        self.btn_load_sb = QPushButton("Import Soundbase File")
+        self.btn_load_sb = QPushButton("SB / WWB Import")
+        self.btn_load_sb.setToolTip("Import Soundbase (.sbcoordsite, .json) or Wireless Workbench (.csv)")
         self.btn_load_sb.setStyleSheet("""
             QPushButton {
                 background-color: #21262d;
@@ -150,7 +154,7 @@ class MSCANPanel(QWidget):
                 border-color: #8b949e;
             }
         """)
-        self.btn_load_sb.clicked.connect(self.loadSoundbaseClicked.emit)
+        self.btn_load_sb.clicked.connect(self.loadCoordinationClicked.emit)
         sb_layout.addWidget(self.btn_load_sb)
 
         self.sb_file_lbl = QLabel("No coordination file loaded")
@@ -167,6 +171,8 @@ class MSCANPanel(QWidget):
         self.channel_tree.setColumnWidth(1, 80)
         self.channel_tree.setIndentation(14)
         self.channel_tree.setFixedHeight(220)
+        self.channel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.channel_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self.channel_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #0d1117;
@@ -386,6 +392,7 @@ class MSCANPanel(QWidget):
                         ch_item.setFlags(ch_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                         ch_item.setCheckState(0, Qt.CheckState.Checked)
                         ch_item.setData(0, Qt.ItemDataRole.UserRole, carrier)
+                        ch_item.setData(0, Qt.ItemDataRole.UserRole + 1, str(carrier.get("id", f_mhz)))
                         ch_item.setForeground(0, QBrush(QColor(c_color)))
                         ch_item.setForeground(1, QBrush(QColor("#f0f6fc")))
 
@@ -404,6 +411,73 @@ class MSCANPanel(QWidget):
         self.channel_tree.expandAll()
         self.channel_tree.blockSignals(False)
         self._update_selected_carriers()
+
+    def _on_tree_context_menu(self, pos: QPoint):
+        item = self.channel_tree.itemAt(pos)
+        if not item:
+            return
+        carrier = item.data(0, Qt.ItemDataRole.UserRole)
+        c_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if not carrier or c_id is None:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #1f6feb;
+                color: #ffffff;
+            }
+        """)
+        ch_name = item.text(0)
+        action_color = menu.addAction(f"Change Color for '{ch_name}'...")
+        action_tune = menu.addAction(f"Tune Audio Demod ({carrier.get('freq_mhz', 0.0):.3f} MHz)")
+        action_rtsa = menu.addAction(f"Inspect in RTSA ({carrier.get('freq_mhz', 0.0):.3f} MHz)")
+
+        chosen = menu.exec(self.channel_tree.viewport().mapToGlobal(pos))
+        if chosen == action_color:
+            current_brush = item.foreground(0)
+            initial_color = current_brush.color() if current_brush.color().isValid() else QColor("#38bdf8")
+            selected_color = QColorDialog.getColor(initial_color, self, f"Select Color for {ch_name}")
+            if selected_color.isValid():
+                hex_col = selected_color.name()
+                item.setForeground(0, QBrush(selected_color))
+                carrier["color"] = hex_col
+                self.carrierColorChanged.emit(str(c_id), hex_col)
+        elif chosen == action_tune:
+            self.tuneAudioDemodRequested.emit(carrier.get("freq_mhz", 0.0))
+        elif chosen == action_rtsa:
+            self.inspectRtsaRequested.emit(carrier.get("freq_mhz", 0.0))
+
+    def update_carrier_color(self, carrier_id: str, new_color_hex: str):
+        c_id = str(carrier_id)
+        qcol = QColor(new_color_hex)
+        if not qcol.isValid():
+            return
+
+        def search_tree(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if str(child.data(0, Qt.ItemDataRole.UserRole + 1)) == c_id:
+                    child.setForeground(0, QBrush(qcol))
+                    carrier_data = child.data(0, Qt.ItemDataRole.UserRole)
+                    if isinstance(carrier_data, dict):
+                        carrier_data["color"] = new_color_hex
+                    return True
+                if search_tree(child):
+                    return True
+            return False
+
+        for idx in range(self.channel_tree.topLevelItemCount()):
+            top = self.channel_tree.topLevelItem(idx)
+            if search_tree(top):
+                break
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
         if column != 0:
