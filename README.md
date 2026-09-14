@@ -36,11 +36,23 @@
 
 fReqon's **Threat Detection & Intruder Alert** system provides automated, real-time protection against uncoordinated and unauthorized RF carriers during live productions:
 
-- **Approved Carrier Masking via Soundbase**: Import a Soundbase frequency coordination file (`.sbcoordsite` / JSON) to load your authorized production frequencies. fReqon automatically creates protective channel masks around all approved transmitters.
-- **Broadcast DTV Masking**: Overlay North American (ATSC 6 MHz) or European (OFCOM 8 MHz) television allocations to account for known licensed broadcast stations.
-- **Dynamic Threshold Evaluation**: An interactive threshold line on the spectrum display defines the trip level. Any live RF peak exceeding this threshold that is **not** inside an approved Soundbase mask or active DTV mask is immediately flagged as a potential threat.
+- **Approved Carrier Masking via Soundbase & Wireless Workbench**: Import frequency coordination files from **Soundbase** (`.sbcoordsite` / JSON) or **Shure Wireless Workbench** (`.csv`) to automatically load authorized production frequencies, channel names, equipment profiles, and custom colors. fReqon automatically generates protective channel masks around all approved transmitters and integrates user exclusions.
+- **Broadcast DTV & Radio Astronomy Masking**: Overlay North American (ATSC 6 MHz) or European (OFCOM 8 MHz) television allocations, alongside a mandatory Channel 37 (608–614 MHz) radio astronomy and medical telemetry protection mask.
+- **Dynamic Threshold Evaluation**: An interactive threshold line on the spectrum display defines the trip level. Any live RF peak exceeding this threshold that is **not** inside an approved coordination mask or active DTV mask is immediately flagged as a potential threat.
 - **Spectral Signature Analysis**: For every flagged threat, the engine analyzes the signal’s occupied bandwidth, shape, and modulation characteristics to identify candidate transmitter types (e.g., Shure Axient Digital, Wisycom, Sennheiser, analog FM, or generic carriers).
 - **Rapid Navigation & Mitigation**: Operators can click any entry in the live Threats Table to snap tracking crosshairs and HUD readouts directly onto the rogue carrier, cycle through active alerts via top-bar steppers, or convert threats into permanent avoidance markers with one click.
+
+---
+
+## Rapid Channel Monitor (Hardware MSCAN Mode)
+
+Rather than continuously sweeping across hundreds of megahertz to check individual carriers, the **Rapid Channel Monitor** leverages Harogic's hardware-accelerated discrete channel scanning mode (**MSCAN**):
+
+- **High-Speed Discrete Channel Hopping**: The hardware analyzer rapidly steps through a discrete list of user-assigned carrier frequencies, measuring true peak and average RSSI levels across dozens or hundreds of frequencies in milliseconds.
+- **Responsive 5-Column Grid**: Each coordinated wireless channel is rendered as an interactive card displaying channel name, operating frequency, real-time signal strength meter (dBm RSSI), and peak power indicators.
+- **Coordination Color Integration**: Channel cards and tree items adopt the custom color tags defined in your Soundbase or Shure Wireless Workbench coordination plans for immediate visual identification.
+- **Selectable IF Filter Bandwidths**: Choose from 100 kHz, 200 kHz, 400 kHz, or 800 kHz IF channel filter bandwidths with hardware decimation factors (up to Decimate 256) to cleanly isolate tightly spaced carriers in high-density RF environments.
+- **Clean Engine Transitions**: Seamless hardware state transitions allow instant switching between Rapid Channel Monitoring, Swept-Spectrum (SWP), and RTSA without driver desynchronization.
 
 ---
 
@@ -63,7 +75,10 @@ fReqon includes a comprehensive Digital and Analog Demodulation suite, enabling 
 ## Core Capabilities
 
 - **Real-Time Spectrum Analysis (RTSA)**: High-speed hardware DPX acquisition streaming dense persistence sweeps at over 150 FPS.
+- **Rapid Discrete Channel Monitoring (MSCAN)**: Hardware discrete frequency polling across Soundbase and Wireless Workbench carrier lists.
 - **Multi-Row Folded Waterfall**: Splits wideband spans across 2, 3, 4, or 8 rows to preserve critical horizontal pixel density for narrowband wireless channels.
+- **Coordination Importers**: Native support for **Shure Wireless Workbench** (`.csv`) and **Soundbase** (`.sbcoordsite` / JSON) with auto-generated masks and custom colors.
+- **Regulatory & Astronomy Protection**: Automated DTV station overlays and mandatory Channel 37 (608–614 MHz) radio astronomy exclusion zones.
 - **Audio Demodulation Engine**: High-fidelity live demodulation for AM, FM, WFM, LSB, and USB signals with bandpass filtering and low-latency audio playback.
 - **Zero-Span Time Domain (DET)**: High-speed oscilloscope-style burst and pulse repetition analysis.
 - **Digital Intercom & Protocol Analyzers**:
@@ -79,17 +94,25 @@ fReqon includes a comprehensive Digital and Analog Demodulation suite, enabling 
 ├── RF_Recon_Modern/          # Modern modular application architecture
 │   ├── main.py               # Main application entry point
 │   ├── core/                 # DSP engines, Harogic C-API wrapper, and analyzers
-│   │   ├── device_controller.py      # Hardware subprocess worker and queue reader
+│   │   ├── device_controller.py      # Hardware subprocess worker (SWP, RTSA, MSCAN, DET)
 │   │   ├── multi_device_manager.py   # Multi-device orchestration and topologies
 │   │   ├── demod_engine.py           # AM/FM/SSB audio DSP demodulator
 │   │   ├── transmitter_classifier.py # RF signal signature recognition engine
+│   │   ├── soundbase_parser.py       # Soundbase JSON coordination parser
+│   │   ├── wwb_parser.py             # Shure Wireless Workbench (.csv) coordination parser
 │   │   ├── dect_analyzer.py          # DECT / Bolero timeslot analyzer
 │   │   ├── showlink_crmx_analyzer.py # 2.4 GHz wireless stage equipment analyzer
 │   │   └── fcc_database.py           # FCC & OFCOM digital TV lookup engines
 │   └── ui/                   # PySide6 / PyQt6 widgets, dialogs, and themes
-│       ├── main_window.py            # Primary application window & hub
+│       ├── main_window.py            # Primary application window & navigation hub
 │       ├── theme.py                  # Obsidian dark industrial styling
 │       └── widgets/                  # Viewports, waterfall, and control panels
+│           ├── mscan_view.py         # Rapid Channel Monitor 5-column grid view
+│           ├── spectrum_view.py      # Real-time spectrum plot with interactive markers
+│           ├── waterfall_view.py     # High-speed spectrogram view
+│           ├── multi_row_waterfall.py# Folded high-resolution waterfall
+│           └── panels/               # Sliding dock panels (MSCAN, Threats, RTSA, etc.)
+├── Shure_Coord_Example.csv   # Sample Shure Wireless Workbench coordination report
 ├── RF_Recon_App/             # Legacy monolithic application archive
 ├── API/                      # Harogic Linux API, SDK drivers, and examples
 ├── CalFile/                  # Hardware calibration tables

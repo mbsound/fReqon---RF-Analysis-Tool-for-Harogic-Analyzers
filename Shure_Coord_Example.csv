@@ -1,0 +1,126 @@
+
+
+
+
+
+
+
+Unnamed show
+
+
+
+
+
+
+
+Point of contact,,,Venue information,,
+Point of contact:,,,Venue:,,
+Address:,,,Address:,,
+Phone:,,,Phone:,,
+E-mail:,,,E-mail:,,
+Notes:,,,,,
+
+
+
+
+
+Coordination report
+
+
+RF zone: Default   
+
+Primary frequencies (11)
+Type,Band,Channel name,Group & Channel,Frequency,
+No Inclusion Group (11),,,,,
+AD/Standard,G57,,G:-- Ch:--,488.225 MHz,
+AD/Standard,G57,,G:-- Ch:--,491.575 MHz,
+AD/Standard,G57,,G:-- Ch:--,504.625 MHz,
+AD/Standard,G57,,G:-- Ch:--,506.775 MHz,
+AD/Standard,G57,,G:-- Ch:--,508.400 MHz,
+AD/Standard,G57,,G:-- Ch:--,515.250 MHz,
+AD/Standard,G57,,G:-- Ch:--,521.725 MHz,
+AD/Standard,G57,,G:-- Ch:--,561.400 MHz,
+AD/Standard,G57,,G:-- Ch:--,563.325 MHz,
+AD/Standard,G57,,G:-- Ch:--,573.825 MHz,
+AD/Standard,G57,,G:-- Ch:--,577.300 MHz,
+
+
+
+
+Backup frequencies (0),,
+
+,
+
+
+RF zone: Zone 2   
+
+Primary frequencies (10)
+Type,Band,Channel name,Group & Channel,Frequency,
+No Inclusion Group (10),,,,,
+EM 6000,A1A4,,G:-- Ch:--,488.675 MHz,
+EM 6000,A1A4,,G:-- Ch:--,490.475 MHz,
+EM 6000,A1A4,,G:-- Ch:--,493.575 MHz,
+EM 6000,A1A4,,G:-- Ch:--,502.350 MHz,
+EM 6000,A1A4,,G:-- Ch:--,507.400 MHz,
+EM 6000,A1A4,,G:-- Ch:--,513.600 MHz,
+EM 6000,A1A4,,G:-- Ch:--,516.300 MHz,
+EM 6000,A1A4,,G:-- Ch:--,516.700 MHz,
+EM 6000,A1A4,,G:-- Ch:--,518.700 MHz,
+EM 6000,A1A4,,G:-- Ch:--,557.025 MHz,
+
+
+
+
+Backup frequencies (0),,
+
+,
+
+
+RF zone: Zone 3   
+
+Primary frequencies (10)
+Type,Band,Channel name,Group & Channel,Frequency,
+No Inclusion Group (10),,,,,
+PSM1000,J8,,G:-- Ch:--,558.275 MHz,
+PSM1000,J8,,G:-- Ch:--,562.400 MHz,
+PSM1000,J8,,G:-- Ch:--,567.275 MHz,
+PSM1000,J8,,G:-- Ch:--,574.975 MHz,
+PSM1000,J8,,G:-- Ch:--,614.775 MHz,
+PSM1000,J8,,G:-- Ch:--,615.850 MHz,
+PSM1000,J8,,G:-- Ch:--,616.350 MHz,
+PSM1000,J8,,G:-- Ch:--,618.850 MHz,
+PSM1000,J8,,G:-- Ch:--,624.125 MHz,
+PSM1000,J8,,G:-- Ch:--,625.800 MHz,
+
+
+
+
+Backup frequencies (0),,
+
+,
+
+
+
+
+
+Frequency coordination parameters
+
+
+Exclusions
+
+
+Active TV channels (17)
+
+Type,Channels,,,
+Digital,11, 12, 18, 23, 24, 25, 26, 27, 32, 34, 35, 36, 7, 8,,,
+Public Safety,14, 15, 16,,,
+
+
+Other exclusions (0)
+
+
+Created on 14 Sep 2026 at 6:21PM
+
+
+Generated using Wireless Workbench 7.8.2.63
+
