@@ -25,6 +25,7 @@ class SweepPanel(QWidget):
     quickSettingToggled = pyqtSignal(int, bool)
     editQuickSettingsClicked = pyqtSignal()
     amplitudeChanged = pyqtSignal()
+    scaleDivChanged = pyqtSignal(float)
     autoRefLevelClicked = pyqtSignal()
     sweepSettingsChanged = pyqtSignal()
     detectSettingsChanged = pyqtSignal()
@@ -167,6 +168,14 @@ class SweepPanel(QWidget):
         
         self.auto_ref_btn = QPushButton("Auto Ref. Level")
         self.auto_ref_btn.clicked.connect(self.autoRefLevelClicked.emit)
+
+        # Scale / Division Selector
+        self.scale_div_combo = QComboBox()
+        self.scale_div_combo.addItem("10 dB / div", 10.0)
+        self.scale_div_combo.addItem("5 dB / div", 5.0)
+        self.scale_div_combo.addItem("2 dB / div", 2.0)
+        self.scale_div_combo.addItem("1 dB / div", 1.0)
+        self.scale_div_combo.currentIndexChanged.connect(self._on_scale_div_changed)
         
         atten_container = QWidget()
         atten_layout = QHBoxLayout(atten_container)
@@ -221,6 +230,7 @@ class SweepPanel(QWidget):
         
         amp_form.addRow("Ref. Level:", self.ref_level_spin)
         amp_form.addRow("", self.auto_ref_btn)
+        amp_form.addRow("Scale / Div:", self.scale_div_combo)
         amp_form.addRow("Attenuation:", atten_container)
         amp_form.addRow("Pre-Amplifier:", self.preamp_combo)
         amp_form.addRow("Amp. Offset:", self.amp_offset_spin)
@@ -421,6 +431,24 @@ class SweepPanel(QWidget):
     def _on_auto_atten_toggled(self, checked: bool):
         self.atten_spin.setEnabled(not checked)
         self.amplitudeChanged.emit()
+
+    def _on_scale_div_changed(self, idx: int):
+        val = self.scale_div
+        self.scaleDivChanged.emit(val)
+        self.amplitudeChanged.emit()
+
+    @property
+    def scale_div(self) -> float:
+        data = self.scale_div_combo.currentData()
+        return float(data) if data is not None else 10.0
+
+    def set_scale_div(self, val: float):
+        for i in range(self.scale_div_combo.count()):
+            if abs(float(self.scale_div_combo.itemData(i)) - float(val)) < 0.01:
+                self.scale_div_combo.blockSignals(True)
+                self.scale_div_combo.setCurrentIndex(i)
+                self.scale_div_combo.blockSignals(False)
+                break
 
     @property
     def attenuation(self) -> int:
