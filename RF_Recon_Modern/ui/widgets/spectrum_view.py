@@ -10,6 +10,40 @@ from PyQt6.QtCore import Qt, pyqtSignal, QPointF
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QCursor
 from .channel_marker_bar import MHzAxisItem, ChannelMarkerBar
 
+class PowerDbAxisItem(pg.AxisItem):
+    """
+    Dedicated RF Spectrum Y-Axis Item.
+    Maintains exact graticule division ticks aligned to the hardware Reference Level at the top,
+    with custom scale per division (e.g., 10 dB/div, 5 dB/div, 2 dB/div, 1 dB/div).
+    """
+    def __init__(self, orientation='left', ref_level=0.0, scale_div=10.0, num_divisions=10, **kwargs):
+        super().__init__(orientation, **kwargs)
+        self.ref_level = float(ref_level)
+        self.scale_div = float(scale_div)
+        self.num_divisions = int(num_divisions)
+
+    def set_params(self, ref_level: float, scale_div: float, num_divisions: int = 10):
+        self.ref_level = float(ref_level)
+        self.scale_div = float(scale_div)
+        self.num_divisions = int(num_divisions)
+        self.picture = None
+        self.update()
+
+    def tickValues(self, minVal, maxVal, size):
+        major = [self.ref_level - i * self.scale_div for i in range(self.num_divisions + 1)]
+        minor = []
+        if self.scale_div >= 2.0:
+            sub = self.scale_div / 2.0
+            for m in major[:-1]:
+                minor.append(m - sub)
+        return [
+            (self.scale_div, [t for t in major if (minVal - 0.05) <= t <= (maxVal + 0.05)]),
+            (self.scale_div / 2.0, [t for t in minor if (minVal - 0.05) <= t <= (maxVal + 0.05)])
+        ]
+
+    def tickStrings(self, values, scale, spacing):
+        return [f"{v:.0f}" if abs(v - round(v)) < 0.01 else f"{v:.1f}" for v in values]
+
 class SpectrumView(QWidget):
     """
     Main Spectrum Plot Viewport with real-time trace rendering and interactive HUD.
@@ -25,6 +59,9 @@ class SpectrumView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._x_multiplier = 1e6 # MHz base
+        self.ref_level = 0.0
+        self.scale_div = 10.0
+        self.num_divisions = 10
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -37,6 +74,20 @@ class SpectrumView(QWidget):
         self.title_label = QLabel("REAL-TIME SPECTRUM (SWP MODE)")
         self.title_label.setStyleSheet("font-weight: 700; font-size: 11px; color: #8b949e; letter-spacing: 0.5px;")
         header_layout.addWidget(self.title_label)
+
+        # Scale & Reference Level Badge
+        self.scale_badge = QLabel("REF: 0.0 dBm | 10 dB/DIV")
+        self.scale_badge.setStyleSheet("""
+            background-color: #161b22;
+            color: #facc15;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+            font-weight: 700;
+            font-size: 10px;
+        """)
+        header_layout.addWidget(self.scale_badge)
         
         header_layout.addStretch()
         
@@ -70,12 +121,17 @@ class SpectrumView(QWidget):
         
         layout.addLayout(header_layout)
         
-        # Plot Widget
-        self.plot_widget = pg.PlotWidget(axisItems={'bottom': MHzAxisItem(orientation='bottom')})
+        # Plot Widget with Custom PowerDbAxisItem linked to Ref Level
+        self.power_axis = PowerDbAxisItem('left', ref_level=self.ref_level, scale_div=self.scale_div, num_divisions=self.num_divisions)
+        self.plot_widget = pg.PlotWidget(axisItems={
+            'bottom': MHzAxisItem(orientation='bottom'),
+            'left': self.power_axis
+        })
         self.plot_widget.setBackground('#0d1117')
         self.plot_widget.setLabel('left', 'Power', units='dBm')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
-        self.plot_widget.setYRange(-130, 10, padding=0)
+        initial_bottom = self.ref_level - (self.scale_div * self.num_divisions)
+        self.plot_widget.setYRange(initial_bottom, self.ref_level, padding=0)
         self.plot_widget.hideButtons()
         self.plot_widget.getViewBox().setMouseEnabled(x=True, y=False)
         self.plot_widget.getViewBox().disableAutoRange()
@@ -234,18 +290,28 @@ class SpectrumView(QWidget):
 
     def _calc_text_y_pos(self):
         try:
-            vb = self.plot_widget.getViewBox()
-            y_range = vb.viewRange()[1]
-            y_min, y_max = y_range[0], y_range[1]
-            # When scale spans +10 to -30 dBm (or whenever 0 dBm is in range), use 0 dBm as reference
-            if y_min < 0.0 < y_max:
-                return 0.0
-            elif y_max <= 0.0:
-                return y_max - (y_max - y_min) * 0.12
-            else:
-                return y_max - 10.0
+            # Position station badges neatly below the top reference level line (0.3 divisions below ceiling)
+            return self.ref_level - (self.scale_div * 0.30)
         except Exception:
-            return 0.0
+            return self.ref_level - 3.0
+
+    def set_amplitude_scale(self, ref_level: float, scale_div: float = 10.0):
+        """
+        Links the Spectrum View Y-axis height directly to the hardware Reference Level
+        and user-defined Scale/Div (dB/division).
+        The reference level forms the exact top line of the graticule.
+        """
+        self.ref_level = float(ref_level)
+        self.scale_div = max(0.5, float(scale_div))
+        bottom = self.ref_level - (self.scale_div * self.num_divisions)
+
+        self.power_axis.set_params(self.ref_level, self.scale_div, self.num_divisions)
+        self.plot_widget.setYRange(bottom, self.ref_level, padding=0)
+
+        div_str = f"{self.scale_div:.0f}" if abs(self.scale_div - round(self.scale_div)) < 0.01 else f"{self.scale_div:.1f}"
+        self.scale_badge.setText(f"REF: {self.ref_level:.1f} dBm | {div_str} dB/DIV")
+
+        self._update_text_items()
 
     def _fit_channel_text(self, mask_w_px, ch_label, f_start, f_stop, hdr_color, call_sign):
         if mask_w_px < 22:

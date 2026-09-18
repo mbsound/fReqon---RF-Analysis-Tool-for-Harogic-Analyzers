@@ -376,6 +376,7 @@ class MainWindow(QMainWindow):
         self.sweep_panel.quickSettingToggled.connect(self._on_quick_setting_toggled)
         self.sweep_panel.editQuickSettingsClicked.connect(self.open_quick_settings_editor)
         self.sweep_panel.amplitudeChanged.connect(self.apply_amplitude_settings)
+        self.sweep_panel.scaleDivChanged.connect(self._on_scale_div_changed)
         self.sweep_panel.autoRefLevelClicked.connect(self.auto_reference_level)
         self.sweep_panel.sweepSettingsChanged.connect(self.apply_sweep_settings)
         self.sweep_panel.detectSettingsChanged.connect(self.apply_detect_settings)
@@ -596,6 +597,9 @@ class MainWindow(QMainWindow):
         self.sweep_panel.ref_level_spin.blockSignals(True)
         self.sweep_panel.ref_level_spin.setValue(ref_level)
         self.sweep_panel.ref_level_spin.blockSignals(False)
+        self.spectrum_view.set_amplitude_scale(ref_level, self.sweep_panel.scale_div)
+        if hasattr(self, 'demod_view') and hasattr(self.demod_view, 'spectrum_view'):
+            self.demod_view.spectrum_view.set_amplitude_scale(ref_level, self.sweep_panel.scale_div)
         if atten >= 0:
             self.sweep_panel.atten_spin.blockSignals(True)
             self.sweep_panel.atten_spin.setValue(atten)
@@ -1378,9 +1382,20 @@ class MainWindow(QMainWindow):
             self.apply_view_frequencies()
 
     # --- Amplitude, BW & Sweep Configuration ---
-    def apply_amplitude_settings(self):
-        if not self.is_connected: return
+    def _on_scale_div_changed(self, scale_div: float):
         ref = self.sweep_panel.ref_level_spin.value()
+        self.spectrum_view.set_amplitude_scale(ref, scale_div)
+        if hasattr(self, 'demod_view') and hasattr(self.demod_view, 'spectrum_view'):
+            self.demod_view.spectrum_view.set_amplitude_scale(ref, scale_div)
+
+    def apply_amplitude_settings(self):
+        ref = self.sweep_panel.ref_level_spin.value()
+        scale_div = self.sweep_panel.scale_div
+        self.spectrum_view.set_amplitude_scale(ref, scale_div)
+        if hasattr(self, 'demod_view') and hasattr(self.demod_view, 'spectrum_view'):
+            self.demod_view.spectrum_view.set_amplitude_scale(ref, scale_div)
+
+        if not self.is_connected: return
         atten = self.sweep_panel.attenuation
         preamp = self.sweep_panel.preamp_combo.currentData()
         if preamp is None:
