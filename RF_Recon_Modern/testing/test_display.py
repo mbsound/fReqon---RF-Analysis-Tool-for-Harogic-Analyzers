@@ -234,9 +234,195 @@ def test_disconnect_clears_the_display():
     win.close()
 
 
+def test_linked_view_retunes_the_sweep():
+    """View linked to the sweep: zooming or dragging a plot by hand moves the analyzer sweep too."""
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from ui.main_window import MainWindow
+    MainWindow.connect_analyzer = lambda self: None          # never touch real hardware here
+    win = MainWindow()
+    win.settings = QSettings(os.path.join(tempfile.mkdtemp(), "t.ini"), QSettings.Format.IniFormat)
+    sp = win.sweep_panel
+
+    def by_hand(plot, lo, hi):
+        vb = plot.getViewBox()
+        vb.setXRange(lo, hi, padding=0)
+        vb.sigRangeChangedManually.emit(vb.state["mouseEnabled"])
+        end = time.monotonic() + 0.6                         # the gesture comes to rest
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.01)
+
+    def sweep():
+        return round(sp.start_spin.value(), 3), round(sp.stop_spin.value(), 3)
+
+    sp.link_view_check.setChecked(True)
+    sp.start_spin.setValue(470.0)
+    sp.stop_spin.setValue(608.0)
+    sp.frequenciesChanged.emit()
+    by_hand(win.spectrum_view.plot_widget, 500.0, 540.0)
+    assert sweep() == (500.0, 540.0), sweep()
+    by_hand(win.waterfall_view.waterfall_widget, 510.0, 520.0)      # the waterfall shares the X axis
+    assert sweep() == (510.0, 520.0), sweep()
+
+    # A view moved by the program (a click on a TV channel) leaves the sweep alone
+    sp.view_start_spin.setValue(512.0)
+    sp.view_stop_spin.setValue(514.0)
+    win.apply_view_frequencies()
+    app.processEvents()
+    assert sweep() == (510.0, 520.0), sweep()
+
+    # Unlinked: the view moves on its own
+    sp.link_view_check.setChecked(False)
+    by_hand(win.spectrum_view.plot_widget, 480.0, 490.0)
+    assert sweep() == (510.0, 520.0), sweep()
+    assert round(sp.view_start_spin.value(), 3) == 480.0
+
+
+def test_dual_spectrum_in_diversity():
+    """Diversity: the Dual Spectrum layout shows antenna A and antenna B each in a spectrum view."""
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    from ui.main_window import MainWindow
+    from core.multi_device_manager import MultiDeviceTopology
+    MainWindow.connect_analyzer = lambda self: None          # never touch real hardware here
+    win = MainWindow()
+    win.settings = QSettings(os.path.join(tempfile.mkdtemp(), "t.ini"), QSettings.Format.IniFormat)
+    win.show()
+    bar, combo = win.top_bar, win.top_bar.view_mode_combo
+    assert combo.findText(bar.DUAL_SPECTRUM) < 0, "only offered in diversity"
+
+    win.multi_device_manager.topology = MultiDeviceTopology.DIVERSITY
+    bar.set_multi_device_state(MultiDeviceTopology.DIVERSITY, {})
+    assert combo.findText(bar.DUAL_SPECTRUM) >= 0
+    win.is_sweeping = win.is_connected = True
+    combo.setCurrentText(bar.DUAL_SPECTRUM)
+    app.processEvents()
+    a, b = win.spectrum_view, win.spectrum_view_b
+    assert a.isVisible() and b.isVisible() and not win.waterfall_view.isVisible()
+    assert not bar.focus_combo.isEnabled()
+
+    f = np.linspace(470e6, 608e6, 500)
+    pa, pb = np.full(500, -90.0), np.full(500, -80.0)
+    win._last_div_render_time = 0.0
+    win._on_diversity_sweep_data(f, pa, pb, pa - pb)
+    assert a.curves["Trace A"].isVisible() and not a.curves["Trace B"].isVisible()
+    assert abs(a.curves["Trace A"].getData()[1][0] + 90.0) < 1e-6
+    assert b.curves["Trace B"].isVisible() and abs(b.curves["Trace B"].getData()[1][0] + 80.0) < 1e-6
+
+    # Both views share the frequency axis and the amplitude scale
+    win.sweep_panel.ref_level_spin.setValue(-20.0)
+    app.processEvents()
+    assert b.ref_level == a.ref_level == -20.0
+    a.set_view_range(500.0, 520.0)
+    app.processEvents()
+    lo, hi = b.plot_widget.viewRange()[0]
+    assert abs(lo - 500.0) < 0.01 and abs(hi - 520.0) < 0.01
+
+    # Channel masks and coordinated-carrier masks are on both views
+    win.spectrum_view.set_soundbase_masks([{"id": "c1", "name": "Vox 1", "f_start_mhz": 522.3, "f_stop_mhz": 522.5,
+                                            "color": "#22c55e", "model": "Axient Digital"}])
+    assert set(a.soundbase_masks) == set(b.soundbase_masks) and len(b.soundbase_masks) == 1, b.soundbase_masks
+    win.spectrum_view.set_soundbase_mask_visible(next(iter(a.soundbase_masks)), False)
+    assert not next(iter(b.soundbase_masks.values())).isVisible()
+    win.spectrum_view.set_soundbase_mask_visible(next(iter(a.soundbase_masks)), True)
+    assert set(a.channel_masks) == set(b.channel_masks)
+
+    # The ETSI mask of a carrier hangs on the level each antenna receives it at
+    f = np.linspace(520e6, 525e6, 2001)
+    pa, pb = np.full(2001, -100.0), np.full(2001, -100.0)
+    on = np.abs(f - 522.4e6) <= 100e3
+    pa[on], pb[on] = -40.0, -60.0
+    win._last_sweep = (f, pa)
+    win._last_div_render_time = 0.0
+    win._on_diversity_sweep_data(f, pa, pb, pa - pb)
+    win._mask_draw_time = 0.0
+    win._draw_carrier_masks()
+    top = lambda view: max(float(np.nanmax(item.getData()[1])) for item in view._emission_mask_items.values()
+                           if item.isVisible() and item.getData()[1] is not None and len(item.getData()[1]))
+    assert abs((top(a) - top(b)) - 20.0) < 0.5, (top(a), top(b))
+
+    # Max hold, min hold and average: antenna B has its own, on its own view
+    rows = win.sweep_panel.trace_rows
+    for name in ("Max. Hold", "Min. Hold", "Average"):
+        rows[name]["cb"].setChecked(True)
+    win.sweep_panel.avg_sweeps_spin.setValue(4)
+    win._reset_b_holds()
+    f = np.linspace(470e6, 608e6, 500)
+    quiet = np.full(500, -100.0)
+    for n, level_b in enumerate((-80.0, -70.0, -90.0)):
+        win.multi_device_manager.slots["slot_b"].last_update_time = 100.0 + n      # a new sweep from B
+        win._last_div_render_time = 0.0
+        win._on_diversity_sweep_data(f, quiet, np.full(500, level_b), quiet - level_b)
+    got = lambda name: float(b.curves[name].getData()[1][0])
+    assert b.curves["Max. Hold"].isVisible() and abs(got("Max. Hold") + 70.0) < 1e-6, got("Max. Hold")
+    assert abs(got("Min. Hold") + 90.0) < 1e-6 and abs(got("Average") + 80.0) < 1e-6, (got("Min. Hold"), got("Average"))
+    rows["Max. Hold"]["cb"].setChecked(False)
+    assert not b.curves["Max. Hold"].isVisible()
+
+    # Intruders: what only antenna B hears is listed too, and says so
+    win.spectrum_view.set_soundbase_masks([])
+    win.threats_panel.intruder_thresh_spin.setValue(-75.0)
+    win.intruders.clear()
+    pa, pb = np.full(500, -100.0), np.full(500, -100.0)
+    ia, ib, iab = 100, 250, 400
+    pa[ia], pb[ib] = -50.0, -55.0
+    pa[iab], pb[iab] = -60.0, -45.0
+    win._last_div_render_time = 0.0
+    win._on_diversity_sweep_data(f, pa, pb, pa - pb)
+    win._process_intruder_sweep(f, pa)
+    by_ant = {e["antenna"]: (k, e["power"]) for k, e in win.intruders.items()}
+    assert set(by_ant) == {"A", "B", "B>A"}, win.intruders
+    assert abs(by_ant["B"][0] - f[ib] / 1e6) < 0.01 and abs(by_ant["B"][1] + 55.0) < 1e-6
+    assert abs(by_ant["B>A"][1] + 45.0) < 1e-6, "listed at the level of the antenna that hears it best"
+    win.intruders.clear()
+
+    # DECT, ShowLink and Broadcast / DTV each read the antenna chosen in their panel
+    win._refresh_antenna_sources()
+    for panel in (win.dect_panel, win.showlink_panel, win.dtv_panel):
+        row = panel.antenna_row
+        assert not row.isHidden() and not row.combo.isHidden() and row.note.isHidden() and row.choice() == "A"
+    win._last_div_render_time = 0.0
+    win._on_diversity_sweep_data(f, pa, pb, pa - pb)
+    assert win._detector_sweep(win.dect_panel, f, pa)[1][ia] == -50.0
+    win.dect_panel.antenna_row.combo.setCurrentIndex(1)
+    assert win.dect_panel.antenna_row.choice() == "B"
+    assert win._detector_sweep(win.dect_panel, f, pa)[1][ib] == -55.0, "DECT reads antenna B"
+    assert win._detector_sweep(win.dtv_panel, f, pa)[1][ia] == -50.0, "the others keep their own choice"
+    # ... and so do its zero-span captures, once analyzer B is there to take them
+    assert win._detector_slot(win.dect_panel) is None
+    win.multi_device_manager.slots["slot_b"].is_connected = True
+    assert win._detector_slot(win.dect_panel) == "slot_b" and win._detector_slot(win.showlink_panel) is None
+    win.multi_device_manager.slots["slot_b"].is_connected = False
+
+    # Split sweep: no choice, a note on where the readings come from
+    win.multi_device_manager.topology = MultiDeviceTopology.SPLIT_SWEEP
+    win._refresh_antenna_sources()
+    row = win.dect_panel.antenna_row
+    assert not row.isHidden() and row.combo.isHidden() and not row.note.isHidden() and "analyzer A" in row.note.text()
+    assert row.choice() == "A" and win._detector_sweep(win.dect_panel, f, pa)[1] is pa
+    win.multi_device_manager.topology = MultiDeviceTopology.SINGLE
+    win._refresh_antenna_sources()
+    assert win.dect_panel.antenna_row.isHidden()
+    win.multi_device_manager.topology = MultiDeviceTopology.DIVERSITY
+    win._refresh_antenna_sources()
+
+    # Back to the usual layout, and out of diversity the choice is gone
+    combo.setCurrentText("Dual View")
+    app.processEvents()
+    assert not b.isVisible() and win.waterfall_view.isVisible() and bar.focus_combo.isEnabled()
+    combo.setCurrentText(bar.DUAL_SPECTRUM)
+    bar.set_multi_device_state(MultiDeviceTopology.SINGLE, {})
+    app.processEvents()
+    assert combo.findText(bar.DUAL_SPECTRUM) < 0 and not b.isVisible() and win.waterfall_view.isVisible()
+
+
 if __name__ == "__main__":
     for test in (test_auto_ref_level, test_quick_band_presets, test_intermod_overlay_levels,
-                 test_disconnect_clears_the_display):
+                 test_disconnect_clears_the_display, test_linked_view_retunes_the_sweep,
+                 test_dual_spectrum_in_diversity):
         t0 = time.monotonic()
         test()
         print(f"ok  {test.__name__}  ({time.monotonic() - t0:.1f} s)")

@@ -291,6 +291,29 @@ QDoubleSpinBox:focus, QSpinBox:focus {{
     background-color: #1c2128;
 }}
 
+QLabel:disabled {{
+    color: {TEXT_MUTED};
+}}
+
+/* A field that cannot be changed right now: flat, dim, no stepper buttons */
+QDoubleSpinBox:disabled, QSpinBox:disabled {{
+    background-color: transparent;
+    color: {TEXT_MUTED};
+    border: 1px dashed {BORDER_SUBTLE};
+}}
+
+QDoubleSpinBox::up-button:disabled, QSpinBox::up-button:disabled,
+QDoubleSpinBox::down-button:disabled, QSpinBox::down-button:disabled {{
+    width: 0px;
+    border: none;
+    background: transparent;
+}}
+
+QDoubleSpinBox::up-arrow:disabled, QSpinBox::up-arrow:disabled,
+QDoubleSpinBox::down-arrow:disabled, QSpinBox::down-arrow:disabled {{
+    image: none;
+}}
+
 QDoubleSpinBox::up-button, QSpinBox::up-button {{
     subcontrol-origin: border;
     subcontrol-position: top right;

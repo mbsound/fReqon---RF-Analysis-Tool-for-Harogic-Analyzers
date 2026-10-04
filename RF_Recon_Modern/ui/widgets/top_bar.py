@@ -5,10 +5,10 @@ master sweep play/pause controls, live threat banners, trace pills, and regional
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QComboBox, QFrame, QSizePolicy, QMenu
+    QWidget, QHBoxLayout, QLabel, QPushButton, QComboBox, QFrame, QSizePolicy, QMenu, QLayout
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QRectF
+from PyQt6.QtGui import QColor, QPainter, QPixmap
 
 
 class ElidedLabel(QLabel):
@@ -93,10 +93,13 @@ class TopBar(QWidget):
         dev_chip_layout.setContentsMargins(4, 2, 4, 2)
         dev_chip_layout.setSpacing(6)
         
-        self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("color: #f43f5e; font-size: 12px;")
+        self.status_dot = QLabel()
+        self.status_dot.setStyleSheet("padding: 0px;")
+        self.status_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dot_connected = False
+        self._dot_halves = None         # two analyzers: (A connected, B connected)
+        self._paint_dot()
         self.status_dot.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.status_dot.setToolTip("Click to view Hardware Endorsements & Licenses")
         self.status_dot.mousePressEvent = lambda ev: self._show_endorsements_menu()
         
         self.dev_label = ElidedLabel("Disconnected")
@@ -206,6 +209,17 @@ class TopBar(QWidget):
         self.power_label = QLabel("-- W")
         self.power_label.hide()
         dev_chip_layout.addWidget(self.power_label)
+
+        # With several analyzers online: one readout per slot instead of the two labels above
+        self._slot_readouts = []
+        self._slot_chips = {}
+        self.slot_chip_frame = QFrame()
+        self.slot_chip_frame.setStyleSheet("background-color: transparent; border: none; padding: 0px;")
+        self.slot_chip_layout = QHBoxLayout(self.slot_chip_frame)
+        self.slot_chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.slot_chip_layout.setSpacing(4)
+        self.slot_chip_frame.hide()
+        dev_chip_layout.addWidget(self.slot_chip_frame)
         dev_chip_layout.addWidget(self.interface_btn)
         dev_chip_layout.addWidget(self.connect_btn)
         main_layout.addWidget(self.dev_chip, 0)
@@ -246,6 +260,7 @@ class TopBar(QWidget):
         main_layout.addWidget(self.play_pause_btn)
         
         self.fps_label = QLabel("0.0 FPS")
+        self.fps_label.setMinimumWidth(72)      # 9.5 FPS and 284.0 FPS take the same room
         self.fps_label.setStyleSheet("font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #8b949e;")
         main_layout.addWidget(self.fps_label)
         
@@ -346,6 +361,7 @@ class TopBar(QWidget):
         self.view_mode_combo.addItems(["Dual View", "Multi-Row Waterfall", "Spectrum Only", "Waterfall Only"])
         self.view_mode_combo.setToolTip("Select Viewport Canvas Layout")
         self.view_mode_combo.currentTextChanged.connect(self.viewModeChanged.emit)
+        self._fit_combo_list(self.view_mode_combo)
         main_layout.addWidget(self.view_mode_combo)
         
         # 7. Region: chosen in Preferences & Settings (the gear button), not here. The
@@ -363,7 +379,8 @@ class TopBar(QWidget):
         self.audio_btn.clicked.connect(self.audioDemodClicked.emit)
         main_layout.addWidget(self.audio_btn)
         
-        self.cal_btn = QPushButton("Calibration ▾")
+        self._cal_text = "Calibration ▾"
+        self.cal_btn = QPushButton(self._cal_text)
         self.cal_btn.setFixedHeight(24)
         cal_menu = QMenu(self.cal_btn)
         cal_menu.addAction("Calibration Manager…", self.calManagerClicked.emit)
@@ -385,7 +402,163 @@ class TopBar(QWidget):
         self.current_temp_c = temp_c
         self._update_temp_display()
 
+    def _format_temp(self, temp_c: float) -> str:
+        if self.temp_unit == "F":
+            return f"{temp_c * 9.0 / 5.0 + 32.0:.1f} °F"
+        return f"{temp_c:.1f} °C"
+
+    @staticmethod
+    def _temp_color(temp_c: float) -> str:
+        return "#10b981" if temp_c < 55.0 else ("#f59e0b" if temp_c < 70.0 else "#f43f5e")
+
+    DOT_OK, DOT_BAD = "#10b981", "#f43f5e"
+
+    def set_slot_connections(self, halves):
+        """
+        With two analyzers the connection dot is split: its left half is analyzer A, its
+        right half analyzer B, each green when connected and red when not. halves is
+        (A connected, B connected), or None for the plain dot of a single analyzer.
+        """
+        halves = tuple(bool(x) for x in halves) if halves is not None else None
+        if halves != self._dot_halves:
+            self._dot_halves = halves
+            self._paint_dot()
+
+    def _paint_dot(self):
+        size, d = 16, 12           # whole pixels: the two halves must be one circle
+        ratio = self.devicePixelRatioF() or 1.0
+        pm = QPixmap(int(size * ratio), int(size * ratio))
+        pm.setDevicePixelRatio(ratio)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        x = y = (size - d) / 2.0
+        rect = QRectF(x, y, d, d)
+        if self._dot_halves is None:
+            painter.setBrush(QColor(self.DOT_OK if self._dot_connected else self.DOT_BAD))
+            painter.drawEllipse(rect)
+            tip = "Connected" if self._dot_connected else "Not connected"
+        else:
+            a, b = self._dot_halves
+            # One circle drawn twice, each time clipped to its half: the halves cannot differ
+            # in outline (two pie slices do, by a fraction of a pixel)
+            mid = size / 2.0
+            for ok, clip in ((a, QRectF(0, 0, mid, size)), (b, QRectF(mid, 0, mid, size))):
+                painter.setClipRect(clip)
+                painter.setBrush(QColor(self.DOT_OK if ok else self.DOT_BAD))
+                painter.drawEllipse(rect)
+            painter.setClipping(False)
+            tip = (f"Left half, analyzer A: {'connected' if a else 'not connected'}\n"
+                   f"Right half, analyzer B: {'connected' if b else 'not connected'}")
+        painter.end()
+        self.status_dot.setPixmap(pm)
+        self.status_dot.setToolTip(tip + "\nClick to view Hardware Endorsements & Licenses")
+
+    def set_slot_readouts(self, entries: list):
+        """
+        One readout per connected analyzer, shown in place of the single temperature and
+        power labels when more than one is online. entries, in slot order:
+        [{"slot_id", "tag" ("A"), "name", "interface", "endorsements", "temp_c", "power"}]
+        Hover for the analyzer's details, click for its licenses and hardware.
+        """
+        self._slot_readouts = entries if len(entries) > 1 else []
+        wanted = [e["slot_id"] for e in self._slot_readouts]
+        changed = wanted != list(self._slot_chips) or bool(self._slot_readouts) != self.slot_chip_frame.isVisible()
+        for slot_id in [k for k in self._slot_chips if k not in wanted]:
+            chip = self._slot_chips.pop(slot_id)
+            self.slot_chip_layout.removeWidget(chip)
+            chip.deleteLater()
+        for i, e in enumerate(self._slot_readouts):
+            chip = self._slot_chips.get(e["slot_id"])
+            if chip is None:
+                chip = QLabel()
+                chip.setTextFormat(Qt.TextFormat.RichText)
+                chip.setCursor(Qt.CursorShape.PointingHandCursor)
+                chip.setStyleSheet("""
+                    background-color: #21262d;
+                    color: #8b949e;
+                    font-family: 'JetBrains Mono', monospace;
+                    font-size: 10px;
+                    font-weight: 700;
+                    padding: 1px 5px;
+                    border-radius: 3px;
+                    border: 1px solid #30363d;
+                """)
+                chip.mousePressEvent = lambda ev, s=e["slot_id"]: self._show_slot_menu(s)
+                self._slot_chips[e["slot_id"]] = chip
+                self.slot_chip_layout.insertWidget(i, chip)
+            self._set_chip_text(chip, e)
+        multi = bool(self._slot_readouts)
+        self.slot_chip_frame.setVisible(multi)
+        if multi:
+            self.temp_label.hide()
+            self.power_label.hide()
+        else:
+            self._update_temp_display()
+            if self.power_state:
+                self.power_label.show()
+        if changed:
+            self._fit()
+
+    def _set_chip_text(self, chip, e: dict):
+        """A chip never gets narrower as its readings change (9.9 W, 10.1 W): the bar must not twitch."""
+        text, tip = self._slot_readout_text(e)
+        chip.setText(text)
+        chip.setToolTip(tip)
+        chip.setMinimumWidth(max(chip.minimumWidth(), chip.sizeHint().width()))
+
+    def _slot_readout_text(self, e: dict):
+        """(chip text, tooltip) for one analyzer's readout."""
+        interface = e.get("interface") or "USB Direct"
+        net = interface.lower().startswith("network")
+        # What a chip shows shrinks as the bar runs out of room (level 1: no interface word,
+        # level 2: whole degrees and watts, level 3: no power); the tooltip always has everything
+        level = getattr(self, "_chips_compact", 0)
+        parts = [f"<span style='color:#38bdf8'>{e['tag']}</span>"]
+        if level < 1:
+            parts.append("Net" if net else "USB")
+        tip = [f"Analyzer {e['tag']}: {e.get('name') or 'Analyzer'}"]
+        end = e.get("endorsements") or {}
+        if end.get("uid"):
+            tip.append(f"Serial UID: 0x{end['uid']}")
+        tip.append(f"Interface: {interface}")
+        if end.get("firmware") or end.get("mfw_ver"):
+            tip.append("Firmware: " + (end.get("firmware") or f"MCU {end.get('mfw_ver')} / FPGA {end.get('ffw_ver', 'Unknown')}"))
+        temp_c = e.get("temp_c")
+        if temp_c is not None and temp_c > 0.0:
+            shown = self._format_temp(temp_c)
+            if level >= 2:
+                shown = f"{float(shown.split()[0]):.0f}°"
+            parts.append(f"<span style='color:{self._temp_color(temp_c)}'>{shown}</span>")
+            tip.append(f"Temperature: {self._format_temp(temp_c)}")
+        p = e.get("power")
+        if p:
+            lines, warning = self.describe_power(p, interface)
+            total_w = p["port_v"] * p["port_a"] + p["usb_v"] * p["usb_a"]
+            bus_powered = p["port_v"] < self.POWER_PORT_MIN_V and not net
+            w_text = f"{'USB ' if bus_powered else ''}{total_w:.1f} W"
+            if level >= 2:
+                w_text = f"{total_w:.0f}W"
+            if level < 3 or warning:
+                parts.append(f"<span style='color:#f59e0b'>{w_text}</span>" if warning else w_text)
+            tip += lines + ([f"⚠ {warning}"] if warning else [])
+        tip.append("Click for licenses and hardware")
+        return "&nbsp;".join(parts).replace(" ", "&nbsp;"), "\n".join(tip)
+
+    def _show_slot_menu(self, slot_id: str):
+        e = next((x for x in self._slot_readouts if x["slot_id"] == slot_id), None)
+        if e:
+            self._show_endorsements_menu(e.get("endorsements"), e.get("power"), e.get("interface") or "USB Direct",
+                                         self._slot_chips.get(slot_id), e.get("temp_c"))
+
     def _update_temp_display(self):
+        if self._slot_readouts:
+            self.temp_label.hide()
+            for e in self._slot_readouts:       # the unit may have changed
+                self._slot_chips[e["slot_id"]].setMinimumWidth(0)
+                self._set_chip_text(self._slot_chips[e["slot_id"]], e)
+            return
         if self.current_temp_c is None or self.current_temp_c <= 0.0:
             self.temp_label.hide()
             return
@@ -452,20 +625,21 @@ class TopBar(QWidget):
             border-radius: 3px;
             border: 1px solid #30363d;
         """)
-        self.power_label.show()
+        self.power_label.setVisible(not self._slot_readouts)
 
     def set_input_chain_state(self, lines: dict):
         """lines: {analyzer label: 'chain name: correction summary'} for analyzers with a chain."""
         if lines:
-            self.cal_btn.setText("Calibration ● ▾")
+            self._cal_text = "Calibration ● ▾"
             self.cal_btn.setStyleSheet("QPushButton { color: #38bdf8; border: 1px solid #38bdf8; }")
             self.cal_btn.setToolTip("Input chain correction applied to levels:\n"
                                     + "\n".join(f"{k}: {v}" for k, v in lines.items()))
         else:
-            self.cal_btn.setText("Calibration ▾")
+            self._cal_text = "Calibration ▾"
             self.cal_btn.setStyleSheet("")
             self.cal_btn.setToolTip("Calibration files and input chains (antenna / cable / amplifier). "
                                     "No input chain is applied: levels are at the analyzer's input.")
+        self._fit()
 
     def flash_status(self, text: str, ms: int = 4000):
         """Show a transient notice in the device label, then restore the analyzer name."""
@@ -476,13 +650,58 @@ class TopBar(QWidget):
     TRACE_SHORT = {"Real-Time": "Live", "Max. Hold": "Max", "Min. Hold": "Min", "Average": "Avg"}
 
     def _fit(self):
+        """Make the bar fit its width: full labels if they fit, else shorter ones, step by step."""
+        def too_wide():
+            # Inner layouts first: their size hints are otherwise stale until the next event
+            # Qt refreshes the cached sizes of nested frames only with the next event: do it now
+            for w in self.findChildren(QWidget):
+                w.updateGeometry()
+            for lay in self.findChildren(QLayout):
+                lay.invalidate()
+            self.layout().activate()
+            return self.layout().sizeHint().width() > self.width()
+
+        def chips(level: int):
+            self._chips_compact = level
+            for e in self._slot_readouts:
+                chip = self._slot_chips.get(e["slot_id"])
+                if chip is not None:
+                    chip.setMinimumWidth(0)
+                    self._set_chip_text(chip, e)
+
         for name, btn in self.trace_buttons.items():
             btn.setText(name)
-        self.layout().activate()
-        if self.layout().sizeHint().width() > self.width():
-            for name, btn in self.trace_buttons.items():
-                btn.setText(self.TRACE_SHORT[name])
-                btn.setToolTip(name)
+        chips(0)
+        self.cal_btn.setText(self._cal_text)
+        self.fps_label.setVisible(True)
+        self.logo_label.setVisible(True)
+        self.dev_label.setMaximumWidth(200)
+        self.view_mode_combo.setMaximumWidth(16777215)
+        if not too_wide():
+            return
+        for name, btn in self.trace_buttons.items():
+            btn.setText(self.TRACE_SHORT[name])
+            btn.setToolTip(name)
+        # Then, one at a time and only as far as needed
+        steps = [lambda: chips(1),
+                 lambda: self.cal_btn.setText(self._cal_text.replace("Calibration", "Cal")),
+                 lambda: self.fps_label.setVisible(False),
+                 lambda: self.logo_label.setVisible(False),
+                 lambda: self.dev_label.setMaximumWidth(self.dev_label.minimumWidth()),
+                 lambda: self.view_mode_combo.setMaximumWidth(112),
+                 lambda: chips(2),
+                 lambda: chips(3)]
+        self._fit_steps = 0
+        for step in steps:
+            if not too_wide():
+                break
+            step()
+            self._fit_steps += 1
+
+    def minimumSizeHint(self):
+        # The bar adapts to the width it is given (_fit): it must not hold the window wider
+        # than the screen because its full-length labels would need that
+        return QSize(900, super().minimumSizeHint().height())
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -493,6 +712,25 @@ class TopBar(QWidget):
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("color: #30363d; margin: 4px 2px;")
         layout.addWidget(sep)
+
+    DUAL_SPECTRUM = "Dual Spectrum (A / B)"
+
+    @staticmethod
+    def _fit_combo_list(combo) -> int:
+        """A combo's drop-down list is as wide as its longest entry needs, however narrow the
+        combo itself is in the bar. Returns that width."""
+        fm = combo.view().fontMetrics()
+        widest = max((fm.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())), default=0)
+        width = widest + 56             # the tick mark, padding and the frame
+        combo.view().setMinimumWidth(width)
+        return width
+
+    def set_antenna_view_locked(self, locked: bool):
+        """Dual Spectrum shows both antennas, each in its own view: the A / B / overlay choice does not apply."""
+        self.focus_combo.setEnabled(not locked)
+        self.focus_combo.setToolTip("Both antennas are shown, each in its own spectrum view." if locked else "")
+        if locked and self.focus_combo.currentIndex() != 0:
+            self.focus_combo.setCurrentIndex(0)         # A+B: what the two views show between them
 
     def set_multi_device_state(self, topology: str, slots: dict):
         self.current_topology = topology
@@ -522,8 +760,21 @@ class TopBar(QWidget):
         else:
             self.topo_badge.hide()
             self.multi_ctrl_frame.hide()
-            
+
+        # Two spectra, one per antenna: a layout that only diversity has
+        i = self.view_mode_combo.findText(self.DUAL_SPECTRUM)
+        if topology == MultiDeviceTopology.DIVERSITY and i < 0:
+            self.view_mode_combo.insertItem(1, self.DUAL_SPECTRUM)
+        elif topology != MultiDeviceTopology.DIVERSITY and i >= 0:
+            if self.view_mode_combo.currentIndex() == i:
+                self.view_mode_combo.setCurrentIndex(0)
+            self.view_mode_combo.removeItem(i)
+
+        self._fit_combo_list(self.view_mode_combo)
+        if self.focus_combo.count():
+            self.focus_combo.setMinimumWidth(self._fit_combo_list(self.focus_combo) - 12)   # text, padding and the arrow
         self.focus_combo.blockSignals(False)
+        self._fit()
 
     def _on_focus_combo_changed(self, text: str):
         if self.current_topology == MultiDeviceTopology.DIVERSITY:
@@ -549,12 +800,16 @@ class TopBar(QWidget):
 
     def set_device_status(self, connected: bool, text: str):
         if not connected:
+            # Readings of an analyzer that is no longer there are not shown
             self.power_state = None
             self.power_label.hide()
+            self.current_temp_c = None
+            self._update_temp_display()
         self._identity_text = text
         self._notice_timer.stop()
         if connected:
-            self.status_dot.setStyleSheet("color: #10b981; font-size: 12px;")
+            self._dot_connected = True
+            self._paint_dot()
             self.dev_label.setText(text)
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet("""
@@ -568,7 +823,8 @@ class TopBar(QWidget):
             """)
             self.play_pause_btn.setEnabled(True)
         else:
-            self.status_dot.setStyleSheet("color: #f43f5e; font-size: 12px;")
+            self._dot_connected = False
+            self._paint_dot()
             self.dev_label.setText(text)
             self.connect_btn.setText("Connect")
             self.connect_btn.setStyleSheet("""
@@ -638,7 +894,13 @@ class TopBar(QWidget):
         if child not in (self.interface_btn, self.connect_btn, self.temp_label):
             self._show_endorsements_menu()
 
-    def _show_endorsements_menu(self):
+    def _show_endorsements_menu(self, endorsements=None, power=None, interface=None, anchor=None, temp_c=None):
+        """The focused analyzer's details, or those passed in (one of several analyzers)."""
+        own = endorsements is None and anchor is None
+        data = self.hw_endorsements if own else endorsements
+        power = self.power_state if own else power
+        power_interface = getattr(self, "power_interface", "USB Direct") if own else (interface or "USB Direct")
+        anchor = anchor or self.dev_chip
         menu = QMenu(self)
         menu.setObjectName("endorsementsMenu")
         menu.setStyleSheet("""
@@ -669,7 +931,7 @@ class TopBar(QWidget):
             }
         """)
 
-        if not self.hw_endorsements:
+        if not data:
             hdr = menu.addAction("HAROGIC SPECTRUM ANALYZER")
             hdr.setEnabled(False)
             menu.addSeparator()
@@ -677,34 +939,36 @@ class TopBar(QWidget):
             no_conn.setEnabled(False)
             hint = menu.addAction("Connect an analyzer to inspect on-board licenses.")
             hint.setEnabled(False)
-            menu.exec(self.dev_chip.mapToGlobal(self.dev_chip.rect().bottomLeft()))
+            menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
             return
 
-        model = self.hw_endorsements.get('model', 'Unknown')
-        hw_ver = self.hw_endorsements.get('hw_ver', '')
-        uid = self.hw_endorsements.get('uid', 'Unknown')
-        full_uid = self.hw_endorsements.get('full_uid', uid)
-        mfw = self.hw_endorsements.get('mfw_ver', 'Unknown')
-        ffw = self.hw_endorsements.get('ffw_ver', 'Unknown')
-        interface = self.hw_endorsements.get('interface', 'USB Direct')
+        model = data.get('model', 'Unknown')
+        hw_ver = data.get('hw_ver', '')
+        uid = data.get('uid', 'Unknown')
+        full_uid = data.get('full_uid', uid)
+        mfw = data.get('mfw_ver', 'Unknown')
+        ffw = data.get('ffw_ver', 'Unknown')
+        interface = data.get('interface', 'USB Direct')
         
         # 1. Device Header (analyzers other than Harogic ones supply their own title)
-        title = self.hw_endorsements.get('title')
+        title = data.get('title')
         hdr = menu.addAction(f"{title} (Hardware Rev {hw_ver})" if title else f"HAROGIC MODEL {model} (Hardware Rev {hw_ver})")
         hdr.setEnabled(False)
         uid_act = menu.addAction(f"Serial UID: 0x{uid}")
         uid_act.setEnabled(False)
         if_act = menu.addAction(f"Interface: {interface}")
         if_act.setEnabled(False)
-        if self.power_state:
-            lines, warning = self.describe_power(self.power_state, getattr(self, "power_interface", "USB Direct"))
+        if temp_c is not None and temp_c > 0.0:
+            menu.addAction(f"Temperature: {self._format_temp(temp_c)}").setEnabled(False)
+        if power:
+            lines, warning = self.describe_power(power, power_interface)
             for line in lines + ([f"⚠ {warning}"] if warning else []):
                 menu.addAction(line).setEnabled(False)
         
         menu.addSeparator()
 
         # 2. Licenses & Endorsements Section (licenses None: the analyzer has no license options)
-        licenses = self.hw_endorsements.get('licenses', [])
+        licenses = data.get('licenses', [])
         if licenses is not None:
             lic_hdr = menu.addAction("LICENSES && ENDORSEMENTS")
             lic_hdr.setEnabled(False)
@@ -728,7 +992,7 @@ class TopBar(QWidget):
             menu.addSeparator()
 
         # 3. Hardware Features Section
-        hw_features = self.hw_endorsements.get('hardware_features', [])
+        hw_features = data.get('hardware_features', [])
         if title:
             hw_hdr = menu.addAction("HARDWARE")
             hw_hdr.setEnabled(False)
@@ -748,16 +1012,22 @@ class TopBar(QWidget):
         menu.addSeparator()
 
         # 4. Telemetry Details
-        firmware = self.hw_endorsements.get('firmware')
+        firmware = data.get('firmware')
         fw_act = menu.addAction(f"Firmware: {firmware}" if firmware else f"Firmware: MCU {mfw} / FPGA {ffw}")
         fw_act.setEnabled(False)
         if full_uid and full_uid != uid:
             full_act = menu.addAction(f"Full Hardware ID: {full_uid}")
             full_act.setEnabled(False)
-        menu.popup(self.dev_chip.mapToGlobal(self.dev_chip.rect().bottomLeft()))
+        if not own:
+            # The temperature label is hidden while several analyzers are shown
+            menu.addSeparator()
+            menu.addAction("Temperature unit && fan control…").triggered.connect(
+                lambda: self._show_temp_fan_menu(anchor))
+        menu.popup(anchor.mapToGlobal(anchor.rect().bottomLeft()))
         self._active_endorsements_menu = menu
 
-    def _show_temp_fan_menu(self):
+    def _show_temp_fan_menu(self, anchor=None):
+        anchor = anchor or self.temp_label
         menu = QMenu(self)
         menu.setObjectName("tempFanMenu")
         menu.setStyleSheet("""
@@ -852,5 +1122,5 @@ class TopBar(QWidget):
             self.fanStateRequested.emit(1, 50.0)
         act_off.triggered.connect(select_off)
 
-        menu.popup(self.temp_label.mapToGlobal(self.temp_label.rect().bottomLeft()))
+        menu.popup(anchor.mapToGlobal(anchor.rect().bottomLeft()))
         self._active_temp_fan_menu = menu

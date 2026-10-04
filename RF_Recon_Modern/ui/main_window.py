@@ -360,7 +360,24 @@ class MainWindow(QMainWindow):
         
         self.view_v_splitter.addWidget(self.waterfall_view)
         self.view_v_splitter.addWidget(self.spectrum_view)
-        self.view_v_splitter.setSizes([340, 360])
+
+        # A second spectrum, for the other antenna in diversity (view mode "Dual Spectrum")
+        self.spectrum_view_b = SpectrumView(self.view_v_splitter)
+        self.spectrum_view_b.title_label.setText("ANTENNA B")
+        self.spectrum_view_b.plot_widget.setXLink(self.spectrum_view.plot_widget)
+        self.spectrum_view_b.channel_bar.setXLink(self.spectrum_view.plot_widget)
+        self.spectrum_view_b.set_trace_visible("Trace B", True)
+        self.spectrum_view.amplitude_follower = self.spectrum_view_b
+        self.spectrum_view.mirror_masks_to(self.spectrum_view_b)
+        self._last_div_b = None             # antenna B's latest sweep (Hz, dBm): its ETSI masks, intruders
+        self._last_div_a = None             # and antenna A's, whatever the main view is showing
+        self._zero_span_slot = None         # the analyzer a zero-span run put into zero span, if not the focused one
+        self._reset_b_holds()
+        self.view_v_splitter.addWidget(self.spectrum_view_b)
+        self.spectrum_view_b.hide()
+        self._dual_spectrum = False
+        self._spectrum_title = self.spectrum_view.title_label.text()
+        self.view_v_splitter.setSizes([340, 360, 0])
         dual_layout.addWidget(self.view_v_splitter)
         
         # Viewport Page 1: Multi-Row Folded Waterfall Viewport (Aaronia RTSA Mode)
@@ -465,6 +482,15 @@ class MainWindow(QMainWindow):
         self.spectrum_view.triggerZeroSpanRequested.connect(self._on_spectrum_trigger_zero_span)
         self.waterfall_view.triggerZeroSpanRequested.connect(self._on_spectrum_trigger_zero_span)
         self.spectrum_view.rangeChanged.connect(self._on_view_range_changed)
+        # Zooming or dragging a plot by hand, with the view linked: the analyzer follows
+        self._link_follow_timer = QTimer(self)
+        self._link_follow_timer.setSingleShot(True)
+        self._link_follow_timer.setInterval(350)       # once the gesture has come to rest
+        self._link_follow_timer.timeout.connect(self._sweep_follows_view)
+        for plot in (self.spectrum_view.plot_widget, self.waterfall_view.waterfall_widget,
+                     self.spectrum_view.channel_bar, self.waterfall_view.channel_bar,
+                     self.spectrum_view_b.plot_widget, self.spectrum_view_b.channel_bar):
+            plot.getViewBox().sigRangeChangedManually.connect(self._on_view_moved_by_hand)
         self.spectrum_view.thresholdChanged.connect(self._on_dtv_threshold_dragged)
         self.spectrum_view.intruderThresholdChanged.connect(self.threats_panel.intruder_thresh_spin.setValue)
         self.waterfall_view.colormapChanged.connect(self._on_colormap_changed)
@@ -498,6 +524,12 @@ class MainWindow(QMainWindow):
         self.sweep_panel.linkViewToggled.connect(self._on_link_view_toggled)
         self.sweep_panel.rfInputChanged.connect(self._on_rf_input_changed)
         self.sweep_panel.settingsTargetChanged.connect(self._select_settings_slot)
+        self.multi_device_manager.topology_changed.connect(lambda _t: self._refresh_antenna_sources())
+        self.multi_device_manager.topology_changed.connect(lambda _t: self._refresh_connection_dot())
+        self._refresh_antenna_sources()
+        self.sweep_panel.levelTrimChanged.connect(self._on_level_trim_changed)
+        self.sweep_panel.alignTracesClicked.connect(self._align_split_traces)
+        self._load_level_trims()
         
         # Freq Coupling
         self.sweep_panel.start_spin.valueChanged.connect(self._on_start_stop_changed)
@@ -731,6 +763,9 @@ class MainWindow(QMainWindow):
 
     def _on_all_connection_status(self, any_connected: bool):
         self.is_connected = any_connected
+        self._refresh_slot_readouts()
+        self._refresh_connection_dot()
+        self._refresh_antenna_sources()
         if any_connected:
             topo = self.multi_device_manager.topology
             connected_slots = [s for s in self.multi_device_manager.slots.values() if s.is_connected]
@@ -743,7 +778,7 @@ class MainWindow(QMainWindow):
                 self.top_bar.set_interface_badge("usb")
 
             if len(connected_slots) > 1:
-                info_str = f"{len(connected_slots)} Analyzers Online ({topo.upper()})"
+                info_str = f"{len(connected_slots)} Analyzers Online"      # the mode is in the badge beside it
             elif len(connected_slots) == 1:
                 s = connected_slots[0]
                 if s.capabilities:
@@ -782,11 +817,14 @@ class MainWindow(QMainWindow):
         """
         self.last_freq = self.last_power = None
         self._last_sweep = None
+        self._last_div_b = self._last_div_a = None
+        self._reset_b_holds()
         self.max_hold_data = self.min_hold_data = None
         self.avg_history = []
         self.waterfall_buffer[:] = -130.0
         self._wf_head = 0
         self.spectrum_view.clear_traces()
+        self.spectrum_view_b.clear_traces()
         self.waterfall_view.clear_image()
         if hasattr(self, "multi_row_view"):
             self.multi_row_view.clear_data()
@@ -818,6 +856,23 @@ class MainWindow(QMainWindow):
     def _on_amplitude_clamped(self, slot_id: str, ref_level: float, atten: int):
         if self._settings_slot and slot_id != self._settings_slot:
             return      # another analyzer's settings are on screen
+        mdm = self.multi_device_manager
+        if not self._settings_slot and sum(1 for s in mdm.slots.values() if s.is_connected) > 1:
+            # Several analyzers share the panel's settings: one of them reaching its own
+            # limit must not pull the control (and the display) back for all of them
+            tag = slot_id.split("_")[-1].upper()
+            self.top_bar.flash_status(f"Analyzer {tag}: Ref Level limited to {ref_level:.1f} dBm by hardware")
+            return
+        if self.sweep_panel.attenuation >= 0:
+            # Manual attenuation: the analyzer takes its reference level from the attenuation
+            # and reports that one back on every change. The control stays the user's (it
+            # sets the top of the display); writing the report back would pin it.
+            # Said once per range: the analyzer repeats its report every time the sweep is re-armed
+            if getattr(self, "_manual_range_told", None) != (slot_id, ref_level):
+                self._manual_range_told = (slot_id, ref_level)
+                self.top_bar.flash_status(
+                    f"Manual attenuation: the analyzer's range is {ref_level:.0f} dBm; Ref. Level moves the display only", 5000)
+            return
         self.sweep_panel.ref_level_spin.blockSignals(True)
         self.sweep_panel.ref_level_spin.setValue(ref_level)
         self.sweep_panel.ref_level_spin.blockSignals(False)
@@ -853,6 +908,35 @@ class MainWindow(QMainWindow):
         if "power" in hw:
             self.top_bar.set_power_state(hw["power"], hw.get("endorsements", {}).get("interface", "USB Direct"))
 
+    def _refresh_connection_dot(self):
+        """Two analyzers in use (any topology but single): the dot shows each one's connection."""
+        mdm = self.multi_device_manager
+        a, b = mdm.slots.get("slot_a"), mdm.slots.get("slot_b")
+        if mdm.topology == MultiDeviceTopology.SINGLE or a is None or b is None:
+            self.top_bar.set_slot_connections(None)
+        else:
+            self.top_bar.set_slot_connections((a.is_connected, b.is_connected))
+
+    def _refresh_slot_readouts(self):
+        """With several analyzers online the top bar shows each one's readouts, not just the focused one's."""
+        entries = []
+        for slot_id in sorted(self.multi_device_manager.slots):
+            slot = self.multi_device_manager.slots[slot_id]
+            if not slot.is_connected:
+                continue
+            hw = self._slot_hw(slot_id)
+            end = hw.get("endorsements", {})
+            if slot.capabilities:
+                name = slot.capabilities["name"]
+            else:
+                name = f"Model {slot.detected_model:03d}" if slot.detected_model else "Analyzer"
+            alias = (slot.role_alias or "").strip()
+            interface = end.get("interface") or ("Network" if slot.interface_type.lower() == "network" else "USB Direct")
+            entries.append({"slot_id": slot_id, "tag": slot_id.split("_")[-1].upper(),
+                            "name": f"{name} • {alias}" if alias else name, "interface": interface,
+                            "endorsements": end, "temp_c": hw.get("temp_c"), "power": hw.get("power")})
+        self.top_bar.set_slot_readouts(entries)
+
     def _on_hw_endorsements(self, slot_id: str, endorsements: dict):
         # Sent once per connection: readings kept from the slot's previous
         # analyzer (temperature, power) no longer apply
@@ -862,6 +946,7 @@ class MainWindow(QMainWindow):
         if self._is_focused_slot(slot_id):
             self.top_bar.set_hw_endorsements(endorsements)
             self.top_bar.set_device_temperature(None)
+        self._refresh_slot_readouts()
 
     # --- Analyzer capabilities: grey out what the focused analyzer cannot do ---
     def _capabilities(self) -> dict:
@@ -949,8 +1034,52 @@ class MainWindow(QMainWindow):
             target = None if not choices or None in choices else (
                 mdm.focused_slot_id if mdm.focused_slot_id in choices else choices[0])
         self.sweep_panel.set_settings_targets(entries, target)
+        self._refresh_level_trims()
         if target != self._settings_slot:
             self._select_settings_slot(target)
+
+    # --- Level trim: a few dB per analyzer, to line their traces up with each other ---
+    def _load_level_trims(self):
+        try:
+            trims = json.loads(self.settings.value("slot_level_trims", "") or "{}")
+        except (TypeError, ValueError):
+            trims = {}
+        for sid, slot in self.multi_device_manager.slots.items():
+            try:
+                slot.level_trim_db = float(trims.get(sid, 0.0))
+            except (TypeError, ValueError):
+                slot.level_trim_db = 0.0
+
+    def _refresh_level_trims(self):
+        mdm = self.multi_device_manager
+        entries = [(sid, sid.split("_")[-1].upper(), slot.level_trim_db)
+                   for sid, slot in sorted(mdm.slots.items()) if slot.is_connected]
+        self.sweep_panel.set_level_trims(entries, mdm.topology == MultiDeviceTopology.SPLIT_SWEEP)
+
+    def _on_level_trim_changed(self, slot_id: str, trim_db: float):
+        slots = self.multi_device_manager.slots
+        if slot_id not in slots:
+            return
+        slots[slot_id].level_trim_db = trim_db
+        self.settings.setValue("slot_level_trims", json.dumps(
+            {sid: s.level_trim_db for sid, s in slots.items() if s.level_trim_db}))
+        # The held traces were built with the old trim
+        self.max_hold_data = self.min_hold_data = None
+        self.avg_history = []
+        self._reset_b_holds()
+
+    def _align_split_traces(self):
+        step = self.multi_device_manager.seam_step_db()
+        if step is None:
+            self.top_bar.flash_status("Align at Seam: needs a sweep from both analyzers in split mode")
+            return
+        step_db, slot_id = step
+        slot = self.multi_device_manager.slots[slot_id]
+        trim = round(max(-40.0, min(40.0, slot.level_trim_db + step_db)), 1)
+        self._on_level_trim_changed(slot_id, trim)
+        self._refresh_level_trims()
+        tag = slot_id.split("_")[-1].upper()
+        self.top_bar.flash_status(f"Analyzer {tag} trimmed to {trim:+.1f} dB (step at the seam was {step_db:+.1f} dB)", 6000)
 
     def _select_settings_slot(self, slot_id):
         """Show the settings of one analyzer (or of all, None) in the sweep panel."""
@@ -1046,14 +1175,32 @@ class MainWindow(QMainWindow):
     def _on_diversity_sweep_data(self, freq, power_a, power_b, delta):
         if not self.is_sweeping or self.multi_device_manager.topology != MultiDeviceTopology.DIVERSITY:
             return
+        # Antenna B as the rest of the program sees antenna A: with the amplitude offset, and
+        # finite (outside B's coverage there is nothing, not a signal)
+        power_b = np.nan_to_num(np.asarray(power_b, dtype=float) + self.sweep_panel.amp_offset_spin.value(),
+                                nan=-200.0, posinf=0.0, neginf=-200.0)
+        self._last_div_b = (freq, power_b)
+        self._last_div_a = (freq, np.nan_to_num(np.asarray(power_a, dtype=float) + self.sweep_panel.amp_offset_spin.value(),
+                                                nan=-200.0, posinf=0.0, neginf=-200.0))
+        b_traces = self._update_b_holds(power_b)
         # One pair arrives per sweep of either analyzer (~300/s); draw at ~30 FPS
         now = time.monotonic()
         if now - self._last_div_render_time < RENDER_PERIOD_S:
             return
         self._last_div_render_time = now
         x_scaled = freq / self._x_multiplier
+        if self._dual_spectrum:
+            for name, y in b_traces.items():
+                self.spectrum_view_b.update_curve_data(name, x_scaled, y)
         mode = self.multi_device_manager.diversity_view_mode
-        if mode == "both":
+        if self._dual_spectrum:
+            # Antenna A in the main view, antenna B in the second one
+            self.spectrum_view.set_trace_visible("Trace A", True)
+            self.spectrum_view.set_trace_visible("Trace B", False)
+            self.spectrum_view.set_trace_visible("Delta", False)
+            self.spectrum_view.update_curve_data("Trace A", x_scaled, power_a)
+            self.spectrum_view_b.update_curve_data("Trace B", x_scaled, power_b)
+        elif mode == "both":
             self.spectrum_view.set_trace_visible("Trace A", True)
             self.spectrum_view.set_trace_visible("Trace B", True)
             self.spectrum_view.set_trace_visible("Delta", False)
@@ -1074,6 +1221,71 @@ class MainWindow(QMainWindow):
             self.spectrum_view.set_trace_visible("Trace B", False)
             self.spectrum_view.set_trace_visible("Delta", True)
             self.spectrum_view.update_curve_data("Delta", x_scaled, delta)
+
+    # --- Which antenna a detector reads (DECT, ShowLink, Broadcast / DTV) ---
+    def _refresh_antenna_sources(self):
+        topo = self.multi_device_manager.topology
+        for panel in (self.dect_panel, self.showlink_panel, self.dtv_panel):
+            panel.antenna_row.set_topology(topo)
+
+    def _detector_sweep(self, panel, x_data, y_data):
+        """
+        The sweep a detector works on. Diversity: the antenna chosen in its panel, whatever
+        the main view shows (A, B or their difference). Otherwise the sweep as given.
+        """
+        if self.multi_device_manager.topology == MultiDeviceTopology.DIVERSITY:
+            pair = self._last_div_b if panel.antenna_row.choice() == "B" else self._last_div_a
+            if pair is not None:
+                return pair
+        return x_data, y_data
+
+    def _detector_slot(self, panel):
+        """The analyzer a detector's zero-span captures are taken by; None: the focused one."""
+        mdm = self.multi_device_manager
+        if mdm.topology == MultiDeviceTopology.DIVERSITY and panel.antenna_row.choice() == "B" \
+                and mdm.slots["slot_b"].is_connected:
+            return "slot_b"
+        return None
+
+    def _update_b_holds(self, power_b) -> dict:
+        """
+        Max hold, min hold and average of antenna B (Dual Spectrum), following the same
+        switches as antenna A's. A pair arrives for every sweep of either analyzer, so
+        only a new sweep from B counts. Returns the traces to draw.
+        """
+        if not self._dual_spectrum:
+            return {}
+        rows = self.sweep_panel.trace_rows
+        slot_b = self.multi_device_manager.slots.get("slot_b")
+        stamp = getattr(slot_b, "last_update_time", None)
+        fresh = stamp is None or stamp != self._b_stamp
+        self._b_stamp = stamp
+        h = self._b_holds
+        n = len(power_b)
+        traces = {}
+        if rows["Max. Hold"]["cb"].isChecked():
+            if h["max"] is None or len(h["max"]) != n:
+                h["max"] = np.copy(power_b)
+            elif fresh and not rows["Max. Hold"]["freeze"].isChecked():
+                np.maximum(h["max"], power_b, out=h["max"])
+            traces["Max. Hold"] = h["max"]
+        if rows["Min. Hold"]["cb"].isChecked():
+            if h["min"] is None or len(h["min"]) != n:
+                h["min"] = np.copy(power_b)
+            elif fresh and not rows["Min. Hold"]["freeze"].isChecked():
+                np.minimum(h["min"], power_b, out=h["min"])
+            traces["Min. Hold"] = h["min"]
+        if rows["Average"]["cb"].isChecked():
+            if h["avg"] and len(h["avg"][0]) != n:
+                h["avg"] = []
+            if (fresh and not rows["Average"]["freeze"].isChecked()) or not h["avg"]:
+                h["avg"] = (h["avg"] + [power_b])[-max(1, self.sweep_panel.avg_sweeps_spin.value()):]
+            traces["Average"] = np.mean(h["avg"], axis=0)
+        return traces
+
+    def _reset_b_holds(self):
+        self._b_holds = {"max": None, "min": None, "avg": []}
+        self._b_stamp = None
 
     def _on_device_sweep_data(self, slot_id: str, x_data: np.ndarray, y_data: np.ndarray):
         if not self.is_sweeping or x_data is None or y_data is None or len(x_data) == 0:
@@ -1208,16 +1420,17 @@ class MainWindow(QMainWindow):
         else:
             self._draw_masks_without_detection(x_data, y_offset)
             
+        # (In diversity each detector reads the antenna chosen in its panel)
         if self.dect_panel.enable_cb.isChecked():
-            self.dect_engine.process_sweep_data(x_data, y_offset)
+            self.dect_engine.process_sweep_data(*self._detector_sweep(self.dect_panel, x_data, y_offset))
             
         if self.showlink_panel.enable_cb.isChecked():
-            self.showlink_engine.process_sweep_data(x_data, y_offset)
+            self.showlink_engine.process_sweep_data(*self._detector_sweep(self.showlink_panel, x_data, y_offset))
             
         if self.dtv_detect_active:
-            self._process_dtv_detect(x_data, y_offset)
+            self._process_dtv_detect(*self._detector_sweep(self.dtv_panel, x_data, y_offset))
         if self.tband_detect_active:
-            self._process_tband_scan(x_data, y_offset)
+            self._process_tband_scan(*self._detector_sweep(self.dtv_panel, x_data, y_offset))
 
     def resume_rf_sweep(self):
         self._last_operating_mode = "SWP"
@@ -1235,6 +1448,7 @@ class MainWindow(QMainWindow):
             return
             
         self.multi_device_manager.stop_mscan()
+        self._release_zero_span_slot()
         self.multi_device_manager.set_operating_mode("SWP")
         self.apply_frequencies()
         self.apply_amplitude_settings()
@@ -1250,6 +1464,12 @@ class MainWindow(QMainWindow):
         self.is_sweeping = True
         self.top_bar.set_sweeping_state(True)
         self.multi_device_manager.start_sweeping_all()
+
+    def _release_zero_span_slot(self):
+        """An analyzer other than the focused one that a run put into zero span goes back to sweeping."""
+        if self._zero_span_slot:
+            self.multi_device_manager.set_operating_mode("SWP", target_slot_id=self._zero_span_slot)
+            self._zero_span_slot = None
 
     def _on_det_trigger_requested(self, params: dict):
         if not self.is_connected:
@@ -1586,12 +1806,14 @@ class MainWindow(QMainWindow):
         self._slot_hw(slot_id)["temp_c"] = temp_c
         if self._is_focused_slot(slot_id):
             self.top_bar.set_device_temperature(temp_c)
+        self._refresh_slot_readouts()
 
     def _on_power_updated(self, slot_id: str, power: dict):
         hw = self._slot_hw(slot_id)
         hw["power"] = power
         if self._is_focused_slot(slot_id):
             self.top_bar.set_power_state(power, hw.get("endorsements", {}).get("interface", "USB Direct"))
+        self._refresh_slot_readouts()
 
     def _on_fan_state_requested(self, fan_state: int, threshold_temp: float):
         if hasattr(self, 'multi_device_manager'):
@@ -1615,9 +1837,10 @@ class MainWindow(QMainWindow):
                 atten=params.get("atten", 0)
             )
 
-    def _on_det_params_changed(self, params: dict):
+    def _on_det_params_changed(self, params: dict, slot_id: str = None):
         if hasattr(self, 'multi_device_manager'):
             self.multi_device_manager.configure_det(
+                target_slot_id=slot_id,
                 center_freq_hz=params.get("center_freq_hz", 1925e6),
                 decimate_factor=params.get("decimate_factor", 2),
                 ref_level=params.get("ref_level", 0.0),
@@ -1703,11 +1926,29 @@ class MainWindow(QMainWindow):
             self.nav_rail.set_active_mode(0)
             return
             
-        if mode == "Dual View":
+        dual_spectrum = mode == self.top_bar.DUAL_SPECTRUM
+        if dual_spectrum != self._dual_spectrum:
+            self._dual_spectrum = dual_spectrum
+            self.spectrum_view_b.setVisible(dual_spectrum)
+            self.spectrum_view.title_label.setText("ANTENNA A" if dual_spectrum else self._spectrum_title)
+            self.top_bar.set_antenna_view_locked(dual_spectrum)
+            self._reset_b_holds()
+            for name in self.B_VIEW_TRACES:      # the same traces, in the same colours, as antenna A's view
+                self.spectrum_view_b.set_trace_visible(name, self.sweep_panel.trace_rows[name]["cb"].isChecked())
+                self.spectrum_view_b.curves[name].setPen(self.spectrum_view.curves[name].opts["pen"])
+            if hasattr(self, "_mask_drawn"):
+                self._mask_draw_time = 0.0
+                self._draw_carrier_masks()      # antenna B's view gets (or loses) its ETSI masks now
+        if dual_spectrum:
+            self.viewport_stack.setCurrentIndex(0)
+            self.waterfall_view.hide()
+            self.spectrum_view.show()
+            self.view_v_splitter.setSizes([0, 350, 350])
+        elif mode == "Dual View":
             self.viewport_stack.setCurrentIndex(0)
             self.waterfall_view.show()
             self.spectrum_view.show()
-            self.view_v_splitter.setSizes([340, 360])
+            self.view_v_splitter.setSizes([340, 360, 0])
         elif mode == "Multi-Row Waterfall":
             self.viewport_stack.setCurrentIndex(1)
             if hasattr(self, 'waterfall_buffer') and self.waterfall_buffer is not None:
@@ -1901,6 +2142,29 @@ class MainWindow(QMainWindow):
             self.demod_view.spectrum_view.set_view_range(v_start, v_stop)
         self._check_span_correlation()
 
+    def _on_view_moved_by_hand(self, *_):
+        if self.sweep_panel.link_view_check.isChecked():
+            self._link_follow_timer.start()
+
+    def _sweep_follows_view(self):
+        """
+        The view is linked to the analyzer sweep and was zoomed or dragged on the plot:
+        the sweep is set to what the view now shows (within what the analyzer can tune;
+        the view then settles on the sweep it got). Views moved by the program, such as
+        a click on a TV channel, do not retune the analyzer.
+        """
+        sp = self.sweep_panel
+        if not sp.link_view_check.isChecked():
+            return
+        x_min, x_max = self.spectrum_view.plot_widget.viewRange()[0]
+        if not x_max > x_min:
+            return
+        if abs(x_min - sp.start_spin.value()) < 1e-3 and abs(x_max - sp.stop_spin.value()) < 1e-3:
+            return
+        sp.start_spin.setValue(x_min)
+        sp.stop_spin.setValue(x_max)
+        sp.frequenciesChanged.emit()        # as if the range had been typed in
+
     def _on_link_view_toggled(self, linked: bool):
         if linked:
             self.sweep_panel.view_start_spin.setValue(self.sweep_panel.start_spin.value())
@@ -1991,8 +2255,12 @@ class MainWindow(QMainWindow):
         self._store_panel_settings()
 
     # --- Traces ---
+    B_VIEW_TRACES = ("Max. Hold", "Min. Hold", "Average")      # its live trace is "Trace B"
+
     def _on_top_trace_toggled(self, name: str, active: bool):
         self.spectrum_view.set_trace_visible(name, active)
+        if name in self.B_VIEW_TRACES:
+            self.spectrum_view_b.set_trace_visible(name, active)
         if name in self.sweep_panel.trace_rows:
             self.sweep_panel.trace_rows[name]["cb"].blockSignals(True)
             self.sweep_panel.trace_rows[name]["cb"].setChecked(active)
@@ -2000,6 +2268,8 @@ class MainWindow(QMainWindow):
 
     def _on_panel_trace_toggled(self, name: str, active: bool):
         self.spectrum_view.set_trace_visible(name, active)
+        if name in self.B_VIEW_TRACES:
+            self.spectrum_view_b.set_trace_visible(name, active)
         self.top_bar.set_trace_active(name, active)
 
     def _on_trace_freeze_toggled(self, name: str, frozen: bool):
@@ -2007,9 +2277,12 @@ class MainWindow(QMainWindow):
 
     def _on_trace_color_changed(self, name: str, color: QColor):
         self.spectrum_view.set_trace_color(name, color)
+        if name in self.B_VIEW_TRACES:
+            self.spectrum_view_b.set_trace_color(name, color)
 
     def _on_avg_sweeps_changed(self, sweeps: int):
         self.avg_history = []
+        self._b_holds["avg"] = []
 
     # --- Region & Presets ---
     def change_region(self, region_name: str):
@@ -2034,6 +2307,7 @@ class MainWindow(QMainWindow):
         # Redraw Channel Markers
         standard = TV_CHANNEL_STANDARDS.get(self.current_region, [])
         self.spectrum_view.channel_bar.draw_channels(standard, self._x_multiplier)
+        self.spectrum_view_b.channel_bar.draw_channels(standard, self._x_multiplier)
         self.waterfall_view.channel_bar.draw_channels(standard, self._x_multiplier)
         
         if self.current_region == "North America":
@@ -2042,6 +2316,7 @@ class MainWindow(QMainWindow):
             self.active_channels = dict(DEFAULT_EUROPE_ACTIVE)
         ps_dict = self._public_safety_channels()
         self.spectrum_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+        self.spectrum_view_b.channel_bar.set_active_channels(self.active_channels, ps_dict)
         self.waterfall_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
         self.spectrum_view.update_channel_masks(self.active_channels, standard, ps_dict, self.station_info)
         self.waterfall_view.update_channel_masks(self.active_channels, standard, ps_dict)
@@ -2739,8 +3014,9 @@ class MainWindow(QMainWindow):
         self.dect_panel.set_count_status(f"Zero span on Ch {c['ch']} ({c['freq_mhz']:.3f} MHz), "
                                          f"carrier {run['i'] + 1} of {len(run['carriers'])}…", busy=True)
         params = dict(run["params"], center_freq_hz=c["freq_mhz"] * 1e6)
-        self.multi_device_manager.set_operating_mode("DET")
-        self._on_det_params_changed(params)
+        self._zero_span_slot = self._detector_slot(self.dect_panel)
+        self.multi_device_manager.set_operating_mode("DET", target_slot_id=self._zero_span_slot)
+        self._on_det_params_changed(params, self._zero_span_slot)
 
     def _dect_count_capture(self, time_ns, power, info):
         run = self._dect_count
@@ -2779,6 +3055,7 @@ class MainWindow(QMainWindow):
             f"{ant} antennas, {packs} beltpacks on calls. Idle beltpacks are silent and cannot be counted. "
             f"Counts stand for {int(self.dect_engine.ZERO_SPAN_FRESH_S)} s.")
         # Back to what the analyzer was doing
+        self._release_zero_span_slot()
         if run["resume_mode"] == "DET":
             self._on_det_trigger_requested(self.det_panel.get_params())
         else:
@@ -2904,8 +3181,9 @@ class MainWindow(QMainWindow):
         self._showlink_airtime["timer"].start(500)
         self.showlink_panel.airtime_btn.setEnabled(False)
         self.showlink_panel.airtime_lbl.setText(f"Zero span on Ch {ch}…")
-        self.multi_device_manager.set_operating_mode("DET")
-        self._on_det_params_changed(params)
+        self._zero_span_slot = self._detector_slot(self.showlink_panel)
+        self.multi_device_manager.set_operating_mode("DET", target_slot_id=self._zero_span_slot)
+        self._on_det_params_changed(params, self._zero_span_slot)
 
     def _showlink_airtime_capture(self, time_ns, power, info):
         run = self._showlink_airtime
@@ -2928,6 +3206,7 @@ class MainWindow(QMainWindow):
             return
         run["timer"].stop()
         self.showlink_panel.airtime_btn.setEnabled(True)
+        self._release_zero_span_slot()
         if run["resume_mode"] == "DET":
             self._on_det_trigger_requested(self.det_panel.get_params())
         else:
@@ -3109,7 +3388,37 @@ class MainWindow(QMainWindow):
             x_mhz = x_data
             
         y_clean = np.nan_to_num(y_data, nan=-130.0, posinf=0.0, neginf=-130.0)
-        
+        masked = self._masked_ranges()
+        filtered_peaks = self._intruder_candidates(x_mhz, y_clean, thresh, masked, draw=True)
+        # Diversity: what only antenna B hears is an intruder too. Its sweep is searched the
+        # same way (its own ETSI limits, at the levels B receives the carriers at), and each
+        # entry says which antenna hears it, and on which it is stronger
+        seen_on = {}
+        b = self._last_div_b if self.multi_device_manager.topology == MultiDeviceTopology.DIVERSITY else None
+        if b is not None and len(b[0]) == len(x_mhz):
+            seen_on = {f: "A" for f, _p in filtered_peaks}
+            for f, p in self._intruder_candidates(x_mhz, b[1], thresh, masked, draw=False):
+                near = next((i for i, (fa, _pa) in enumerate(filtered_peaks) if abs(f - fa) < 0.15), None)
+                if near is None:
+                    filtered_peaks.append((f, p))
+                    seen_on[f] = "B"
+                else:
+                    fa, pa = filtered_peaks[near]
+                    del seen_on[fa]
+                    if p > pa:
+                        filtered_peaks[near] = (f, p)
+                        seen_on[f] = "B>A"
+                    else:
+                        seen_on[fa] = "A>B"
+            # Carriers are measured (for identification) where they are strongest
+            y_clean = np.maximum(y_clean, b[1])
+        self._track_intruders(x_mhz, y_clean, filtered_peaks, masked, seen_on)
+
+    def _intruder_candidates(self, x_mhz, y_clean, thresh, masked, draw: bool) -> list:
+        """
+        What in one antenna's sweep is not accounted for: [(MHz, dBm)], strongest first, one
+        per 150 kHz. draw: this is the sweep the main view shows (its ETSI masks are drawn).
+        """
         # Find true local maxima above threshold using scipy find_peaks
         peak_indices, _ = signal.find_peaks(y_clean, height=thresh, prominence=1.0, distance=3)
         # (No early return when nothing is found: the table still refreshes below
@@ -3118,11 +3427,10 @@ class MainWindow(QMainWindow):
         # Sort detected peaks descending by power and cluster within 150 kHz in the current frame
         peak_powers = y_clean[peak_indices]
         sorted_indices = peak_indices[np.argsort(-peak_powers)]
-        
-        masked = self._masked_ranges()
+
         # ETSI masks around the coordinated carriers: a carrier's own skirts stay under its
         # mask; what breaks through is listed even where it is a shoulder and not a peak
-        limit, etsi_masks = self._carrier_mask_limit(x_mhz, y_clean, thresh)
+        limit, etsi_masks = self._carrier_mask_limit(x_mhz, y_clean, thresh, draw=draw)
         filtered_peaks = []
         for idx in sorted_indices:
             f = float(x_mhz[idx])
@@ -3147,6 +3455,10 @@ class MainWindow(QMainWindow):
             self._mask_breaks[round(near, 3)] = {"name": m["carrier"]["name"], "excess_db": m["excess_db"],
                                                  "kind": m["kind"], "peak_mhz": m["peak_hz"] / 1e6,
                                                  "fc_mhz": m["carrier"]["freq_hz"] / 1e6, "t": time.time()}
+        return filtered_peaks
+
+    def _track_intruders(self, x_mhz, y_clean, filtered_peaks, masked, seen_on):
+        """Update the intruder list with this sweep's candidates (seen_on: MHz -> antenna, in diversity)."""
         if masked:
             for k in [k for k in self.intruders if self._is_masked(k, masked)]:
                 del self.intruders[k]
@@ -3164,6 +3476,9 @@ class MainWindow(QMainWindow):
                     
             if matched_key is not None:
                 entry = self.intruders[matched_key]
+                if seen_on.get(f) != entry.get("antenna"):
+                    entry["antenna"] = seen_on.get(f)
+                    updated_any = True
                 if now - entry["last_seen"] > 1.0:
                     entry["bursts"] = entry.get("bursts", 1) + 1     # it went away and came back
                 entry["last_seen"] = now
@@ -3188,7 +3503,8 @@ class MainWindow(QMainWindow):
                     "confidence": 0,
                     "color": "#8b949e",
                     "first_seen": now,
-                    "last_seen": now
+                    "last_seen": now,
+                    "antenna": seen_on.get(f)
                 }
                 updated_any = True
 
@@ -3240,7 +3556,12 @@ class MainWindow(QMainWindow):
             f_item = NumericTableWidgetItem(f"{f:.3f}", f)
             f_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             
-            p_item = NumericTableWidgetItem(f"{info['power']:.1f} dBm", info['power'])
+            ant = info.get("antenna")
+            p_item = NumericTableWidgetItem(f"{info['power']:.1f} dBm" + (f"  {ant}" if ant else ""), info['power'])
+            if ant:
+                p_item.setToolTip({"A": "Heard on antenna A only", "B": "Heard on antenna B only",
+                                   "A>B": "Heard on both antennas, stronger on A",
+                                   "B>A": "Heard on both antennas, stronger on B"}[ant])
             p_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             
             sig_name = info.get("signature", "Unknown Carrier")
@@ -3385,6 +3706,7 @@ class MainWindow(QMainWindow):
         if tp.carrier_mask_combo.currentData() == "channel":
             self._mask_drawn = False
             self.spectrum_view.set_emission_masks([])
+            self.spectrum_view_b.set_emission_masks([])
         else:
             self._draw_carrier_masks()
 
@@ -3415,7 +3737,7 @@ class MainWindow(QMainWindow):
         self._carrier_mask_limit(x / 1e6 if x[0] > 1e5 else x, np.nan_to_num(y_data, nan=-130.0),
                                  float(self.threats_panel.intruder_thresh_spin.value()))
 
-    def _carrier_mask_limit(self, x_mhz, y_dbm, thresh, rbw=None):
+    def _carrier_mask_limit(self, x_mhz, y_dbm, thresh, rbw=None, draw=True):
         """
         (limit per sweep point, masks) for the coordinated carriers whose mask is shown,
         or (None, []) in "Channel only" mode or with no coordination loaded. Also draws
@@ -3424,11 +3746,13 @@ class MainWindow(QMainWindow):
         mode = self.threats_panel.carrier_mask_combo.currentData()
         meta = getattr(self.spectrum_view, "_carrier_meta", {})
         if mode == "channel" or not meta:
-            if self._mask_drawn:
+            if draw and self._mask_drawn:
                 self._mask_drawn = False
                 self.spectrum_view.set_emission_masks([])
+                self.spectrum_view_b.set_emission_masks([])
             return None, []
-        self._mask_drawn = True
+        if draw:
+            self._mask_drawn = True
         carriers = [{"freq_hz": (m["f_start"] + m["f_stop"]) / 2 * 1e6, "bw_hz": (m["f_stop"] - m["f_start"]) * 1e6,
                      "name": m["name"], "device": m.get("device", ""), "is_wmas": m.get("is_wmas", False)}
                     for m in meta.values() if m.get("visible", True)]
@@ -3442,23 +3766,43 @@ class MainWindow(QMainWindow):
             self.threats_panel.carrier_mask_margin_spin.value(), rbw,
             force_kind=None if mode == "auto" else mode, idle_top_dbm=idle_top)
         now = time.monotonic()
-        if now - self._mask_draw_time >= 0.25:
+        if draw and now - self._mask_draw_time >= 0.25:
             self._mask_draw_time = now
-            # One outline per state, the highest mask where neighbours' skirts overlap
-            # (that is the limit that applies there); broken masks are drawn whole, in red
             f_hz = np.asarray(x_mhz, dtype=float) * 1e6
-            drawn = []
-            for state in (False, "idle"):
-                env = np.full(len(f_hz), np.nan)
-                for m in masks:
-                    if (("idle" if not m["on_air"] else m["at_hz"] is not None) is state) and len(m["x_hz"]):
-                        i = np.searchsorted(f_hz, m["x_hz"])
-                        env[i] = np.fmax(env[i], m["y_dbm"])
-                if not np.isnan(env).all():
-                    drawn.append((f_hz / 1e6, env, state))
-            drawn += [(m["x_hz"] / 1e6, m["y_dbm"], True) for m in masks if m["on_air"] and m["at_hz"] is not None]
-            self.spectrum_view.set_emission_masks(drawn)
+            self.spectrum_view.set_emission_masks(self._mask_outlines(f_hz, masks))
+            # Dual Spectrum: antenna B's view gets the same carriers' masks, hung on the
+            # levels antenna B receives them at
+            b = self._last_div_b if self._dual_spectrum else None
+            if b is not None and len(b[0]) >= 4:
+                fb = np.asarray(b[0], dtype=float)
+                pb = np.nan_to_num(np.asarray(b[1], dtype=float), nan=-200.0)
+                _limit_b, masks_b = emission_mask.limit_line(
+                    fb, pb, carriers, thresh, self.threats_panel.carrier_mask_margin_spin.value(), rbw,
+                    force_kind=None if mode == "auto" else mode, idle_top_dbm=idle_top)
+                self.spectrum_view_b.set_emission_masks(self._mask_outlines(fb, masks_b))
+            else:
+                self.spectrum_view_b.set_emission_masks(self._mask_outlines(f_hz, [m for m in masks if not m["on_air"]])
+                                                        if self._dual_spectrum else [])
         return limit, [m for m in masks if m["on_air"]]
+
+    @staticmethod
+    def _mask_outlines(f_hz, masks):
+        """
+        What to draw for a set of emission masks: one outline per state, the highest mask
+        where neighbours' skirts overlap (that is the limit that applies there); broken
+        masks are drawn whole, in red.
+        """
+        drawn = []
+        for state in (False, "idle"):
+            env = np.full(len(f_hz), np.nan)
+            for m in masks:
+                if (("idle" if not m["on_air"] else m["at_hz"] is not None) is state) and len(m["x_hz"]):
+                    i = np.searchsorted(f_hz, m["x_hz"])
+                    env[i] = np.fmax(env[i], m["y_dbm"])
+            if not np.isnan(env).all():
+                drawn.append((f_hz / 1e6, env, state))
+        drawn += [(m["x_hz"] / 1e6, m["y_dbm"], True) for m in masks if m["on_air"] and m["at_hz"] is not None]
+        return drawn
 
     def _mask_break_note(self, key_mhz: float, new: dict) -> dict:
         """Say on a listed carrier whose emission mask it breaks."""
@@ -4050,6 +4394,7 @@ class MainWindow(QMainWindow):
         ps_dict = self._public_safety_channels()
         std = TV_CHANNEL_STANDARDS.get(self.current_region, [])
         self.spectrum_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
+        self.spectrum_view_b.channel_bar.set_active_channels(self.active_channels, ps_dict)
         self.waterfall_view.channel_bar.set_active_channels(self.active_channels, ps_dict)
         self.spectrum_view.update_channel_masks(self.active_channels, std, ps_dict, self.station_info)
         self.waterfall_view.update_channel_masks(self.active_channels, std, ps_dict)

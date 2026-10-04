@@ -20,6 +20,7 @@ except ImportError:
 
 # Acquisition statuses whose data is valid: success, or the IF-overload warning.
 ACQ_OK = (0, -12)  # APIRETVAL_NoError, APIRETVAL_WARNING_IFOverflow
+LOST_AFTER_S = 3.0  # acquisition failing for this long: check that the analyzer is still there
 
 # Undecimated IQ rate assumed only when the SDK does not report one (SAN-60 value).
 IQ_FALLBACK_BASE_RATE_HZ = 125e6
@@ -641,6 +642,32 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
     is_running = False
     consecutive_errors = 0
     acq_failures = 0  # consecutive failed DET/IQS acquisition cycles
+    # Losing the analyzer (cable pulled, power gone): acquisition fails from then on. After a
+    # few seconds of nothing but failures the analyzer is asked for its state; no answer, or
+    # a sweep that can no longer be configured, means it is gone, and that is reported as a
+    # disconnection instead of a picture frozen on the last good sweep.
+    fail_since = None           # start of the current run of failed acquisitions
+    config_failures = 0         # sweep re-configurations refused in a row
+    device_lost = False
+
+    def acquisition_failed() -> bool:
+        """Note a failed acquisition; True once the analyzer is found to be gone."""
+        nonlocal fail_since
+        now_f = time.monotonic()
+        if fail_since is None:
+            fail_since = now_f
+            return False
+        if now_f - fail_since < LOST_AFTER_S:
+            return False
+        fail_since = now_f              # (asked again in a few seconds if it is still there)
+        if config_failures >= 2:
+            return True
+        try:
+            state = DeviceState_TypeDef()
+            fn = getattr(dll, "Device_QueryDeviceState_Realtime", None)
+            return fn is not None and fn(ctypes.pointer(device), ctypes.pointer(state)) != 0
+        except Exception:
+            return True
     # Exit (closing the device) if the GUI process dies without telling us, so an
     # orphaned process never keeps the analyzer's USB interface claimed.
     parent = multiprocessing.parent_process()
@@ -770,6 +797,9 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                 data_queue.cancel_join_thread()
                 command_queue.cancel_join_thread()
                 break
+
+        if device_lost:
+            break
 
         # Check for commands
         try:
@@ -1230,6 +1260,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                 
                 if sweep_ok:
                     consecutive_errors = 0
+                    fail_since, config_failures = None, 0
                     try:
                         data_queue.put_nowait(("data", (np.copy(freq_np), np.copy(power_np))))
                     except Exception:
@@ -1239,15 +1270,18 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     consecutive_errors += 1
                     if consecutive_errors >= 2:
                         try:
-                            dll.SWP_Configuration(
+                            st_cfg = dll.SWP_Configuration(
                                 ctypes.pointer(device),
                                 ctypes.pointer(swp_profile_in),
                                 ctypes.pointer(swp_profile_out),
                                 ctypes.pointer(trace_info)
                             )
                         except Exception:
-                            pass
+                            st_cfg = -1
+                        config_failures = 0 if st_cfg == 0 else config_failures + 1
                         consecutive_errors = 0
+                    if acquisition_failed():
+                        device_lost = True
                     time.sleep(0.01)
 
             elif current_mode == "RTA" and rta_spec_trace is not None:
@@ -1312,6 +1346,10 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                         det_raw_stream[start_idx : start_idx + det_stream_info.PacketSamples] = det_norm_packet[:]
                         
                 acq_failures = 0 if complete else acq_failures + 1
+                if complete:
+                    fail_since = None
+                elif acquisition_failed():
+                    device_lost = True
                 if acq_failures == 10:
                     data_queue.put(("status", f"DET acquisition failing repeatedly (Status: {st})"))
                 if complete:
@@ -1354,6 +1392,10 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                             break
                         chunks.append(np.ctypeslib.as_array(altern_iq_packet, shape=(pkt_samples * 2,)).copy())
                     acq_failures = 0 if chunks else acq_failures + 1
+                    if chunks:
+                        fail_since = None
+                    elif acquisition_failed():
+                        device_lost = True
                     if acq_failures == 10:
                         data_queue.put(("status", f"IQS stream failing repeatedly (Status: {st})"))
                     if chunks:
@@ -1400,6 +1442,10 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                             iqs_raw_stream[start_idx : start_idx + cnt] = altern_iq_packet[0:cnt]
                             
                     acq_failures = 0 if complete else acq_failures + 1
+                    if complete:
+                        fail_since = None
+                    elif acquisition_failed():
+                        device_lost = True
                     if acq_failures == 10:
                         data_queue.put(("status", f"IQS acquisition failing repeatedly (Status: {st})"))
                     if complete:
@@ -1493,6 +1539,12 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
         else:
             time.sleep(0.01)
             
+    if device_lost:
+        # Nothing to stop or close on an analyzer that is no longer there (and the SDK can
+        # wait a long time on one): the process ends and the handle goes with it
+        data_queue.put(("connected", False))
+        data_queue.put(("status", "Analyzer lost (unplugged or powered off)"))
+        return
     try:
         stop_mscan_if_running()
         stop_rta_stream()

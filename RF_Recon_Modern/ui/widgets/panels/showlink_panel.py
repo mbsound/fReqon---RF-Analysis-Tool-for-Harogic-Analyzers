@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QFrame, QScrollArea, QComboBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+from ..antenna_source import AntennaSourceRow
 
 class ShowLinkPanel(QWidget):
     """
@@ -57,6 +58,11 @@ class ShowLinkPanel(QWidget):
         
         # --- 1. CONFIGURATION CARD ---
         cfg_card = self._create_card("2.4 GHz SHOWLINK & CRMX MONITOR", layout)
+        self.antenna_row = AntennaSourceRow(
+            "Split sweep: the survey comes from the stitched sweep (analyzer A below the seam, B above). "
+            "The zero-span airtime measurement is taken by analyzer A alone.",
+            "Which antenna's analyzer the survey and the zero-span airtime measurement are taken from.")
+        cfg_card.layout().addWidget(self.antenna_row)
         
         thresh_layout = QHBoxLayout()
         thresh_layout.setContentsMargins(0, 2, 0, 2)
