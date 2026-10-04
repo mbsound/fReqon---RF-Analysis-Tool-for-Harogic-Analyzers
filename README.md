@@ -120,7 +120,6 @@ fReqon includes a comprehensive Digital and Analog Demodulation suite, enabling 
 │           ├── waterfall_view.py     # High-speed spectrogram view
 │           ├── multi_row_waterfall.py# Folded high-resolution waterfall
 │           └── panels/               # Sliding dock panels (MSCAN, Threats, RTSA, etc.)
-├── Shure_Coord_Example.csv   # Sample Shure Wireless Workbench coordination report
 └── docs/                     # Documentation assets and screenshots
     └── images/               # Visual Tour figures and documentation captures
 ```
