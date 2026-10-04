@@ -4,7 +4,7 @@ Renders clean, high-DPI vector icons using QPainter.
 Zero emojis, strict professional industrial test-and-measurement aesthetic.
 """
 
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF
 from PyQt6.QtCore import Qt, QPointF, QRectF
 
 def _create_pixmap(size=24):

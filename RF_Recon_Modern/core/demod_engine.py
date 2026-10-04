@@ -10,10 +10,11 @@ Processes real physical complex IQ streams into:
 CRITICAL PROJECT RULE: Zero synthetic data. Operates strictly on real hardware IQ packets.
 """
 
+import cmath
 import numpy as np
 import scipy.signal as signal
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 
 # Supported modulation types
 MOD_TYPES = {
@@ -22,6 +23,8 @@ MOD_TYPES = {
     "FSK": ["2-FSK", "4-FSK", "GMSK"],
     "ASK": ["2-ASK", "4-ASK"]
 }
+
+MAX_PLL_SYMBOLS = 2048   # symbols run through the phase-tracking loop per frame
 
 @dataclass
 class DemodResult:
@@ -70,9 +73,30 @@ class DemodEngine:
     """
 
     def __init__(self):
+        self._grid_cache = {}   # constellation -> decision lookup grid
         self.rrc_cache: Dict[Tuple[int, float, int], np.ndarray] = {}
         self.pll_phase = 0.0
         self.pll_freq = 0.0
+
+    def _decision_grid(self, ideal_const: np.ndarray):
+        """
+        Nearest-constellation-point lookup table over the complex plane:
+        grid[i][q] is the index of the ideal point nearest the cell centre.
+        Built once per constellation (cells are 0.014 wide, far finer than any
+        decision region), so a symbol decision is two integer index operations.
+        Returns (grid, lower edge, cells per unit, cell count).
+        """
+        key = ideal_const.tobytes()
+        cached = self._grid_cache.get(key)
+        if cached is not None:
+            return cached
+        n, lo, hi = 256, -1.8, 1.8
+        centers = lo + (np.arange(n) + 0.5) * (hi - lo) / n
+        pts = centers[:, None] + 1j * centers[None, :]           # [i, q]
+        grid = np.argmin(np.abs(pts[:, :, None] - ideal_const[None, None, :]), axis=2).tolist()
+        cached = (grid, lo, n / (hi - lo), n)
+        self._grid_cache[key] = cached
+        return cached
 
     def generate_ideal_constellation(self, mod_type: str) -> np.ndarray:
         """Generate normalized ideal constellation points."""
@@ -103,12 +127,10 @@ class DemodEngine:
             pts = np.array([i + 1j * q for i in grid for q in grid], dtype=np.complex64)
             pts /= np.sqrt(42.0)
         elif m_type == "128-QAM":
+            # Cross-shaped 128-QAM: 12x12 grid minus the 2x2 block in each corner
             grid = np.array(range(-11, 12, 2), dtype=np.float32)
-            all_pts = [i + 1j * q for i in grid for q in grid]
-            # Cross shape
-            pts = np.array([p for p in all_pts if abs(p.real) + abs(p.imag) <= 16], dtype=np.complex64)
-            if len(pts) != 128:
-                pts = np.array(all_pts[:128], dtype=np.complex64)
+            pts = np.array([i + 1j * q for i in grid for q in grid
+                            if not (abs(i) >= 9 and abs(q) >= 9)], dtype=np.complex64)
             pts /= np.sqrt(np.mean(np.abs(pts)**2))
         elif m_type == "256-QAM":
             grid = np.arange(-15, 16, 2, dtype=np.float32)
@@ -127,6 +149,27 @@ class DemodEngine:
             pts = np.array([-1 - 1j, -1 + 1j, 1 - 1j, 1 + 1j], dtype=np.complex64) / np.sqrt(2.0)
             
         return pts
+
+    @staticmethod
+    def symbol_bit_labels(mod_type: str, n_points: int) -> np.ndarray:
+        """
+        Bit label for each constellation index (the order used by
+        generate_ideal_constellation), Gray-coded so that neighbouring points
+        differ in one bit: per axis for square QAM, along the circle for 8-PSK,
+        along the levels for ASK/FSK. BPSK/QPSK index order is already Gray.
+        Cross 32/128-QAM have no standard Gray map and keep index labels.
+        """
+        idx = np.arange(n_points)
+        gray = lambda k: k ^ (k >> 1)
+        m_type = mod_type.upper()
+        if m_type in ("16-QAM", "64-QAM", "256-QAM"):
+            side = int(round(np.sqrt(n_points)))
+            bits_axis = int(round(np.log2(side)))
+            # Index = i_level * side + q_level (I outer loop in the generator)
+            return (gray(idx // side) << bits_axis) | gray(idx % side)
+        if m_type == "8-PSK" or "ASK" in m_type or "FSK" in m_type:
+            return gray(idx)
+        return idx
 
     def design_rrc_filter(self, sps: int, alpha: float = 0.35, span: int = 8) -> np.ndarray:
         """Design Root-Raised Cosine (RRC) matched filter impulse response."""
@@ -170,6 +213,42 @@ class DemodEngine:
         peak_idx = np.argmax(fft_res)
         f_offset = freqs[peak_idx] / mod_order
         return float(f_offset)
+
+    def estimate_carrier_offset_rings(self, syms: np.ndarray, ideal_const: np.ndarray, symbol_rate: float) -> float:
+        """
+        Coarse carrier offset for constellations whose overall 4th moment cancels
+        (cross 32/128-QAM). Works on symbol-strobed samples: symbols are assigned
+        to the nearest ideal amplitude ring, and only rings whose own 4th moment
+        is strong (mostly diagonal points, where s^4 is real and negative) are kept.
+        Their 4th power carries a spectral line at 4x the offset. Range +/- Rs/8.
+        """
+        if len(syms) < 256:
+            return 0.0
+        ideal_pow = np.abs(ideal_const) ** 2
+        syms = syms * np.sqrt(np.mean(ideal_pow) / max(np.mean(np.abs(syms) ** 2), 1e-20))
+        radii = np.unique(np.round(np.sqrt(ideal_pow), 6))
+        good = np.zeros(len(radii), dtype=bool)
+        align = np.ones(len(radii), dtype=np.complex128)
+        for i, r in enumerate(radii):
+            ring = ideal_const[np.abs(np.abs(ideal_const) - r) < 1e-5]
+            m4 = np.mean(ring ** 4)
+            good[i] = abs(m4) / np.mean(np.abs(ring) ** 4) > 0.6
+            # Rings differ in the sign of their 4th moment (axis vs diagonal
+            # points); rotate each onto a common phase so they add, not cancel.
+            align[i] = np.conj(m4) / max(abs(m4), 1e-12)
+        if not np.any(good):
+            return 0.0
+        # Nearest ring for every symbol (midpoints between consecutive radii)
+        ring_idx = np.searchsorted((radii[1:] + radii[:-1]) / 2.0, np.abs(syms))
+        keep = good[ring_idx]
+        if np.count_nonzero(keep) < 64:
+            return 0.0
+        # Zeroing the other symbols keeps the time base uniform for the FFT
+        x = np.where(keep, align[ring_idx] * syms ** 4 / np.maximum(np.abs(syms) ** 3, 1e-12), 0.0)
+        n_fft = 1 << int(np.ceil(np.log2(len(x) * 4)))
+        spec = np.abs(np.fft.fft(x * np.hanning(len(x)), n=n_fft))
+        freqs = np.fft.fftfreq(n_fft, d=1.0 / symbol_rate)
+        return float(freqs[np.argmax(spec)] / 4.0)
 
     def process_iq_stream(
         self,
@@ -306,9 +385,14 @@ class DemodEngine:
             # PSK / QAM: Costas Loop & Symbol Timing Recovery
             # Coarse carrier offset removal
             order = 4 if "QPSK" in mod_type.upper() or "QAM" in mod_type.upper() else (2 if "BPSK" in mod_type.upper() else 8)
-            f_offset = self.estimate_carrier_offset(iq_filtered, sample_rate, mod_order=order)
-            res.freq_error_hz = f_offset
-            
+            # The M-th power estimator relies on the constellation's M-th moment
+            # producing a spectral line. Where that moment nearly cancels (cross
+            # 32/128-QAM) it locks onto spurs; those are estimated after timing
+            # recovery from selected amplitude rings instead.
+            moment = abs(np.mean(ideal_const ** order)) / np.mean(np.abs(ideal_const) ** order)
+            use_rings = moment <= 0.25
+            f_offset = 0.0 if use_rings else self.estimate_carrier_offset(iq_filtered, sample_rate, mod_order=order)
+
             t = np.arange(len(iq_filtered)) / sample_rate
             iq_derot = iq_filtered * np.exp(-1j * 2.0 * np.pi * f_offset * t)
             
@@ -317,16 +401,24 @@ class DemodEngine:
             if rms_mag > 1e-12:
                 iq_derot /= rms_mag
                 
-            # Symbol Timing Recovery: select optimal sampling phase that maximizes decision variance
+            # Symbol Timing Recovery: for raised-cosine pulses the mean symbol energy
+            # peaks at the optimal strobe instant. (Envelope variance is the wrong
+            # criterion: for PSK it is smallest, not largest, at the strobe.)
             best_phase = 0
-            best_var = -1.0
+            best_energy = -1.0
             for ph in range(min(sps, len(iq_derot))):
-                sub = iq_derot[ph::sps]
-                v = np.var(np.abs(sub)**4) # Higher order moment peak at strobe instant
-                if v > best_var:
-                    best_var = v
+                energy = np.mean(np.abs(iq_derot[ph::sps]) ** 2)
+                if energy > best_energy:
+                    best_energy = energy
                     best_phase = ph
                     
+            if use_rings:
+                # Timing recovery uses only |x|^2, so it is unaffected by the offset
+                f_offset = self.estimate_carrier_offset_rings(
+                    iq_derot[best_phase::sps], ideal_const, sample_rate / sps)
+                iq_derot = iq_derot * np.exp(-1j * 2.0 * np.pi * f_offset * t).astype(np.complex64)
+            res.freq_error_hz = f_offset
+
             sym_samples = iq_derot[best_phase::sps]
             
             # Decision-Directed Phase Lock (Costas phase tracking across symbols)
@@ -340,23 +432,35 @@ class DemodEngine:
             curr_phase = self.pll_phase
             curr_freq = self.pll_freq
             
-            for k in range(n_sym):
-                # Rotate by current phase
-                s_rot = sym_samples[k] * np.exp(-1j * curr_phase)
-                
-                # Nearest ideal symbol decision (Euclidean distance)
-                dists = np.abs(ideal_const - s_rot)
-                nearest_idx = np.argmin(dists)
-                s_ideal = ideal_const[nearest_idx]
-                
-                corrected_syms[k] = s_rot
-                decided_syms[k] = s_ideal
-                sym_indices[k] = nearest_idx
-                
+            # The loop is inherently sequential (each decision feeds the next
+            # phase), so it runs in plain Python arithmetic on a bounded number
+            # of symbols (the display shows ~1000 and the bit table 512) with an
+            # O(1) nearest-point lookup, instead of numpy calls per symbol.
+            n_use = min(n_sym, MAX_PLL_SYMBOLS)
+            grid, g_lo, g_step, g_n = self._decision_grid(ideal_const)
+            sym_list = sym_samples[:n_use].tolist()
+            const_list = ideal_const.tolist()
+            corrected, decided, idxs = [0j] * n_use, [0j] * n_use, [0] * n_use
+            for k in range(n_use):
+                s_rot = sym_list[k] * cmath.exp(-1j * curr_phase)
+                gi = int((s_rot.real - g_lo) * g_step)
+                gq = int((s_rot.imag - g_lo) * g_step)
+                if gi < 0: gi = 0
+                elif gi >= g_n: gi = g_n - 1
+                if gq < 0: gq = 0
+                elif gq >= g_n: gq = g_n - 1
+                nearest_idx = grid[gi][gq]
+                s_ideal = const_list[nearest_idx]
+                corrected[k] = s_rot
+                decided[k] = s_ideal
+                idxs[k] = nearest_idx
                 # Phase Error Detector
-                err = np.angle(s_rot * np.conj(s_ideal))
+                err = cmath.phase(s_rot * s_ideal.conjugate())
                 curr_freq += beta_pll * err
                 curr_phase += curr_freq + alpha_pll * err
+            corrected_syms = np.array(corrected, dtype=np.complex64)
+            decided_syms = np.array(decided, dtype=np.complex64)
+            sym_indices = np.array(idxs, dtype=np.int32)
                 
             self.pll_phase = curr_phase % (2.0 * np.pi)
             self.pll_freq = curr_freq
@@ -394,13 +498,9 @@ class DemodEngine:
         pts_per_trace = 2 * sps
         num_traces = min(128, (len(eye_source) - pts_per_trace) // sps)
         if num_traces > 4 and pts_per_trace >= 4:
-            i_traces = np.zeros((num_traces, pts_per_trace), dtype=np.float32)
-            q_traces = np.zeros((num_traces, pts_per_trace), dtype=np.float32)
-            
-            for tr_idx in range(num_traces):
-                st_idx = tr_idx * sps
-                i_traces[tr_idx] = np.real(eye_source[st_idx : st_idx + pts_per_trace])
-                q_traces[tr_idx] = np.imag(eye_source[st_idx : st_idx + pts_per_trace])
+            windows = np.lib.stride_tricks.sliding_window_view(eye_source, pts_per_trace)[::sps][:num_traces]
+            i_traces = np.real(windows).astype(np.float32)
+            q_traces = np.imag(windows).astype(np.float32)
                 
             # Time axis from -T_sym to +T_sym in nanoseconds
             t_sym_ns = (1.0 / max(symbol_rate, 1e3)) * 1e9
@@ -414,7 +514,8 @@ class DemodEngine:
         if len(res.symbols) > 0:
             num_bits_per_sym = int(np.round(np.log2(max(2, len(ideal_const)))))
             # Format bits
-            bit_chunks = [format(s, f'0{num_bits_per_sym}b') for s in res.symbols[:512]]
+            labels = self.symbol_bit_labels(mod_type, len(ideal_const))
+            bit_chunks = [format(int(labels[s]), f'0{num_bits_per_sym}b') for s in res.symbols[:512]]
             all_bits = "".join(bit_chunks)
             res.bits = all_bits
             

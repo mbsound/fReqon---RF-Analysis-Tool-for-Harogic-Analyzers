@@ -7,6 +7,7 @@ Synchronized with PyQtGraph frequency axes with click-to-mask and hover tooltips
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPen, QFont
+from .channel_style import channel_kind, bar_colors
 
 class MHzAxisItem(pg.AxisItem):
     """
@@ -32,7 +33,11 @@ class ClickableChannelItem(pg.GraphicsObject):
         self.is_public_safety = False
         
         self.text = pg.TextItem(self.short_label, anchor=(0.5, 0.5), color='#f0f6fc')
-        font = QFont("Segoe UI, Inter, sans-serif", 8, QFont.Weight.Bold)
+        font = QFont()
+        font.setFamilies(["Segoe UI", "Inter"])  # first installed one wins
+        font.setStyleHint(QFont.StyleHint.SansSerif)
+        font.setPointSize(8)
+        font.setWeight(QFont.Weight.Bold)
         if self.item_type == "guard":
             font.setPointSize(7)
         self.text.setFont(font)
@@ -61,29 +66,10 @@ class ClickableChannelItem(pg.GraphicsObject):
         else:
             hz_gap = self.rect.width() * 0.02
 
-        # Industrial color mapping
         if self.is_active:
-            if self.item_type == "uplink":
-                p.setBrush(QBrush(QColor(236, 72, 153, 200)))  # Vibrant Pink
-                p.setPen(QPen(QColor(244, 114, 182), 1))
-            elif self.item_type == "downlink":
-                p.setBrush(QBrush(QColor(168, 85, 247, 200)))  # Vibrant Purple
-                p.setPen(QPen(QColor(192, 132, 252), 1))
-            elif self.item_type == "guard":
-                p.setBrush(QBrush(QColor(100, 116, 139, 180))) # Slate Gray
-                p.setPen(QPen(QColor(148, 163, 184), 1))
-            elif self.item_type in ("lmr_smr", "teal"):
-                p.setBrush(QBrush(QColor(20, 184, 166, 200)))  # Vibrant Teal
-                p.setPen(QPen(QColor(45, 212, 191), 1))
-            elif self.ch_num == 37 or self.item_type == "ch37":
-                p.setBrush(QBrush(QColor(71, 85, 105, 200)))   # Darker Slate
-                p.setPen(QPen(QColor(148, 163, 184), 1))
-            elif self.is_public_safety:
-                p.setBrush(QBrush(QColor(239, 68, 68, 220)))   # Alert Red
-                p.setPen(QPen(QColor(248, 113, 113), 1))
-            else:
-                p.setBrush(QBrush(QColor(14, 116, 144, 220)))  # High-density Cyan/Blue
-                p.setPen(QPen(QColor(6, 182, 212), 1))
+            fill, edge = bar_colors(channel_kind(self.item_type, self.is_public_safety))
+            p.setBrush(QBrush(fill))
+            p.setPen(QPen(edge, 1))
         else:
             # Muted inactive state
             p.setBrush(QBrush(QColor(30, 41, 59, 120)))
@@ -183,6 +169,6 @@ class ChannelMarkerBar(pg.PlotWidget):
                 ch_idx = ch - start_ch
                 f_start = start_freq + (ch_idx * spacing)
                 
-                item = ClickableChannelItem(ch, f_start, spacing)
+                item = ClickableChannelItem(ch, f_start, spacing, item_type=band.get("type", "default"))
                 item.channel_clicked.connect(self.on_channel_clicked)
                 self.addItem(item)

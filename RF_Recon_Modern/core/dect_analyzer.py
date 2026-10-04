@@ -1,56 +1,64 @@
 """
 dect_analyzer.py - DECT & Riedel Bolero Intercom Capacity & Transceiver Analysis Engine
 Provides real-time duty cycle time-occupancy, antenna beacon detection, beltpack transceiver estimation,
-channel congestion ratings, and actionable clean channel recommendations across US DECT 6.0, EU DECT, and 2.4 GHz Bolero.
+channel congestion ratings, and actionable clean channel recommendations across US DECT 6.0, EU DECT, and the 2.4 GHz ISM band.
 """
 
 import time
 import numpy as np
 from collections import deque
+
+from .dect_frames import analyse as analyse_frames
 from PyQt6.QtCore import QObject, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
-    QGridLayout, QFrame, QWidget, QScrollArea, QProgressBar
+    QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
+    QWidget, QProgressBar
 )
-from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QFont
+from PyQt6.QtGui import QColor
 
-# DECT Standard Carrier Frequencies & Band Definitions
+DECT_SPACING_MHZ = 1.728
+
+
+def _dect_carriers(prefix, first_mhz, count):
+    # Numbered upwards from the lowest carrier, as Riedel Bolero numbers them (ETSI numbers
+    # the EU carriers the other way)
+    return [{"ch": n, "freq_mhz": round(first_mhz + n * DECT_SPACING_MHZ, 3),
+             "name": f"{prefix} Ch {n} ({first_mhz + n * DECT_SPACING_MHZ:.2f} MHz)"} for n in range(count)]
+
+
+# DECT carrier frequencies and band definitions (the survey sweep is 30 MHz centred
+# on the band so the carriers at its edges are seen whole)
 DECT_BANDS = {
     "US DECT 6.0 (1920-1930 MHz)": {
-        "start_mhz": 1920.0,
-        "stop_mhz": 1930.0,
+        "start_mhz": 1910.0,
+        "stop_mhz": 1940.0,
         "center_mhz": 1925.0,
-        "span_mhz": 10.0,
-        "channel_spacing_mhz": 1.728,
-        "carriers": [
-            {"ch": 0, "freq_mhz": 1928.448, "name": "US Ch 0 (1928.45 MHz)"},
-            {"ch": 1, "freq_mhz": 1926.720, "name": "US Ch 1 (1926.72 MHz)"},
-            {"ch": 2, "freq_mhz": 1925.000, "name": "US Ch 2 (1925.00 MHz)"},
-            {"ch": 3, "freq_mhz": 1923.264, "name": "US Ch 3 (1923.26 MHz)"},
-            {"ch": 4, "freq_mhz": 1921.536, "name": "US Ch 4 (1921.54 MHz)"}
-        ]
+        "span_mhz": 30.0,
+        "channel_spacing_mhz": DECT_SPACING_MHZ,
+        "carriers": _dect_carriers("US", 1921.536, 5),
     },
     "EU DECT (1880-1900 MHz)": {
-        "start_mhz": 1880.0,
-        "stop_mhz": 1900.0,
+        "start_mhz": 1875.0,
+        "stop_mhz": 1905.0,
         "center_mhz": 1890.0,
-        "span_mhz": 20.0,
-        "channel_spacing_mhz": 1.728,
-        "carriers": [
-            {"ch": 0, "freq_mhz": 1897.344, "name": "EU Ch 0 (1897.34 MHz)"},
-            {"ch": 1, "freq_mhz": 1895.616, "name": "EU Ch 1 (1895.62 MHz)"},
-            {"ch": 2, "freq_mhz": 1893.888, "name": "EU Ch 2 (1893.89 MHz)"},
-            {"ch": 3, "freq_mhz": 1892.160, "name": "EU Ch 3 (1892.16 MHz)"},
-            {"ch": 4, "freq_mhz": 1890.432, "name": "EU Ch 4 (1890.43 MHz)"},
-            {"ch": 5, "freq_mhz": 1888.704, "name": "EU Ch 5 (1888.70 MHz)"},
-            {"ch": 6, "freq_mhz": 1886.976, "name": "EU Ch 6 (1886.98 MHz)"},
-            {"ch": 7, "freq_mhz": 1885.248, "name": "EU Ch 7 (1885.25 MHz)"},
-            {"ch": 8, "freq_mhz": 1883.520, "name": "EU Ch 8 (1883.52 MHz)"},
-            {"ch": 9, "freq_mhz": 1881.792, "name": "EU Ch 9 (1881.79 MHz)"}
-        ]
+        "span_mhz": 30.0,
+        "channel_spacing_mhz": DECT_SPACING_MHZ,
+        "carriers": _dect_carriers("EU", 1881.792, 10),
     },
-    "2.4 GHz Bolero (2400-2483.5 MHz)": {
+    "Japan DECT (1893-1906 MHz)": {
+        "start_mhz": 1885.0,
+        "stop_mhz": 1915.0,
+        "center_mhz": 1900.0,
+        "span_mhz": 30.0,
+        "channel_spacing_mhz": DECT_SPACING_MHZ,
+        "carriers": _dect_carriers("JP", 1895.616, 5),
+    },
+    # Riedel Bolero is a DECT system (bands above). This is a generic 4 MHz grid
+    # across the 2.4 GHz ISM band for 2.4 GHz intercoms; its TDMA-based load
+    # estimates are only indicative there. channel_spacing_mhz is the
+    # measurement width around each carrier.
+    "2.4 GHz ISM Intercom (2400-2483.5 MHz)": {
         "start_mhz": 2400.0,
         "stop_mhz": 2483.5,
         "center_mhz": 2441.75,
@@ -86,6 +94,8 @@ class DECTAnalyzerEngine(QObject):
         self.band_load_pct = 0.0
         self.recommended_carriers = []
         self._last_analysis_time = 0.0
+        # Zero-span frame analysis per carrier (core/dect_frames.py): {cf: {"time", "history": [results]}}
+        self.zero_span = {}
 
     def set_band(self, band_name):
         if band_name in DECT_BANDS:
@@ -108,9 +118,98 @@ class DECTAnalyzerEngine(QObject):
         self.total_beltpacks_est = 0
         self.band_load_pct = 0.0
         self.recommended_carriers.clear()
+        self.zero_span.clear()
         band_info = DECT_BANDS.get(self.active_band_name, DECT_BANDS["US DECT 6.0 (1920-1930 MHz)"])
         num_carriers = len(band_info["carriers"])
         self.slot_matrix = np.full((max(num_carriers, 20), 24), -120.0)
+
+    ZERO_SPAN_FRESH_S = 120.0       # a count from zero span stands this long
+    ZERO_SPAN_HISTORY = 3           # captures per carrier whose counts are taken together
+
+    def carrier_at(self, freq_hz):
+        """The carrier of the active band nearest freq_hz, within half a carrier, or None."""
+        band_info = DECT_BANDS.get(self.active_band_name)
+        if not band_info:
+            return None
+        c = min(band_info["carriers"], key=lambda c: abs(c["freq_mhz"] * 1e6 - freq_hz))
+        return c if abs(c["freq_mhz"] * 1e6 - freq_hz) <= band_info["channel_spacing_mhz"] * 1e6 / 2 else None
+
+    def occupied_carriers(self):
+        """Carriers with energy in the recent sweeps, highest first."""
+        return [c for c in sorted(self.carrier_stats.values(), key=lambda c: -c["smoothed_dbm"]) if c["active"]]
+
+    def process_zero_span(self, center_freq_hz, time_ns, power_dbm):
+        """
+        A zero-span capture of one carrier: count the antennas and beltpacks on it
+        from the burst positions within the 10 ms frame (core/dect_frames.py). The
+        counts of the last few captures are taken together (the median), so one
+        odd frame does not swing them. Returns the analysis, or None when the capture
+        is too short (under two frames) or off any carrier of the band.
+        """
+        c = self.carrier_at(center_freq_hz)
+        if c is None:
+            return None
+        r = analyse_frames(np.asarray(time_ns, dtype=float) * 1e-9, power_dbm, self.threshold_dbm)
+        if r is None:
+            return None
+        cf = c["freq_mhz"]
+        entry = self.zero_span.setdefault(cf, {"history": []})
+        entry["history"] = (entry["history"] + [r])[-self.ZERO_SPAN_HISTORY:]
+        entry["time"] = time.time()
+        hist = entry["history"]
+        entry["antennas"] = int(np.median([h["antennas"] for h in hist]))
+        entry["calls"] = int(np.median([h["calls"] for h in hist]))
+        entry["slots"] = r["slots"]
+        entry["continuous"] = all(h["continuous"] for h in hist)
+        entry["frames"] = r["frames"]
+        self._apply_zero_span(cf)
+        self._emit(time.time())
+        return r
+
+    def _zero_span_fresh(self, cf):
+        z = self.zero_span.get(cf)
+        return z if z and time.time() - z.get("time", 0) <= self.ZERO_SPAN_FRESH_S else None
+
+    def _apply_zero_span(self, cf):
+        """Put a carrier's zero-span count into its stats row (over the duty-cycle estimate)."""
+        z = self._zero_span_fresh(cf)
+        st = self.carrier_stats.get(cf)
+        if not z or not st:
+            return
+        st["antennas"], st["beltpacks"] = z["antennas"], z["calls"]
+        st["slots"] = z["slots"]
+        st["counted"] = "zero-span"
+        if z["continuous"]:
+            st["status"] = "⚠️ CONTINUOUS ENERGY (not DECT bursts)"
+            st["color"] = "#ff1744"
+        elif z["antennas"] == 0 and z["calls"] == 0:
+            st["status"] = "🟢 NO BURSTS (zero span)"
+            st["color"] = "#00e676"
+        else:
+            st["status"] = (f"{'🔵' if z['calls'] else '🟡'} {z['antennas']} Ant + {z['calls']} Packs on calls "
+                            f"(zero span, {z['frames']} frames)")
+            st["color"] = "#00bcd4" if z["calls"] else "#ffb300"
+
+    def _emit(self, now):
+        total_antennas = sum(c["antennas"] for c in self.carrier_stats.values())
+        total_beltpacks = sum(c["beltpacks"] for c in self.carrier_stats.values())
+        self.total_antennas_est = total_antennas
+        self.total_beltpacks_est = total_beltpacks
+        load = self.band_load_pct
+        band_status = "CLEAN" if load < 5.0 else "LIGHT" if load < 20.0 else "MODERATE" if load < 45.0 else "CONGESTED"
+        self.analysis_updated.emit({
+            "band_name": self.active_band_name,
+            "band_status": band_status,
+            "carriers": self.carrier_stats,
+            "slot_matrix": self.slot_matrix.copy(),
+            "total_antennas": self.total_antennas_est,
+            "total_beltpacks": self.total_beltpacks_est,
+            "band_load_pct": self.band_load_pct,
+            "recommended_carriers": self.recommended_carriers,
+            "threshold_dbm": self.threshold_dbm,
+            "counted": "zero-span" if any(self._zero_span_fresh(cf) for cf in self.carrier_stats) else "duty-cycle",
+            "timestamp": now,
+        })
 
     def process_sweep_data(self, freq_hz_array, power_dbm_array):
         """
@@ -143,8 +242,6 @@ class DECTAnalyzerEngine(QObject):
         spacing = band_info["channel_spacing_mhz"]
         half_bw = spacing / 2.0
 
-        total_antennas = 0
-        total_beltpacks = 0
         sum_duty_cycle = 0.0
 
         for idx, c in enumerate(carriers):
@@ -186,7 +283,12 @@ class DECTAnalyzerEngine(QObject):
             # ----------------------------------------------------
             # Transceiver Estimation & Channel Health Calculation
             # ----------------------------------------------------
-            # In DECT TDMA:
+            # duty_cycle_pct is the fraction of recent sweeps in which the carrier
+            # was above threshold. It approximates TDMA slot occupancy only when
+            # the analyzer dwells on the carrier for much less than one slot
+            # (417 us) per sweep; with longer dwell or max-hold detection any
+            # active carrier -- even an idle base's beacon -- reads near 100%.
+            # The counts below are estimates under the short-dwell assumption:
             # - Downlink Beacon (1 Antenna idle): ~4.17% to 8.33% duty cycle
             # - Each active duplex audio call: +8.33% duty cycle (1 DL slot + 1 UL slot)
             if duty_cycle_pct < 2.5:
@@ -215,14 +317,12 @@ class DECTAnalyzerEngine(QObject):
                 status = f"🔴 HEAVY LOAD ({antennas} Ant + {beltpacks} Packs | {duty_cycle_pct:.0f}%)"
                 color = "#e53935"
             else:
-                # Continuous RF energy (> 85% duty cycle) -> Non-DECT jammer or interference!
+                # Energy in (nearly) every sweep: a non-DECT interferer, or any
+                # DECT carrier when the sweep dwell is long -- can't tell apart.
                 antennas = 0
                 beltpacks = 0
-                status = f"⚠️ CONTINUOUS INTERFERENCE ({duty_cycle_pct:.0f}% Jam)"
+                status = f"⚠️ CONTINUOUS ENERGY ({duty_cycle_pct:.0f}% of sweeps: interferer or long dwell)"
                 color = "#ff1744"
-
-            total_antennas += antennas
-            total_beltpacks += beltpacks
 
             self.carrier_stats[cf] = {
                 "ch": ch_num,
@@ -236,8 +336,11 @@ class DECTAnalyzerEngine(QObject):
                 "beltpacks": beltpacks,
                 "status": status,
                 "color": color,
-                "active": duty_cycle_pct >= 2.5
+                "active": duty_cycle_pct >= 2.5,
+                "counted": "duty-cycle",
+                "slots": None,
             }
+            self._apply_zero_span(cf)
 
             # Update Slot Matrix visualization
             if idx < self.slot_matrix.shape[0]:
@@ -246,9 +349,6 @@ class DECTAnalyzerEngine(QObject):
                 else:
                     self.slot_matrix[idx, :] = np.maximum(self.slot_matrix[idx, :] - 5.0, -120.0)
 
-        # Aggregate Network Metrics
-        self.total_antennas_est = total_antennas
-        self.total_beltpacks_est = total_beltpacks
         self.band_load_pct = sum_duty_cycle / max(1, len(carriers))
 
         # Rank Cleanest Carriers for Bolero Expansion
@@ -260,18 +360,7 @@ class DECTAnalyzerEngine(QObject):
             c["name"] for c in sorted_clean if c["duty_cycle_pct"] < 5.0
         ]
 
-        result = {
-            "band_name": self.active_band_name,
-            "carriers": self.carrier_stats,
-            "slot_matrix": self.slot_matrix.copy(),
-            "total_antennas": self.total_antennas_est,
-            "total_beltpacks": self.total_beltpacks_est,
-            "band_load_pct": self.band_load_pct,
-            "recommended_carriers": self.recommended_carriers,
-            "threshold_dbm": self.threshold_dbm,
-            "timestamp": now
-        }
-        self.analysis_updated.emit(result)
+        self._emit(now)
 
 
 class TDMATimeslotDialog(QDialog):
@@ -325,7 +414,7 @@ class TDMATimeslotDialog(QDialog):
         layout.addWidget(self.carrier_table, 1)
 
         # Bottom Info Bar
-        info_label = QLabel("Note: Carrier duty cycle is calculated from real temporal RF energy integration. Beacon signals occupy ~4-8%, and active voice streams add ~8% per call.")
+        info_label = QLabel("Note: Duty cycle is the share of recent sweeps with energy on the carrier. It tracks DECT slot occupancy (beacon ~4-8%, +~8% per call) only with a short sweep dwell; with long dwell or max-hold every active carrier reads near 100%. Antenna and beltpack counts are estimates.")
         info_label.setStyleSheet("font-size: 8pt; color: #888888;")
         layout.addWidget(info_label)
 
@@ -355,7 +444,6 @@ class TDMATimeslotDialog(QDialog):
 
     def update_dashboard(self, data):
         carriers = data.get("carriers", {})
-        band_name = data.get("band_name", "")
         antennas = data.get("total_antennas", 0)
         beltpacks = data.get("total_beltpacks", 0)
         band_load = data.get("band_load_pct", 0.0)

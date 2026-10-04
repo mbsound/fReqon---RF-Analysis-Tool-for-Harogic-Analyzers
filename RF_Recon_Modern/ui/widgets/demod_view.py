@@ -14,12 +14,13 @@ CRITICAL PROJECT RULE: Zero synthetic data. Strictly renders real hardware IQ da
 
 import numpy as np
 import pyqtgraph as pg
+from .plot_grid import install_grid
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSplitter, QFrame,
-    QGridLayout, QTextEdit, QPushButton, QApplication
+    QTextEdit, QPushButton, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor
 
 from .spectrum_view import SpectrumView
 from .waterfall_view import WaterfallView
@@ -185,7 +186,7 @@ class DemodView(QWidget):
         self.baseband_spec_plot = pg.PlotWidget()
         self._format_plot(self.baseband_spec_plot, "Frequency (MHz)", "Power (dBm)")
         self.baseband_spec_plot.setYRange(-110, 10)
-        self.baseband_curve = self.baseband_spec_plot.plot(pen=pg.mkPen('#38bdf8', width=1.5))
+        self.baseband_curve = self.baseband_spec_plot.plot(pen=pg.mkPen('#38bdf8', width=1.0))
         
         # OBW Region shading
         self.obw_region = pg.LinearRegionItem(
@@ -221,11 +222,11 @@ class DemodView(QWidget):
         self.eye_plot.addItem(pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('#30363d', width=1, style=Qt.PenStyle.DashLine)))
         self.eye_plot.setYRange(-2.5, 2.5, padding=0.1)
         self.eye_plot.getViewBox().disableAutoRange(axis=pg.ViewBox.YAxis)
-        self.eye_curves = []
-        for _ in range(48):
-            c_i = self.eye_plot.plot(pen=pg.mkPen(QColor(56, 189, 248, 120), width=1))
-            c_q = self.eye_plot.plot(pen=pg.mkPen(QColor(236, 72, 153, 90), width=1))
-            self.eye_curves.append((c_i, c_q))
+        # Every eye trace of a frame goes into one curve per component, with a
+        # NaN between traces (connect="finite"): two setData calls per frame
+        # instead of one per trace
+        self.eye_curve_i = self.eye_plot.plot(pen=pg.mkPen(QColor(56, 189, 248, 120), width=1), connect="finite")
+        self.eye_curve_q = self.eye_plot.plot(pen=pg.mkPen(QColor(236, 72, 153, 90), width=1), connect="finite")
             
         self.eye_frame.layout().addWidget(self.eye_plot)
         right_quad_splitter.addWidget(self.eye_frame)
@@ -307,7 +308,7 @@ class DemodView(QWidget):
 
     def _format_plot(self, plot: pg.PlotWidget, x_lbl: str, y_lbl: str):
         plot.setBackground('#0d1117')
-        plot.showGrid(x=True, y=True, alpha=0.25)
+        install_grid(plot, x=True, y=True, alpha=0.25)
         styles = {'color': '#8b949e', 'font-size': '10px'}
         plot.setLabel('bottom', x_lbl, **styles)
         plot.setLabel('left', y_lbl, **styles)
@@ -315,13 +316,6 @@ class DemodView(QWidget):
             ax = plot.getAxis(axis)
             ax.setPen(pg.mkPen('#30363d'))
             ax.setTextPen(pg.mkPen('#8b949e'))
-
-    def update_sweep_data(self, freq: np.ndarray, power: np.ndarray):
-        """Update the top Spectrum and Waterfall views with live RF sweep data."""
-        if len(freq) > 0 and len(power) > 0:
-            x_mhz = freq / 1e6
-            self.spectrum_view.update_curve_data("Real-Time", x_mhz, power)
-            self.waterfall_view.update_waterfall(power, x_mhz[0], x_mhz[-1])
 
     def set_channel_params(self, center_freq_mhz: float, channel_bw_mhz: float):
         """Update the interactive selection band position and bandwidth."""
@@ -420,17 +414,23 @@ class DemodView(QWidget):
             
         # 3. Eye Diagram
         if len(res.eye_time_ns) > 0 and len(res.eye_i_traces) > 0:
-            n_curves = min(len(self.eye_curves), len(res.eye_i_traces))
-            for idx in range(n_curves):
-                c_i, c_q = self.eye_curves[idx]
-                c_i.setData(res.eye_time_ns, res.eye_i_traces[idx])
-                c_q.setData(res.eye_time_ns, res.eye_q_traces[idx])
-            self.eye_plot.setXRange(res.eye_time_ns[0], res.eye_time_ns[-1])
+            n_tr = res.eye_i_traces.shape[0]
+            nan_col = np.full((n_tr, 1), np.nan, dtype=np.float32)
+            x = np.tile(np.append(res.eye_time_ns.astype(np.float32), np.float32(np.nan)), n_tr)
+            self.eye_curve_i.setData(x, np.hstack((res.eye_i_traces, nan_col)).ravel())
+            self.eye_curve_q.setData(x, np.hstack((res.eye_q_traces, nan_col)).ravel())
+            t0, t1 = float(res.eye_time_ns[0]), float(res.eye_time_ns[-1])
+            if np.isfinite(t0) and np.isfinite(t1) and t1 > t0:
+                self.eye_plot.setXRange(t0, t1)
             
-            # Maintain a static, stable Y-axis view range with generous headroom
-            max_i = float(np.max(np.abs(res.eye_i_traces))) if len(res.eye_i_traces) > 0 else 1.0
-            max_q = float(np.max(np.abs(res.eye_q_traces))) if len(res.eye_q_traces) > 0 else 1.0
+            # Maintain a static, stable Y-axis view range with generous headroom.
+            # (A noise-only capture can give infinite traces; those must not
+            # reach the view range, which pyqtgraph cannot represent.)
+            max_i = float(np.nanmax(np.abs(res.eye_i_traces))) if len(res.eye_i_traces) > 0 else 1.0
+            max_q = float(np.nanmax(np.abs(res.eye_q_traces))) if len(res.eye_q_traces) > 0 else 1.0
             curr_peak = max(max_i, max_q, 1.0)
+            if not np.isfinite(curr_peak) or curr_peak > 1e6:
+                curr_peak = max(self._eye_max_peak, 1.0)
             
             # Fast attack on large peaks, slow decay to keep scale calm and stable
             if curr_peak > self._eye_max_peak:

@@ -6,7 +6,7 @@ Acquisition Window Length, Reference Level, Attenuation, Preamp, and Trigger Sou
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QDoubleSpinBox, QSpinBox, QFrame, QScrollArea
+    QDoubleSpinBox, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ..freq_inputs import FreqSpinBox
@@ -109,6 +109,8 @@ class DETPanel(QWidget):
         self.dec_combo.addItem("512 ns (Decimate 64)", 64)
         self.dec_combo.addItem("1.02 us (Decimate 128)", 128)
         self.dec_combo.setCurrentIndex(1) # Default 16 ns
+        self._interval_ns = 8.0      # per sample at decimation 1
+        self._det_caps = None        # an analyzer's own zero-span options (apply_capabilities)
         dec_row.addWidget(dec_lbl)
         dec_row.addWidget(self.dec_combo)
         time_layout.addLayout(dec_row)
@@ -132,6 +134,11 @@ class DETPanel(QWidget):
         self.window_info_lbl = QLabel("Window Span: 259.8 us")
         self.window_info_lbl.setStyleSheet("color: #10b981; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600; padding-top: 2px;")
         time_layout.addWidget(self.window_info_lbl)
+        self.caps_note_lbl = QLabel("")
+        self.caps_note_lbl.setWordWrap(True)
+        self.caps_note_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+        self.caps_note_lbl.setVisible(False)
+        time_layout.addWidget(self.caps_note_lbl)
         
         self.dec_combo.currentIndexChanged.connect(self._update_window_info)
         self.len_combo.currentIndexChanged.connect(self._update_window_info)
@@ -165,7 +172,7 @@ class DETPanel(QWidget):
         gain_layout.addLayout(att_row)
         
         preamp_row = QHBoxLayout()
-        preamp_lbl = QLabel("Pre-Amplifier:")
+        preamp_lbl = self.preamp_lbl = QLabel("Pre-Amplifier:")
         preamp_lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
         self.preamp_combo = QComboBox()
         self.preamp_combo.addItem("Auto On", 0x00)
@@ -173,6 +180,14 @@ class DETPanel(QWidget):
         preamp_row.addWidget(preamp_lbl)
         preamp_row.addWidget(self.preamp_combo)
         gain_layout.addLayout(preamp_row)
+        self.gain_note_lbl = QLabel("")
+        self.gain_note_lbl.setWordWrap(True)
+        self.gain_note_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+        self.gain_note_lbl.setVisible(False)
+        gain_layout.addWidget(self.gain_note_lbl)
+        self._caps = None            # the analyzer's capabilities, when it has its own gain choices
+        self._rf_input = "auto"
+        self.cf_spin.valueChanged.connect(self._refresh_gain_options)
         
         layout.addWidget(gain_card)
         
@@ -189,6 +204,22 @@ class DETPanel(QWidget):
         tsrc_row.addWidget(tsrc_lbl)
         tsrc_row.addWidget(self.trig_source_combo)
         trig_layout.addLayout(tsrc_row)
+
+        # A trigger level, for analyzers whose zero span takes one (apply_capabilities)
+        self.trig_level_lbl = QLabel("Level:")
+        self.trig_level_lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
+        self.trig_level_spin = QDoubleSpinBox()
+        self.trig_level_spin.setRange(-130.0, 10.0)
+        self.trig_level_spin.setDecimals(0)
+        self.trig_level_spin.setValue(-60.0)
+        self.trig_level_spin.setSuffix(" dBm")
+        tlvl_row = QHBoxLayout()
+        tlvl_row.addWidget(self.trig_level_lbl)
+        tlvl_row.addWidget(self.trig_level_spin)
+        trig_layout.addLayout(tlvl_row)
+        self.trig_level_lbl.setVisible(False)
+        self.trig_level_spin.setVisible(False)
+        self.trig_source_combo.currentIndexChanged.connect(self._sync_trig_level)
         
         layout.addWidget(trig_card)
         
@@ -285,11 +316,134 @@ class DETPanel(QWidget):
                 combo.setCurrentIndex(idx)
                 break
 
+    HAROGIC_DECIMATIONS = (("8 ns (Decimate 1)", 1), ("16 ns (Decimate 2)", 2), ("32 ns (Decimate 4)", 4),
+                           ("64 ns (Decimate 8)", 8), ("128 ns (Decimate 16)", 16), ("256 ns (Decimate 32)", 32),
+                           ("512 ns (Decimate 64)", 64), ("1.02 us (Decimate 128)", 128))
+    HAROGIC_LENGTHS = (2048, 4096, 8192, 16240, 32768, 65536)
+    HAROGIC_TRIGGERS = (("Internal Bus Trigger", 2), ("External Trigger (SMA)", 1), ("Level Threshold Trigger", 3))
+
+    @staticmethod
+    def _fill(combo: QComboBox, items, select):
+        combo.blockSignals(True)
+        combo.clear()
+        for label, data in items:
+            combo.addItem(label, data)
+        combo.setCurrentIndex(max(0, combo.findData(select)))
+        combo.blockSignals(False)
+
+    def apply_capabilities(self, caps: dict):
+        """
+        Offer the analyzer's own zero-span options (core/device_caps.py "det"). A
+        Harogic analyzer samples every 8 ns x decimation; a tinySA has one, much
+        slower, rate, takes its gain settings from RF & Sweep and has no external trigger.
+        """
+        self.cf_spin.setRange(max(0.001, caps["freq_min_hz"] / 1e6), caps["freq_max_hz"] / 1e6)
+        det = caps.get("det")
+        self._caps = caps if det else None
+        self._refresh_gain_options()
+        if det == self._det_caps:
+            return
+        self._det_caps = det
+        if det:
+            dt_ns = float(det["sample_interval_ns"])
+            self._interval_ns = dt_ns
+            self._fill(self.dec_combo, [(f"{dt_ns / 1e3:.0f} us (fixed)", 1)], 1)
+            lengths = list(det.get("lengths") or [det["max_points"]])
+            self._fill(self.len_combo, [(f"{n} Points", n) for n in lengths], lengths[-1])
+            self._fill(self.trig_source_combo, list(det["trigger_sources"]), det["trigger_sources"][0][1])
+        else:
+            self._interval_ns = 8.0
+            self._fill(self.dec_combo, self.HAROGIC_DECIMATIONS, 2)
+            self._fill(self.len_combo, [(f"{n} Points", n) for n in self.HAROGIC_LENGTHS], 16240)
+            self._fill(self.trig_source_combo, self.HAROGIC_TRIGGERS, 2)
+        self.dec_combo.setEnabled(not det)
+        has_level = bool(det and det.get("trigger_level"))
+        self.trig_level_lbl.setVisible(has_level)
+        self.trig_level_spin.setVisible(has_level)
+        self._sync_trig_level()
+        self.caps_note_lbl.setText((det or {}).get("note", ""))
+        self.caps_note_lbl.setVisible(bool(det and det.get("note")))
+        self._update_window_info()
+
+    HAROGIC_ATTEN = (("Auto (0 dB)", 0), ("10 dB", 10), ("20 dB", 20), ("30 dB", 30))
+    HAROGIC_PREAMP = (("Auto On", 0x00), ("Forced Off", 0x01))
+
+    def set_rf_input(self, rf_input: str):
+        """The RF input chosen in RF & Sweep ("auto": by frequency), for analyzers with several."""
+        self._rf_input = rf_input or "auto"
+        self._refresh_gain_options()
+
+    def _input_in_use(self):
+        """The analyzer input (capabilities "inputs" entry) the centre frequency is measured on, or None."""
+        inputs = (self._caps or {}).get("inputs") or []
+        chosen = next((i for i in inputs if i["id"] == self._rf_input), None)
+        if chosen:
+            return chosen
+        f = self.cf_spin.value() * 1e6
+        return next((i for i in inputs if i["min_hz"] <= f <= i["max_hz"]), None)   # the first that reaches it
+
+    def _refresh_gain_options(self, *_):
+        """
+        Attenuation and pre-amplifier choices of the analyzer in use. A tinySA: 0-31 dB
+        or automatic on the Low input, a pad in or out on the High input, no pre-amplifier;
+        a tinySA Ultra: 0-31 dB or automatic, and its LNA.
+        """
+        caps = self._caps
+        if not caps:
+            atten, preamp, note = self.HAROGIC_ATTEN, self.HAROGIC_PREAMP, ""
+        else:
+            inp = self._input_in_use()
+            kind = (inp or {}).get("atten") or ({"kind": "range", "db": caps["atten_db"]} if caps.get("atten_db") else None)
+            note = ""
+            if kind and kind["kind"] == "switch":
+                label = kind.get("label", "pad")
+                atten = (("Out (0 dB)", 0), (f"In ({label})", 10))
+                note = f"The {inp['label']} input has no step attenuator, only a {label} that is in or out."
+            elif kind:
+                lo, hi, step = (int(v) for v in kind["db"])
+                atten = ((("Auto", -1),) if caps.get("auto_atten") else ()) + tuple(
+                    (f"{v} dB", v) for v in range(lo, hi + 1, max(1, step)))
+            else:
+                atten = ()
+            preamp = (("LNA Off", 0x01), ("LNA On", 0x04)) if caps.get("preamp") == "lna" else ()
+            if preamp:
+                note = (note + " " if note else "") + "The LNA bypasses the attenuator."
+        for combo, items in ((self.att_combo, atten), (self.preamp_combo, preamp)):
+            if [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())] == list(items):
+                continue
+            was = combo.currentData()
+            # The same setting where the new choices have it; a pad follows "some attenuation"
+            if combo is self.att_combo and was is not None and was not in [d for _l, d in items]:
+                was = next((d for _l, d in items if d > 0), None) if was > 0 else next((d for _l, d in items), None)
+            self._fill(combo, items, was)
+        self.att_combo.setEnabled(bool(atten))
+        self.preamp_lbl.setVisible(bool(preamp))
+        self.preamp_combo.setVisible(bool(preamp))
+        self.gain_note_lbl.setText(note)
+        self.gain_note_lbl.setVisible(bool(note))
+
+    def set_gain(self, atten, preamp):
+        """Show an attenuation (-1: automatic) and pre-amplifier setting, as far as the analyzer has them."""
+        if atten is not None and self.att_combo.count():
+            data = [self.att_combo.itemData(i) for i in range(self.att_combo.count())]
+            if atten not in data:
+                positive = [d for d in data if d > 0]
+                atten = min(positive, key=lambda d: abs(d - atten)) if atten > 0 and positive else data[0]
+            self._select_combo_data(self.att_combo, atten)
+        if preamp is not None:
+            self._select_combo_data(self.preamp_combo, preamp)
+
+    def _sync_trig_level(self, *_):
+        # Free run (the bus trigger) has no level
+        self.trig_level_spin.setEnabled(self.trig_source_combo.currentData() != 2)
+
     def _update_window_info(self):
         pts = self.len_combo.currentData() or 16240
         dec = self.dec_combo.currentData() or 2
-        dur_s = pts * 8e-9 * dec
-        if dur_s >= 1e-3:
+        dur_s = pts * self._interval_ns * 1e-9 * dec
+        if dur_s >= 1.0:
+            s_str = f"{dur_s:.2f} s"
+        elif dur_s >= 1e-3:
             s_str = f"{dur_s * 1e3:.2f} ms"
         else:
             s_str = f"{dur_s * 1e6:.1f} us"
@@ -320,6 +474,13 @@ class DETPanel(QWidget):
         self.presetSelected.emit("bluetooth")
 
     def auto_fit_window(self, min_duration_ns: float):
+        if self._det_caps:
+            # One sample rate: the shortest length that covers it
+            lengths = [self.len_combo.itemData(i) for i in range(self.len_combo.count())]
+            fit = next((n for n in lengths if n * self._interval_ns >= min_duration_ns), lengths[-1])
+            self._select_combo_data(self.len_combo, fit)
+            self._update_window_info()
+            return
         # Prefer 16240 points for ultra-fast single-packet USB transfers
         for pts in [16240, 32768, 65536]:
             for dec in [1, 2, 4, 8, 16, 32, 64, 128]:
@@ -342,5 +503,9 @@ class DETPanel(QWidget):
             "atten": self.att_combo.currentData(),
             "preamp": self.preamp_combo.currentData(),
             "trigger_source": self.trig_source_combo.currentData(),
-            "trigger_mode": 0
+            "trigger_mode": 0,
+            # Sent with the zero-span settings for analyzers with their own gain choices (a tinySA)
+            "own_gain": bool(self._caps),
+            # None: the analyzer's zero span takes no level
+            "trigger_level": self.trig_level_spin.value() if (self._det_caps or {}).get("trigger_level") else None,
         }

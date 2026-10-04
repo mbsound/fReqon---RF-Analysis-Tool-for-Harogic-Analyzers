@@ -7,10 +7,9 @@ dwell timing, RF dropout alarms, and Zone/Group channel filtering.
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
     QCheckBox, QDoubleSpinBox, QComboBox, QTreeWidget, QTreeWidgetItem,
-    QFrame, QScrollArea, QHeaderView, QTableWidget, QTableWidgetItem,
-    QMenu, QColorDialog
+    QFrame, QScrollArea, QHeaderView, QMenu, QColorDialog
 )
-from PyQt6.QtGui import QColor, QBrush, QFont, QAction
+from PyQt6.QtGui import QColor, QBrush
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 
 class MSCANPanel(QWidget):

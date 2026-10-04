@@ -5,7 +5,6 @@ Supports auto-staging into active working directories before Device_Open, auto-m
 detailed file introspection, and batch import/export.
 """
 
-import os
 import shutil
 import re
 import json
@@ -45,10 +44,22 @@ class CalibrationManager:
         """
         Migrates calibrations from legacy ~/.config/RF_Recon_App/calibrations/
         and seeds from the local project's CalFile/ folder if present.
+
+        Each source is imported only the first time it is seen (recorded in
+        .seeded_sources), so calibrations the user deletes stay deleted and
+        metadata timestamps are not rewritten on every start.
         """
+        marker = self.base_dir / ".seeded_sources"
+        try:
+            seeded = set(marker.read_text(encoding="utf-8").splitlines()) if marker.exists() else set()
+        except OSError:
+            seeded = set()
+        seeded_before = set(seeded)
+
         try:
             # 1. Migrate legacy folder
-            if self.legacy_dir.exists() and self.legacy_dir.is_dir():
+            legacy_key = str(self.legacy_dir.resolve())
+            if legacy_key not in seeded and self.legacy_dir.is_dir():
                 for dev_dir in self.legacy_dir.iterdir():
                     if dev_dir.is_dir():
                         dest_dir = self.base_dir / dev_dir.name
@@ -56,6 +67,7 @@ class CalibrationManager:
                         for f in dev_dir.glob("*"):
                             if f.is_file() and not (dest_dir / f.name).exists():
                                 shutil.copy2(f, dest_dir / f.name)
+                seeded.add(legacy_key)
 
             # 2. Seed from local project CalFile directory if present
             local_cal_dirs = [
@@ -63,10 +75,18 @@ class CalibrationManager:
                 Path(__file__).resolve().parent.parent / "CalFile"
             ]
             for ldir in local_cal_dirs:
-                if ldir.exists() and ldir.is_dir():
+                key = str(ldir.resolve())
+                if key not in seeded and ldir.is_dir():
                     self.import_from_directory(str(ldir))
+                    seeded.add(key)
         except Exception as e:
             print(f"[CalibrationManager] Warning during auto-migration: {e}")
+
+        if seeded != seeded_before:
+            try:
+                marker.write_text("\n".join(sorted(seeded)) + "\n", encoding="utf-8")
+            except OSError:
+                pass
 
     def get_cal_dir(self, model, uid) -> Path | None:
         """
@@ -207,10 +227,20 @@ class CalibrationManager:
 
         return summary
 
+    @staticmethod
+    def staging_root(slot_name: str = "slot_a") -> Path:
+        """
+        fReqon-owned directory the SDK loads calibration from for one analyzer
+        slot (the SDK reads <root>/CalFile/). Each slot has its own, so two
+        analyzers never overwrite or delete each other's staged files.
+        """
+        return Path.home() / ".config" / "Freqon" / "staging" / slot_name
+
     def deploy_cal_files(self, model, uid, target_dir=None) -> bool:
         """
-        Stages the calibration files for a specific analyzer (model, uid) into the target directory (default: ./CalFile).
-        This guarantees that when Harogic libhtraapi.so invokes Device_Open, it loads the exact calibration for this hardware.
+        Stages the calibration files for a specific analyzer (model, uid) into
+        target_dir (default: the primary slot's staging CalFile directory), so the
+        SDK loads the exact calibration for this hardware at Device_Open.
         """
         cal_dir = self.get_cal_dir(model, uid)
         if not cal_dir:
@@ -219,15 +249,13 @@ class CalibrationManager:
         model_str, uid_str = self._format_keys(model, uid)
         prefix = f"{model_str}_{uid_str}_"
 
-        if target_dir is None:
-            target_dir = Path.cwd() / "CalFile"
-        else:
-            target_dir = Path(target_dir)
+        target_dir = Path(target_dir) if target_dir is not None else self.staging_root() / "CalFile"
 
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Remove any stale rfacal/ifacal/config from other devices in the active stage
+
+            # The staging directory is owned by fReqon and belongs to one slot, so
+            # stale files from a previously connected analyzer can be removed safely.
             for existing in target_dir.glob("*"):
                 if existing.is_file():
                     name = existing.name
@@ -236,12 +264,11 @@ class CalibrationManager:
                             existing.unlink()
                         except Exception:
                             pass
-            
-            # Copy all calibration, config, license, and ampcomp files into the active stage
+
+            # Copy all calibration, config, license, and ampcomp files into the stage
             for f in cal_dir.glob("*"):
                 if f.is_file() and not f.name.endswith(".json"):
-                    dest = target_dir / f.name
-                    shutil.copy2(f, dest)
+                    shutil.copy2(f, target_dir / f.name)
             return True
         except Exception as e:
             print(f"[CalibrationManager] Failed to stage cal files to {target_dir}: {e}")
@@ -255,12 +282,19 @@ class CalibrationManager:
         source_path = Path(source_dir)
         if not source_path.exists() or not source_path.is_dir():
             return 0, [f"Directory does not exist: {source_dir}"]
+        return self.import_files([str(f) for f in source_path.glob("*")])
 
+    def import_files(self, file_paths: list[str]) -> tuple[int, list[str]]:
+        """
+        Imports the given calibration files, identifying the device from each
+        filename ({model}_{uid}_*.txt). Files without a UID prefix (ampcomp, .lic,
+        config.txt) are copied into every device folder. Other files are ignored.
+        """
         pattern = re.compile(r"^(\d{3})_([a-fA-F0-9]{16})_.*\.txt$")
         imported_files = []
         general_files = []
 
-        for f in source_path.glob("*"):
+        for f in map(Path, file_paths):
             if not f.is_file():
                 continue
             name = f.name

@@ -6,14 +6,14 @@ rolling 30s sparklines, and dropout alarms for wireless microphone coordination.
 
 import time
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSplitter, QMenu, QComboBox, QSizePolicy, QColorDialog
 )
-from PyQt6.QtGui import QColor, QFont, QPainter, QBrush, QPen, QLinearGradient
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF
+from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
 import pyqtgraph as pg
 
@@ -27,6 +27,7 @@ class ChannelCard(QFrame):
 
     def __init__(self, carrier: dict, parent=None):
         super().__init__(parent)
+        self._status = None   # last status shown (styles only change with it)
         self.carrier = carrier
         self.channel_id = str(carrier.get("id", ""))
         self.name = carrier.get("name", "Channel")
@@ -127,7 +128,7 @@ class ChannelCard(QFrame):
         self.sparkline.setMouseEnabled(x=False, y=False)
         self.sparkline.getPlotItem().setContentsMargins(0, 0, 0, 0)
         
-        pen = pg.mkPen(color=self.color_hex, width=1.5)
+        pen = pg.mkPen(color=self.color_hex, width=1.0)
         self.sparkline_curve = self.sparkline.plot(self.history_power, pen=pen)
         layout.addWidget(self.sparkline)
 
@@ -170,61 +171,57 @@ class ChannelCard(QFrame):
         self.color_hex = new_color_hex
         self.carrier["color"] = new_color_hex
         self.accent_lbl.setStyleSheet(f"background-color: {new_color_hex}; border-radius: 2px;")
-        pen = pg.mkPen(color=new_color_hex, width=1.5)
+        pen = pg.mkPen(color=new_color_hex, width=1.0)
         self.sparkline_curve.setPen(pen)
         self._update_card_style()
 
-    def update_power(self, power_dbm: float, dropout_threshold_dbm: float = -75.0):
+    STATUS_STYLES = {
+        "GOOD RF":  ("#064e3b", "#34d399", "#10b981", False),
+        "MARGINAL": ("#78350f", "#fbbf24", "#f59e0b", False),
+        "DROPOUT":  ("#7f1d1d", "#f87171", "#ef4444", True),
+        "STANDBY":  ("#21262d", "#8b949e", "#374151", False),
+    }
+
+    def update_power(self, power_dbm: float, dropout_threshold_dbm: float = -75.0, worst_dbm: float = None):
+        """power_dbm is shown; the status is judged on worst_dbm (the weakest
+        hop since the last redraw) so a brief dropout is not missed."""
         self.current_power_dbm = power_dbm
         self.dropout_threshold_dbm = dropout_threshold_dbm
         self.last_update_time = time.time()
+        judge = power_dbm if worst_dbm is None else min(power_dbm, worst_dbm)
 
         if power_dbm > self.peak_power_dbm:
             self.peak_power_dbm = power_dbm
 
-        # Update labels
         self.power_lbl.setText(f"{power_dbm:.1f} dBm")
         self.peak_lbl.setText(f"Pk: {self.peak_power_dbm:.1f}")
 
-        # Update status badge & colors
-        if power_dbm >= -65.0:
-            self.status_badge.setText("GOOD RF")
-            self.status_badge.setStyleSheet("background-color: #064e3b; color: #34d399; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px;")
-            self.power_lbl.setStyleSheet("color: #34d399; font-size: 14px; font-weight: 700; font-family: monospace;")
-            fill_color = "#10b981"
-            self.is_dropout = False
-        elif power_dbm >= dropout_threshold_dbm:
-            self.status_badge.setText("MARGINAL")
-            self.status_badge.setStyleSheet("background-color: #78350f; color: #fbbf24; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px;")
-            self.power_lbl.setStyleSheet("color: #fbbf24; font-size: 14px; font-weight: 700; font-family: monospace;")
-            fill_color = "#f59e0b"
-            self.is_dropout = False
-        elif power_dbm > -95.0:
-            self.status_badge.setText("DROPOUT")
-            self.status_badge.setStyleSheet("background-color: #7f1d1d; color: #f87171; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px;")
-            self.power_lbl.setStyleSheet("color: #f87171; font-size: 14px; font-weight: 700; font-family: monospace;")
-            fill_color = "#ef4444"
-            self.is_dropout = True
+        if judge >= -65.0:
+            status = "GOOD RF"
+        elif judge >= dropout_threshold_dbm:
+            status = "MARGINAL"
+        elif judge > -95.0:
+            status = "DROPOUT"
         else:
-            self.status_badge.setText("STANDBY")
-            self.status_badge.setStyleSheet("background-color: #21262d; color: #8b949e; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px;")
-            self.power_lbl.setStyleSheet("color: #6e7681; font-size: 14px; font-weight: 700; font-family: monospace;")
-            fill_color = "#374151"
-            self.is_dropout = False
+            status = "STANDBY"
+        # Stylesheets re-polish the widget, so they are only applied on a status change
+        if status != self._status:
+            self._status = status
+            bg, fg, fill_color, self.is_dropout = self.STATUS_STYLES[status]
+            self.status_badge.setText(status)
+            self.status_badge.setStyleSheet(f"background-color: {bg}; color: {fg}; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px;")
+            self.power_lbl.setStyleSheet(f"color: {fg if status != 'STANDBY' else '#6e7681'}; font-size: 14px; font-weight: 700; font-family: monospace;")
+            self.bar_fill.setStyleSheet(f"background-color: {fill_color}; border-radius: 2px;")
+            self._update_card_style()
 
-        # Update Level Bar fill width (-100 dBm = 0%, -20 dBm = 100%)
+        # Level Bar fill width (-100 dBm = 0%, -20 dBm = 100%)
         container_w = max(10, self.bar_container.width() - 2)
         fraction = max(0.0, min(1.0, (power_dbm - (-100.0)) / 80.0))
-        fill_w = int(fraction * container_w)
-        self.bar_fill.setGeometry(1, 1, fill_w, 8)
-        self.bar_fill.setStyleSheet(f"background-color: {fill_color}; border-radius: 2px;")
+        self.bar_fill.setGeometry(1, 1, int(fraction * container_w), 8)
 
-        # Update history sparkline
-        self.history_power = np.roll(self.history_power, -1)
+        self.history_power[:-1] = self.history_power[1:]
         self.history_power[-1] = power_dbm
         self.sparkline_curve.setData(self.history_power)
-
-        self._update_card_style()
 
     def _update_card_style(self):
         if self.is_dropout:
@@ -256,6 +253,11 @@ class MSCANView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._pending = {}            # element_idx -> [latest, weakest, threshold] since the last redraw
+        self._timeline_dirty = set()
+        self._flush_timer = QTimer(self)
+        self._flush_timer.timeout.connect(self._flush_pending)
+        self._flush_timer.start(50)
         self.channel_cards: Dict[int, ChannelCard] = {} # element_index -> ChannelCard
         self.channel_list = []
         self.active_channels = []
@@ -384,7 +386,7 @@ class MSCANView(QWidget):
             # Add timeline trace for first 8 channels
             if idx < 8:
                 c_color = ch.get("color", "#38bdf8")
-                pen = pg.mkPen(color=c_color, width=1.8)
+                pen = pg.mkPen(color=c_color, width=1.0)
                 name = ch.get("name", f"Ch {idx}")
                 curve = self.timeline_plot.plot(pen=pen, name=name)
                 self.timeline_curves[idx] = curve
@@ -399,23 +401,31 @@ class MSCANView(QWidget):
             if str(card.channel_id) == c_id:
                 card.set_color(new_color_hex)
                 if idx in self.timeline_curves:
-                    pen = pg.mkPen(color=new_color_hex, width=1.8)
+                    pen = pg.mkPen(color=new_color_hex, width=1.0)
                     self.timeline_curves[idx].setPen(pen)
                 break
 
     def update_channel_data(self, element_idx: int, freq_hz: float, peak_power_dbm: float, spec_data, info: dict, dropout_thresh_dbm: float = -75.0):
-        """Updates live RF power for a single hopped channel."""
-        card = self.channel_cards.get(element_idx)
-        if card:
-            card.update_power(peak_power_dbm, dropout_thresh_dbm)
+        """
+        Records one hop. Hops arrive up to a thousand times a second, so the
+        cards and the timeline are redrawn from the recorded values by
+        _flush_pending at ~20 Hz; nothing a hop reports is lost (the timeline
+        keeps every hop and a card's status reflects the weakest hop since the
+        last redraw).
+        """
+        pend = self._pending.get(element_idx)
+        if pend is None:
+            self._pending[element_idx] = [peak_power_dbm, peak_power_dbm, dropout_thresh_dbm]
+        else:
+            pend[0] = peak_power_dbm
+            pend[1] = min(pend[1], peak_power_dbm)
+            pend[2] = dropout_thresh_dbm
 
-        # Update timeline if tracked
         if element_idx in self.timeline_data:
             buf = self.timeline_data[element_idx]
-            buf = np.roll(buf, -1)
+            buf[:-1] = buf[1:]
             buf[-1] = peak_power_dbm
-            self.timeline_data[element_idx] = buf
-            self.timeline_curves[element_idx].setData(buf)
+            self._timeline_dirty.add(element_idx)
 
         self.hop_count += 1
         now = time.time()
@@ -424,6 +434,20 @@ class MSCANView(QWidget):
             self.hop_rate = self.hop_count / dt
             self.hop_count = 0
             self.last_cycle_time = now
+
+    def _flush_pending(self):
+        if not self._pending and not self._timeline_dirty:
+            return
+        for idx, (latest, worst, thresh) in self._pending.items():
+            card = self.channel_cards.get(idx)
+            if card:
+                card.update_power(latest, thresh, worst)
+        self._pending.clear()
+        for idx in self._timeline_dirty:
+            curve = self.timeline_curves.get(idx)
+            if curve is not None:
+                curve.setData(self.timeline_data[idx])
+        self._timeline_dirty.clear()
 
     def _reflow_grid(self):
         """Lays out cards in a consistent 5-column grid across the viewport."""

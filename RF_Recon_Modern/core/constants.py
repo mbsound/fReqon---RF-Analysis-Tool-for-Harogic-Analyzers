@@ -176,6 +176,46 @@ TV_CHANNEL_STANDARDS = {
                 {"id": "ES_GSMR_DL", "label": "GSM-R", "display_name": "ADIF Ferrocarril GSM-R DL (921-925)", "start": 921.0, "stop": 925.0, "type": "lmr_smr"}
             ]
         }
+    ],
+    "Portugal": [
+        {
+            "start_ch": 21,
+            "end_ch": 48,
+            "start_freq": 470.0,
+            "spacing": 8.0
+        },
+        {
+            "custom_items": [
+                {"id": "700_GB1", "label": "GB", "display_name": "700M Guard (694-703)", "start": 694.0, "stop": 703.0, "type": "guard"},
+                {"id": "700_UL_1", "label": "1", "display_name": "700M Uplink 1 (703-708)", "start": 703.0, "stop": 708.0, "type": "uplink"},
+                {"id": "700_UL_2", "label": "2", "display_name": "700M Uplink 2 (708-713)", "start": 708.0, "stop": 713.0, "type": "uplink"},
+                {"id": "700_UL_3", "label": "3", "display_name": "700M Uplink 3 (713-718)", "start": 713.0, "stop": 718.0, "type": "uplink"},
+                {"id": "700_UL_4", "label": "4", "display_name": "700M Uplink 4 (718-723)", "start": 718.0, "stop": 723.0, "type": "uplink"},
+                {"id": "700_UL_5", "label": "5", "display_name": "700M Uplink 5 (723-728)", "start": 723.0, "stop": 728.0, "type": "uplink"},
+                {"id": "700_UL_6", "label": "6", "display_name": "700M Uplink 6 (728-733)", "start": 728.0, "stop": 733.0, "type": "uplink"},
+                {"id": "700_DL_1", "label": "1", "display_name": "700M Downlink 1 (758-763)", "start": 758.0, "stop": 763.0, "type": "downlink"},
+                {"id": "700_DL_2", "label": "2", "display_name": "700M Downlink 2 (763-768)", "start": 763.0, "stop": 768.0, "type": "downlink"},
+                {"id": "700_DL_3", "label": "3", "display_name": "700M Downlink 3 (768-773)", "start": 768.0, "stop": 773.0, "type": "downlink"},
+                {"id": "700_DL_4", "label": "4", "display_name": "700M Downlink 4 (773-778)", "start": 773.0, "stop": 778.0, "type": "downlink"},
+                {"id": "700_DL_5", "label": "5", "display_name": "700M Downlink 5 (778-783)", "start": 778.0, "stop": 783.0, "type": "downlink"},
+                {"id": "700_DL_6", "label": "6", "display_name": "700M Downlink 6 (783-788)", "start": 783.0, "stop": 788.0, "type": "downlink"},
+                {"id": "700_GB2", "label": "GB", "display_name": "Guard Band (788-791)", "start": 788.0, "stop": 791.0, "type": "guard"},
+                {"id": "800_DL_1", "label": "1", "display_name": "800M Downlink 1 (791-796)", "start": 791.0, "stop": 796.0, "type": "downlink"},
+                {"id": "800_DL_2", "label": "2", "display_name": "800M Downlink 2 (796-801)", "start": 796.0, "stop": 801.0, "type": "downlink"},
+                {"id": "800_DL_3", "label": "3", "display_name": "800M Downlink 3 (801-806)", "start": 801.0, "stop": 806.0, "type": "downlink"},
+                {"id": "800_DL_4", "label": "4", "display_name": "800M Downlink 4 (806-811)", "start": 806.0, "stop": 811.0, "type": "downlink"},
+                {"id": "800_DL_5", "label": "5", "display_name": "800M Downlink 5 (811-816)", "start": 811.0, "stop": 816.0, "type": "downlink"},
+                {"id": "800_DL_6", "label": "6", "display_name": "800M Downlink 6 (816-821)", "start": 816.0, "stop": 821.0, "type": "downlink"},
+                {"id": "800_GB1", "label": "GB", "display_name": "800M Guard (821-823)", "start": 821.0, "stop": 823.0, "type": "guard"},
+                {"id": "800_UL_1", "label": "1", "display_name": "800M Uplink 1 (832-837)", "start": 832.0, "stop": 837.0, "type": "uplink"},
+                {"id": "800_UL_2", "label": "2", "display_name": "800M Uplink 2 (837-842)", "start": 837.0, "stop": 842.0, "type": "uplink"},
+                {"id": "800_UL_3", "label": "3", "display_name": "800M Uplink 3 (842-847)", "start": 842.0, "stop": 847.0, "type": "uplink"},
+                {"id": "800_UL_4", "label": "4", "display_name": "800M Uplink 4 (847-852)", "start": 847.0, "stop": 852.0, "type": "uplink"},
+                {"id": "800_UL_5", "label": "5", "display_name": "800M Uplink 5 (852-857)", "start": 852.0, "stop": 857.0, "type": "uplink"},
+                {"id": "800_UL_6", "label": "6", "display_name": "800M Uplink 6 (857-862)", "start": 857.0, "stop": 862.0, "type": "uplink"},
+                {"id": "800_GB2", "label": "GB", "display_name": "Guard Band (862-863)", "start": 862.0, "stop": 863.0, "type": "guard"}
+            ]
+        }
     ]
 }
 
@@ -198,6 +238,14 @@ DEFAULT_REGIONS = {
         {"name": "DECT", "start": 1880.0, "stop": 1900.0}
     ],
     "Spain": [
+        {"name": "VHF", "start": 174.0, "stop": 216.0},
+        {"name": "UHF", "start": 470.0, "stop": 694.0},
+        {"name": "700MHz Duplex Gap", "start": 694.0, "stop": 703.0},
+        {"name": "800MHz Duplex Gap", "start": 823.0, "stop": 832.0},
+        {"name": "ISM", "start": 863.0, "stop": 865.0},
+        {"name": "DECT", "start": 1880.0, "stop": 1900.0}
+    ],
+    "Portugal": [
         {"name": "VHF", "start": 174.0, "stop": 216.0},
         {"name": "UHF", "start": 470.0, "stop": 694.0},
         {"name": "700MHz Duplex Gap", "start": 694.0, "stop": 703.0},

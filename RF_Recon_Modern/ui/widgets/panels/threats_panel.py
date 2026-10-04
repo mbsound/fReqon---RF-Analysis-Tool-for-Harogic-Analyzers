@@ -5,11 +5,11 @@ Soundbase frequency coordination JSON imports, and active channel markers.
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
-    QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QTreeWidget, QTreeWidgetItem,
-    QFrame, QScrollArea, QTableWidgetItem, QMenu, QColorDialog
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox,
+    QDoubleSpinBox, QTableWidget, QHeaderView, QTreeWidget, QTreeWidgetItem, QFrame,
+    QScrollArea, QTableWidgetItem, QMenu, QColorDialog, QComboBox
 )
-from PyQt6.QtGui import QColor, QBrush, QFont, QAction
+from PyQt6.QtGui import QColor, QBrush
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -38,8 +38,14 @@ class ThreatsPanel(QWidget):
     intruderAlertToggled = pyqtSignal(bool)
     intruderThresholdChanged = pyqtSignal(float)
     showThresholdToggled = pyqtSignal(bool)
+    carrierMaskChanged = pyqtSignal()                 # mask shape or margin around coordinated carriers
     clearIntrudersClicked = pyqtSignal()
     addIntruderToMarkersClicked = pyqtSignal()
+    fingerprintRequested = pyqtSignal()               # one MSCAN fingerprint pass
+    intermodSettingsChanged = pyqtSignal()            # sources/orders/overlay changed
+    intermodCheckRequested = pyqtSignal()             # check coordination for intermod hits
+    intermodVerifyRequested = pyqtSignal()            # attenuation test on the selected carrier
+    backgroundFingerprintToggled = pyqtSignal(bool)   # continuous pass on a second analyzer
     loadCoordinationClicked = pyqtSignal()
     loadSoundbaseClicked = loadCoordinationClicked # Backwards compatible alias
     markerItemChanged = pyqtSignal(object, int)
@@ -101,6 +107,55 @@ class ThreatsPanel(QWidget):
         t_layout.addWidget(self.show_thresh_cb)
         t_layout.addWidget(self.intruder_thresh_spin, 1)
         intr_card.layout().addLayout(t_layout)
+
+        # What a coordinated carrier accounts for: only its channel, or its channel plus
+        # the skirts an ETSI EN 300 422-1 transmit mask allows it (core/emission_mask.py)
+        m_layout = QHBoxLayout()
+        m_layout.setContentsMargins(0, 0, 0, 0)
+        m_layout.setSpacing(6)
+        m_lbl = QLabel("Mask:")
+        m_lbl.setStyleSheet("font-size: 11px;")
+        self.carrier_mask_combo = QComboBox()
+        # (kept narrow: this row must not make the panel wider than it is shown)
+        self.carrier_mask_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.carrier_mask_combo.setMinimumContentsLength(11)
+        self.carrier_mask_combo.addItem("ETSI auto", "auto")
+        self.carrier_mask_combo.addItem("Channel only", "channel")
+        self.carrier_mask_combo.addItem("ETSI digital", "digital")
+        self.carrier_mask_combo.addItem("ETSI analogue", "analogue")
+        self.carrier_mask_combo.setToolTip(
+            "Channel only: whatever is inside a coordinated carrier's channel is that carrier; outside it the threshold applies.\n"
+            "ETSI: the transmit mask of EN 300 422-1 is drawn around each coordinated carrier at the level it is received. "
+            "Its own skirts stay under it; a hotter signal a little off its centre breaks through a skirt and is listed.\n"
+            "ETSI auto picks the mask by device: FM systems (in-ear monitors, UHF-R, EW G3/G4 …) get the analogue mask, WMAS its own, the rest the digital one.")
+        self.carrier_mask_combo.currentIndexChanged.connect(lambda _i: self.carrierMaskChanged.emit())
+        self.carrier_mask_margin_spin = QDoubleSpinBox()
+        self.carrier_mask_margin_spin.setRange(0.0, 30.0)
+        self.carrier_mask_margin_spin.setDecimals(0)
+        self.carrier_mask_margin_spin.setValue(6.0)
+        self.carrier_mask_margin_spin.setPrefix("+")
+        self.carrier_mask_margin_spin.setSuffix(" dB")
+        margin_tip = (
+            "Mask margin: how far above each carrier's received level its ETSI mask is drawn.\n\n"
+            "The mask hangs on the carrier's own level, so with no margin the carrier would touch its own mask "
+            "whenever it fades up or its modulation peaks. The margin is the headroom that keeps those from being listed.\n\n"
+            "Lower (about +3 dB): tighter around the carrier, catches weaker signals beside it, more false alarms.\n"
+            "Higher (about +10 dB): tolerates more level movement, misses weaker signals near the carrier.\n\n"
+            "Used by the ETSI masks only; it has no effect with Mask set to Channel only.")
+        self.carrier_mask_margin_spin.setToolTip(margin_tip)
+        self.carrier_mask_margin_lbl = QLabel("Margin:")
+        self.carrier_mask_margin_lbl.setStyleSheet("font-size: 11px;")
+        self.carrier_mask_margin_lbl.setToolTip(margin_tip)
+        self.carrier_mask_margin_spin.valueChanged.connect(lambda _v: self.carrierMaskChanged.emit())
+        self.carrier_mask_margin_spin.setFixedWidth(100)
+        m_layout.addWidget(m_lbl)
+        m_layout.addWidget(self.carrier_mask_combo, 1)
+        m_layout.addWidget(self.carrier_mask_margin_lbl)
+        m_layout.addWidget(self.carrier_mask_margin_spin)
+        # The margin belongs to the ETSI masks: greyed out with "Channel only"
+        self.carrier_mask_combo.currentIndexChanged.connect(self._sync_mask_margin_enabled)
+        self._sync_mask_margin_enabled()
+        intr_card.layout().addLayout(m_layout)
         
         self.intruder_table = QTableWidget(0, 3)
         self.intruder_table.setHorizontalHeaderLabels(["Freq (MHz)", "Power", "Signature"])
@@ -157,44 +212,59 @@ class ThreatsPanel(QWidget):
         btn_layout.addWidget(self.clear_intr_btn)
         btn_layout.addWidget(self.add_marker_btn)
         intr_card.layout().addLayout(btn_layout)
+
+        # Carrier fingerprinting: identify systems from their spectra. The main
+        # sweep gives a first guess; an MSCAN pass (~1 kHz resolution) firms it up.
+        fp_layout = QHBoxLayout()
+        self.fingerprint_btn = QPushButton("Fingerprint Carriers")
+        self.fingerprint_btn.setToolTip(
+            "Dwell on each detected carrier with MSCAN (~1 kHz resolution) for a few seconds "
+            "to identify it. The sweep pauses briefly; waterfall history is kept.")
+        self.fingerprint_btn.clicked.connect(self.fingerprintRequested.emit)
+        self.bg_fingerprint_cb = QCheckBox("Use Analyzer B")
+        self.bg_fingerprint_cb.setToolTip(
+            "With two analyzers connected, Analyzer B fingerprints carriers continuously "
+            "while Analyzer A keeps sweeping (Analyzer B stops its own sweep).")
+        self.bg_fingerprint_cb.toggled.connect(self.backgroundFingerprintToggled.emit)
+        fp_layout.addWidget(self.fingerprint_btn)
+        fp_layout.addWidget(self.bg_fingerprint_cb)
+        intr_card.layout().addLayout(fp_layout)
+        self.fingerprint_status_lbl = QLabel("Identification from the sweep; MSCAN fingerprinting gives more detail.")
+        self.fingerprint_status_lbl.setWordWrap(True)
+        self.fingerprint_status_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+        intr_card.layout().addWidget(self.fingerprint_status_lbl)
         
-        # --- 2. SOUNDBASE / WWB IMPORTS CARD ---
-        json_card = self._create_card("FREQUENCY COORDINATION IMPORT", layout)
-        
-        self.btn_soundbase_json = QPushButton("SB / WWB Import")
-        self.btn_soundbase_json.setToolTip("Import Soundbase (.sbcoordsite, .json) or Wireless Workbench (.csv)")
-        self.btn_soundbase_json.setStyleSheet("""
-            QPushButton {
-                background-color: #21262d;
-                color: #f0f6fc;
-                font-weight: 600;
-                padding: 6px;
-                border: 1px solid #30363d;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #30363d;
-                border-color: #8b949e;
-                color: #ffffff;
-            }
-        """)
-        self.btn_soundbase_json.clicked.connect(self.loadCoordinationClicked.emit)
-        json_card.layout().addWidget(self.btn_soundbase_json)
-        
-        self.soundbase_status_lbl = QLabel("No coordination file active")
-        self.soundbase_status_lbl.setStyleSheet("color: #6e7681; font-size: 10px; margin-top: 2px;")
-        json_card.layout().addWidget(self.soundbase_status_lbl)
-        
-        # --- 3. MARKERS & CHANNELS CARD ---
+        # --- 2. MARKERS & CHANNELS CARD (the coordination import sits in its header) ---
         markers_card = self._create_card("MARKERS & CHANNEL MASKS", layout)
-        
+        title_lbl = markers_card.layout().itemAt(0).widget()
+        markers_card.layout().removeWidget(title_lbl)
+        markers_hdr = QHBoxLayout()
+        markers_hdr.setContentsMargins(0, 0, 0, 0)
+        markers_hdr.addWidget(title_lbl)
+        markers_hdr.addStretch()
+        self.btn_soundbase_json = QPushButton("SB / WWB Import")
+        self.btn_soundbase_json.setObjectName("pillBtn")
+        self.btn_soundbase_json.setFixedHeight(22)
+        self.btn_soundbase_json.setToolTip("Import Soundbase (.sbcoordsite, .json) or Wireless Workbench (.csv) coordination")
+        self.btn_soundbase_json.clicked.connect(self.loadCoordinationClicked.emit)
+        markers_hdr.addWidget(self.btn_soundbase_json)
+        markers_card.layout().insertLayout(0, markers_hdr)
+
+        self.soundbase_status_lbl = QLabel("No coordination file active")
+        self.soundbase_status_lbl.setWordWrap(True)
+        self.soundbase_status_lbl.setStyleSheet("color: #6e7681; font-size: 10px;")
+        markers_card.layout().addWidget(self.soundbase_status_lbl)
+
         self.markers_tree = QTreeWidget()
         self.markers_tree.setColumnCount(2)
         self.markers_tree.setHeaderLabels(["Item / Channel", "Freq (MHz)"])
         self.markers_tree.setHeaderHidden(False)
-        self.markers_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.markers_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.markers_tree.setColumnWidth(1, 80)
+        # Both columns can be dragged (a stretched column cannot); the last one takes the rest
+        self.markers_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.markers_tree.header().setStretchLastSection(True)
+        self.markers_tree.header().setMinimumSectionSize(40)
+        self.markers_tree.setColumnWidth(0, 190)
+        self.markers_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.markers_tree.setIndentation(14)
         self.markers_tree.setMinimumHeight(240)
         self.markers_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -231,6 +301,83 @@ class ThreatsPanel(QWidget):
         self.markers_tree.itemClicked.connect(self._on_tree_item_clicked)
         markers_card.layout().addWidget(self.markers_tree)
         
+        # --- 2b. INTERMODULATION CARD ---
+        im_card = self._create_card("INTERMODULATION", layout)
+        im_form = QHBoxLayout()
+        self.im_source_combo = QComboBox()
+        self.im_source_combo.addItem("On-air coordinated carriers", "on_air")
+        self.im_source_combo.addItem("All coordinated carriers", "all")
+        self.im_source_combo.setToolTip(
+            "Which transmitters create products. 'On air' uses coordinated carriers currently "
+            "seen in the sweep; 'All' assumes every coordinated (non-spare) carrier is on.")
+        self.im_source_combo.currentIndexChanged.connect(self.intermodSettingsChanged.emit)
+        im_form.addWidget(self.im_source_combo)
+        im_card.layout().addLayout(im_form)
+        im_opts = QHBoxLayout()
+        self.im3_cb = QCheckBox("IM3"); self.im3_cb.setChecked(True)
+        self.im5_cb = QCheckBox("IM5"); self.im5_cb.setChecked(True)
+        self.im3t_cb = QCheckBox("3-tone"); self.im3t_cb.setChecked(True)
+        self.im_detected_cb = QCheckBox("+ detected")
+        self.im_detected_cb.setToolTip(
+            "Also mix in carriers detected by threat detection (front-end intermod in your "
+            "receivers: everything reaching the antenna mixes, regardless of zone).")
+        # The orders in the colours they are drawn in on the spectrum
+        for cb, color in ((self.im3_cb, "#f97316"), (self.im5_cb, "#22d3ee"), (self.im3t_cb, "#e879f9")):
+            cb.setStyleSheet(f"QCheckBox {{ color: {color}; font-weight: 600; }}")
+        for cb in (self.im3_cb, self.im5_cb, self.im3t_cb, self.im_detected_cb):
+            cb.toggled.connect(self.intermodSettingsChanged.emit)
+            im_opts.addWidget(cb)
+        im_card.layout().addLayout(im_opts)
+        im_lvl = QHBoxLayout()
+        im_lvl_lbl = QLabel("IM3 below carriers:")
+        im_lvl_lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
+        self.im_dbc_spin = QDoubleSpinBox()
+        self.im_dbc_spin.setRange(0.0, 80.0)
+        self.im_dbc_spin.setDecimals(0)
+        self.im_dbc_spin.setValue(30.0)
+        self.im_dbc_spin.setSuffix(" dB")
+        self.im_dbc_spin.setToolTip(
+            "How far below the carriers a 2-tone 3rd-order product is drawn: 20-25 dB for packs "
+            "touching, 35-40 dB a metre apart. IM5 is taken 15 dB lower, 3-tone 6 dB higher. "
+            "Carrier levels come from the sweep; a coordinated carrier that is not on air is "
+            "assumed to be as strong as the on-air ones.")
+        self.im_dbc_spin.valueChanged.connect(self.intermodSettingsChanged.emit)
+        im_lvl.addWidget(im_lvl_lbl)
+        im_lvl.addWidget(self.im_dbc_spin)
+        im_lvl.addStretch()
+        im_card.layout().addLayout(im_lvl)
+        self.im_overlay_cb = QCheckBox("Show products on spectrum")
+        self.im_overlay_cb.toggled.connect(self.intermodSettingsChanged.emit)
+        im_card.layout().addWidget(self.im_overlay_cb)
+        im_btns = QHBoxLayout()
+        self.im_check_btn = QPushButton("Check Coordination")
+        self.im_check_btn.setToolTip("List coordinated and spare frequencies that intermod products land on")
+        self.im_check_btn.clicked.connect(self.intermodCheckRequested.emit)
+        self.im_verify_btn = QPushButton("Verify Selected")
+        self.im_verify_btn.setToolTip(
+            "Attenuation test on the selected threat: adds 10 dB of input attenuation for a moment. "
+            "A real signal drops 10 dB; intermod made inside the analyzer drops ~30 dB.")
+        self.im_verify_btn.clicked.connect(self.intermodVerifyRequested.emit)
+        im_btns.addWidget(self.im_check_btn)
+        im_btns.addWidget(self.im_verify_btn)
+        im_card.layout().addLayout(im_btns)
+        self.im_table = QTableWidget(0, 3)
+        self.im_table.setHorizontalHeaderLabels(["Carrier", "MHz", "Products on it"])
+        # Columns can be dragged; the last one takes the rest
+        self.im_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.im_table.horizontalHeader().setStretchLastSection(True)
+        self.im_table.setColumnWidth(0, 96)
+        self.im_table.setColumnWidth(1, 64)
+        self.im_table.setToolTip("Coordinated and spare carriers that intermod products land on")
+        self.im_table.verticalHeader().setVisible(False)
+        self.im_table.setMinimumHeight(120)
+        self.im_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        im_card.layout().addWidget(self.im_table)
+        self.im_status_lbl = QLabel("Import a Soundbase or Wireless Workbench coordination to analyse intermod.")
+        self.im_status_lbl.setWordWrap(True)
+        self.im_status_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+        im_card.layout().addWidget(self.im_status_lbl)
+
         layout.addStretch()
 
     def _create_card(self, title: str, parent_layout: QVBoxLayout) -> QFrame:
@@ -247,18 +394,35 @@ class ThreatsPanel(QWidget):
         parent_layout.addWidget(card)
         return card
 
+    def intermod_settings(self) -> dict:
+        orders = tuple(o for o, cb in ((3, self.im3_cb), (5, self.im5_cb), (33, self.im3t_cb)) if cb.isChecked())
+        return {"source": self.im_source_combo.currentData(), "orders": orders,
+                "include_detected": self.im_detected_cb.isChecked(),
+                "overlay": self.im_overlay_cb.isChecked(), "im3_dbc": self.im_dbc_spin.value()}
+
+    def show_intermod_results(self, rows: list):
+        """rows: [(carrier name, freq MHz, text, is_spare, n_hits)]"""
+        self.im_table.setRowCount(len(rows))
+        for r, (name, f_mhz, text, is_spare, n) in enumerate(rows):
+            items = [QTableWidgetItem(name + (" (spare)" if is_spare else "")),
+                     QTableWidgetItem(f"{f_mhz:.3f}"), QTableWidgetItem(text)]
+            color = QColor("#f85149") if n and not is_spare else QColor("#d29922") if n else QColor("#3fb950")
+            items[2].setForeground(color)
+            items[2].setToolTip(text)
+            for c, it in enumerate(items):
+                self.im_table.setItem(r, c, it)
+
+    def _sync_mask_margin_enabled(self, *_):
+        etsi = self.carrier_mask_combo.currentData() != "channel"
+        self.carrier_mask_margin_spin.setEnabled(etsi)
+        self.carrier_mask_margin_lbl.setEnabled(etsi)
+
     def set_soundbase_active(self, filename: str, count: int):
-        self.btn_soundbase_json.setText("Coordination Loaded")
-        self.btn_soundbase_json.setStyleSheet("""
-            QPushButton {
-                background-color: #238636;
-                color: #ffffff;
-                font-weight: 600;
-                padding: 6px;
-                border: 1px solid #2ea043;
-                border-radius: 4px;
-            }
-        """)
+        # The import button stays an import button (another file can be loaded over this one);
+        # a green outline says a coordination is in use
+        self.btn_soundbase_json.setStyleSheet("QPushButton { border: 1px solid #2ea043; color: #3fb950; }")
+        self.btn_soundbase_json.setToolTip("A coordination is loaded. Click to import another "
+                                           "(Soundbase .sbcoordsite / .json, or Wireless Workbench .csv)")
         self.soundbase_status_lbl.setText(f"{filename} ({count} channels active)")
         self.soundbase_status_lbl.setStyleSheet("color: #10b981; font-size: 10px;")
 

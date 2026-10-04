@@ -6,7 +6,7 @@ and CRMX / Wireless DMX frequency-hopping density.
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QFrame, QScrollArea
+    QCheckBox, QDoubleSpinBox, QTableWidget, QHeaderView, QFrame, QScrollArea, QComboBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -20,6 +20,9 @@ class ShowLinkPanel(QWidget):
     tuneSweepClicked = pyqtSignal()
     openMapClicked = pyqtSignal()
     clearClicked = pyqtSignal()
+    myChannelChanged = pyqtSignal(int)          # the ShowLink channel in use
+    airtimeClicked = pyqtSignal()               # measure the channel's airtime in zero span
+    copySurveyClicked = pyqtSignal()            # put the survey summary on the clipboard
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,11 +85,57 @@ class ShowLinkPanel(QWidget):
         self.tune_btn.setObjectName("primaryActionBtn")
         self.tune_btn.clicked.connect(self.tuneSweepClicked.emit)
         cfg_card.layout().addWidget(self.tune_btn)
+
+        # --- 1b. FEASIBILITY: can ShowLink run here, and what would the venue have to switch off ---
+        feas_card = self._create_card("SHOWLINK FEASIBILITY", layout)
+        self.feas_lbl = QLabel("Enable the monitor and tune to the band. Survey with the venue's Wi-Fi in use.")
+        self.feas_lbl.setWordWrap(True)
+        self.feas_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.feas_lbl.setStyleSheet("font-size: 11px; color: #c9d1d9;")
+        feas_card.layout().addWidget(self.feas_lbl)
+        self.copy_survey_btn = QPushButton("Copy Survey Summary")
+        self.copy_survey_btn.setToolTip("Put a plain-text summary (verdict, clear channels, Wi-Fi in use, what to switch off) on the clipboard")
+        self.copy_survey_btn.clicked.connect(self.copySurveyClicked.emit)
+        feas_card.layout().addWidget(self.copy_survey_btn)
+
+        # --- 1c. THE CHANNEL SHOWLINK IS ON ---
+        my_card = self._create_card("SHOWLINK CHANNEL", layout)
+        my_row = QHBoxLayout()
+        my_lbl = QLabel("Judge:")
+        my_lbl.setStyleSheet("font-size: 11px; color: #8b949e; font-weight: 500;")
+        # The AD610 picks its channel itself (and moves it when interfered with, unless
+        # channel agility is turned off in Wireless Workbench), so the channel is read off
+        # the air; a fixed choice is for checking a channel it might move to
+        self.my_channel_combo = QComboBox()
+        self.my_channel_combo.addItem("the channel ShowLink is seen on", 0)
+        for ch in range(11, 27):
+            self.my_channel_combo.addItem(f"Ch {ch}  ({2405 + 5 * (ch - 11)} MHz)", ch)
+        self.my_channel_combo.setToolTip("The AD610 chooses its channel itself and moves when interfered with "
+                                         "(channel agility; it cannot be set by hand). Judge the channel ShowLink is "
+                                         "seen on, or pick one to see how it would fare there.")
+        self.my_channel_combo.currentIndexChanged.connect(lambda _i: self.myChannelChanged.emit(self.my_channel_combo.currentData()))
+        my_row.addWidget(my_lbl)
+        my_row.addWidget(self.my_channel_combo, 1)
+        my_card.layout().addLayout(my_row)
+        self.verdict_lbl = QLabel("Enable the monitor and tune to the band.")
+        self.verdict_lbl.setWordWrap(True)
+        self.verdict_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.verdict_lbl.setStyleSheet("font-size: 11px; color: #c9d1d9;")
+        my_card.layout().addWidget(self.verdict_lbl)
+        self.airtime_btn = QPushButton("Measure Airtime (Zero-Span)")
+        self.airtime_btn.setToolTip("Capture the judged channel in zero span for a moment and measure the share of time "
+                                    "anything is transmitting on it, and how long the bursts are. The sweep resumes afterwards.")
+        self.airtime_btn.clicked.connect(self.airtimeClicked.emit)
+        my_card.layout().addWidget(self.airtime_btn)
+        self.airtime_lbl = QLabel("")
+        self.airtime_lbl.setWordWrap(True)
+        self.airtime_lbl.setStyleSheet("font-size: 10px; color: #8b949e;")
+        my_card.layout().addWidget(self.airtime_lbl)
         
         # --- 2. SHOWLINK CHANNELS TABLE CARD ---
         table_card = self._create_card("SHOWLINK CHANNELS (11 - 26)", layout)
         
-        self.showlink_table = QTableWidget(0, 4)
+        self.showlink_table = QTableWidget(0, 5)
         self.showlink_table.setStyleSheet("""
             QTableWidget {
                 background-color: #0d1117;
@@ -110,14 +159,15 @@ class ShowLinkPanel(QWidget):
                 font-weight: 700;
             }
         """)
-        self.showlink_table.setHorizontalHeaderLabels(["CH", "FREQ", "RSSI", "STATE"])
-        self.showlink_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.showlink_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.showlink_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.showlink_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.showlink_table.setHorizontalHeaderLabels(["CH", "FREQ", "BUSY", "RSSI", "STATE"])
+        hdr = self.showlink_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setStretchLastSection(True)
+        hdr.setMinimumSectionSize(28)
         self.showlink_table.setColumnWidth(0, 28)
         self.showlink_table.setColumnWidth(1, 42)
-        self.showlink_table.setColumnWidth(2, 68)
+        self.showlink_table.setColumnWidth(2, 44)
+        self.showlink_table.setColumnWidth(3, 60)
         self.showlink_table.verticalHeader().setVisible(False)
         self.showlink_table.setMinimumHeight(190)
         self.showlink_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -138,6 +188,29 @@ class ShowLinkPanel(QWidget):
         action_layout.addWidget(self.map_btn, 1)
         action_layout.addWidget(self.clear_btn, 0)
         table_card.layout().addLayout(action_layout)
+
+        # --- 3. WHAT IS ON THE BAND ---
+        band_card = self._create_card("WHAT IS ON THE BAND", layout)
+        self.mix_lbl = QLabel("")
+        self.mix_lbl.setWordWrap(True)
+        self.mix_lbl.setStyleSheet("font-size: 10px; color: #8b949e;")
+        band_card.layout().addWidget(self.mix_lbl)
+        self.wifi_table = QTableWidget(0, 4)
+        self.wifi_table.setStyleSheet(self.showlink_table.styleSheet())
+        self.wifi_table.horizontalHeader().setStyleSheet(self.showlink_table.horizontalHeader().styleSheet())
+        self.wifi_table.setHorizontalHeaderLabels(["WI-FI", "MHz", "BUSY", "PEAK"])
+        whdr = self.wifi_table.horizontalHeader()
+        whdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        whdr.setStretchLastSection(True)
+        whdr.setMinimumSectionSize(28)
+        self.wifi_table.setColumnWidth(0, 44)
+        self.wifi_table.setColumnWidth(1, 44)
+        self.wifi_table.setColumnWidth(2, 44)
+        self.wifi_table.verticalHeader().setVisible(False)
+        self.wifi_table.setMinimumHeight(150)
+        self.wifi_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.wifi_table.setToolTip("All 13 Wi-Fi channels. Busy: share of recent sweeps with a 20 MHz-wide signal centred on the channel.")
+        band_card.layout().addWidget(self.wifi_table)
         
         layout.addStretch()
 

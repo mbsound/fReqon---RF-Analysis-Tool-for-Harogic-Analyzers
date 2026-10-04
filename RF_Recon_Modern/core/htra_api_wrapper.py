@@ -7,22 +7,158 @@ import platform
 
 system_name = platform.system()
 arch_name = platform.machine()
+
+
+def _linux_arch():
+    a = arch_name.lower()
+    return "aarch64" if ("aarch64" in a or "arm64" in a) else "x86_64" if ("x86_64" in a or "amd64" in a) else "armv7" if "arm" in a else None
+
+
+_VERSION_RE = r"libhtraapi[-.](?:so\.)?(\d+)\.(\d+)\.(\d+)"
+
+
+def available_libraries():
+    """
+    Every SDK build shipped with the app or installed system-wide, newest first:
+    macOS lib/macos/libhtraapi-<ver>.dylib; Linux lib/linux/<arch>/libhtraapi*.so.<ver>
+    and /opt/htraapi/lib/<arch>/libhtraapi.so.<ver> (Harogic's own install layout).
+    """
+    import glob, re
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if system_name == "Darwin":
+        paths = glob.glob(os.path.join(app_dir, "lib", "macos", "libhtraapi-*.dylib"))
+    elif system_name == "Linux" and _linux_arch():
+        paths = (glob.glob(os.path.join(app_dir, "lib", "linux", _linux_arch(), "libhtraapi*.so.*"))
+                 + glob.glob(os.path.join("/opt/htraapi/lib", _linux_arch(), "libhtraapi.so.*")))
+        paths = [p for p in paths if re.search(_VERSION_RE, p)]
+    else:
+        paths = []
+    def ver(pth):
+        m = re.search(_VERSION_RE, pth)
+        return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+    return sorted(paths, key=ver, reverse=True)
+
+
+def library_version(path) -> str:
+    import re
+    m = re.search(_VERSION_RE, path or "")
+    return ".".join(m.groups()) if m else "default"
+
+
+class _MissingFunction:
+    """Stands in for an SDK function when the library could not be loaded: the ctypes
+    bindings below can still be declared, and calling it says what is wrong."""
+    def __init__(self, name, error):
+        self.name, self.error = name, error
+        self.argtypes, self.restype = None, None
+
+    def __call__(self, *args, **kwargs):
+        raise OSError(f"The Harogic SDK is not available ({self.error}); cannot call {self.name}.")
+
+
+class _MissingSDK:
+    """The `dll` when no Harogic library is installed: the app still runs (a tinySA needs no
+    SDK) and a Harogic connection reports the problem instead of crashing at import."""
+    _missing = True
+    _htra_path = ""
+
+    def __init__(self, error):
+        self.error = str(error)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _MissingFunction(name, self.error)
+
+
+def switch_library(path):
+    """
+    Load another SDK build and carry every ctypes binding (argtypes/restype)
+    over to it. Analyzer firmware and SDK builds must match (Device_Open
+    returns -49 otherwise), and two analyzers may run different firmware, so
+    each hardware process picks the build its analyzer accepts.
+    Returns the new library; callers must rebind their `dll` name.
+    """
+    global dll
+    new = ctypes.CDLL(path)
+    for name, fn in list(dll.__dict__.items()):
+        if isinstance(fn, ctypes._CFuncPtr):
+            try:
+                nf = getattr(new, name)
+            except AttributeError:
+                continue
+            nf.argtypes = fn.argtypes
+            nf.restype = fn.restype
+    new._htra_path = path
+    dll = new
+    return new
+
+
+def _load_macos_library():
+    """Load the native Apple Silicon build of the Harogic SDK (htraapi-macos).
+
+    Search order: $HTRAAPI_LIB, lib/macos/ in the application folder (bundled),
+    then the system-wide install location /opt/htraapi/lib/macos/.
+    """
+    if arch_name != "arm64":
+        raise OSError("The macOS Harogic SDK requires an Apple Silicon (arm64) Python; "
+                      f"this interpreter is {arch_name}.")
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.environ.get("HTRAAPI_LIB"),
+        os.path.join(app_dir, "lib", "macos", "libhtraapi.dylib"),
+        "/opt/htraapi/lib/macos/libhtraapi.dylib",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            lib = ctypes.CDLL(path)
+            # Remember which build this is (the default is a copy of one of the versioned files)
+            import filecmp
+            lib._htra_path = path
+            for alt in available_libraries():
+                if filecmp.cmp(path, alt, shallow=False):
+                    lib._htra_path = alt
+                    break
+            return lib
+    raise OSError("libhtraapi.dylib not found. Build htraapi-macos (make dist) and copy "
+                  "dist/htraapi-macos-arm64/lib/ to RF_Recon_Modern/lib/macos/, "
+                  "or set HTRAAPI_LIB to the dylib's path.")
+
+
 try:
+    if os.environ.get("HTRAAPI_LIB") == "none":
+        raise OSError("HTRAAPI_LIB=none: running without the Harogic SDK on purpose")
     if system_name == "Windows":
         dll = ctypes.CDLL("htraapi.dll")
+    elif system_name == "Darwin":
+        dll = _load_macos_library()
     else:
-        if "aarch64" in arch_name.lower() or "arm64" in arch_name.lower():
-            dll = ctypes.CDLL("/opt/htraapi/lib/aarch64/libhtraapi.so")
-        elif "x86_64" in arch_name.lower() or "amd64" in arch_name.lower():
-            dll = ctypes.CDLL("/opt/htraapi/lib/x86_64/libhtraapi.so")
-        elif "arm" in arch_name.lower():
-            dll = ctypes.CDLL("/opt/htraapi/lib/armv7/libhtraapi.so")
+        # Linux: $HTRAAPI_LIB (a hardware process started with a particular build), the
+        # build shipped in lib/linux/<arch>/, then Harogic's install in /opt/htraapi
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [os.environ.get("HTRAAPI_LIB")]
+        if _linux_arch():
+            candidates += (available_libraries()[:1]
+                           + [os.path.join(app_dir, "lib", "linux", _linux_arch(), "libhtraapi.so"),
+                              os.path.join("/opt/htraapi/lib", _linux_arch(), "libhtraapi.so")])
+        candidates.append("libhtraapi.so")
+        last = None
+        for path in candidates:
+            if not path:
+                continue
+            try:
+                dll = ctypes.CDLL(path)
+                dll._htra_path = path if os.path.sep in path else ""
+                break
+            except OSError as e:
+                last = e
         else:
-            dll = ctypes.CDLL("libhtraapi.so")
+            raise OSError(f"libhtraapi.so not found ({last}). Install Harogic's Linux_API "
+                          f"(install_htraapi_lib.sh puts it in /opt/htraapi) or set HTRAAPI_LIB.")
 except OSError as e:
-    print(f"Error loading Harogic API library: {e}")
-    print("Ensure the library is installed and in your system PATH or LD_LIBRARY_PATH.")
-    raise
+    # No SDK: the app still starts (a tinySA needs none); a Harogic connection reports it
+    print(f"Harogic SDK not loaded: {e}")
+    dll = _MissingSDK(e)
 
 
 #Type declaration
@@ -56,9 +192,10 @@ class SWP_FreqAssignment_TypeDef(c_int):
 class Window_TypeDef(c_int):
     FlatTop = 0x00                  #Flat-top window
     Blackman_Nuttall = 0x01         #Nuttall window
-    Blackman = 0x02                 #Blackman window
-    Hamming = 0x03                  #Hamming window
-    Hanning = 0x04                  #Hanning window
+    LowSideLobe = 0x02              #Low-sidelobe window
+    Rect = 0x03                     #Rectangular window
+    Kaiser = 0x04                   #Kaiser window
+    Gaussian_CISPR = 0x0A           #Gaussian (CISPR), EMC mode only
 
 #RBW Update method(SWP)
 class RBWMode_TypeDef(c_int):
@@ -333,7 +470,9 @@ class DeviceInfo_TypeDef(Structure):
                 ("Model",c_uint16),             #Device type
                 ("HardwareVersion",c_uint16),   #Hardware version
                 ("MFWVersion",c_uint32),        #MCU Firmware version
-                ("FFWVersion",c_uint32),]       #FPGA Firmware version
+                ("FFWVersion",c_uint32),        #FPGA Firmware version
+                ("PMUVersion",c_uint16),        #PMU Firmware version
+                ("AGUVersion",c_uint16)]        #AGU Firmware version
 
 #Network Device information (Return)
 class NetworkDeviceInfo_TypeDef(Structure):
@@ -373,7 +512,7 @@ class DeviceState_TypeDef(Structure):
                 ("IFOverflow",c_uint16),            #If the equipment is overloaded, consider and BBState or RFState.
                 ("DecimateFactor",c_uint16),        #The extraction multiple used by the current packet frequency point.
                 ("OptionState",c_uint16),           #Optional status.
-                ("LicenseCode",c_int16)]            #License code
+                ("nsSinceEpoch",c_uint64)]          #System timestamp of the current packet, in nanoseconds since the epoch
 
 #SWP configuration structure (basic configuration)
 class SWP_Profile_TypeDef(Structure):
@@ -573,6 +712,7 @@ class DET_Profile_TypeDef(Structure):
                 ("SystemClockSource",SystemClockSource_TypeDef),            #System clock source.
                 ("ExternalSystemClockFrequency",c_double),                  #External system clock frequency: Hz.
                 ("Atten",c_int8),                                           #attenuation.
+                ("EnableIFAGC",c_uint8),                                    #IF AGC control: 0 = disabled (MGC), 1 = enabled
                 ("DCCancelerMode",DCCancelerMode_TypeDef),                  #Suitable for specific equipment. Dc suppression. 0: disables the DCC. 1: Open, high-pass filter mode (better suppression effect, but will damage the signal in the range of DC to 100 KHZ); 2: Open, manual bias mode (need manual calibration, but not low frequency damage signal).
                 ("QDCMode",QDCMode_TypeDef),                                #Suitable for specific equipment. IQ amplitude and phase corrector. QDCOff: disables the QDC function. QDCManualMode: Enable and use manual mode; QDCAutoMode: Enables and uses the automatic QDC mode.
                 ("QDCIGain",c_float),                                       #Suitable for specific equipment. Normalized linear gain I, 1.0 indicates no gain, set range 0.8 to 1.2.
@@ -636,6 +776,7 @@ class RTA_Profile_TypeDef(Structure):
                 ("SystemClockSource",SystemClockSource_TypeDef),            #System clock source.
                 ("ExternalSystemClockFrequency",c_double),                  #External system clock frequency: Hz.
                 ("Atten",c_int8),                                           #attenuation
+                ("EnableIFAGC",c_uint8),                                    #IF AGC control: 0 = disabled (MGC), 1 = enabled
                 ("DCCancelerMode",DCCancelerMode_TypeDef),                  #Suitable for specific equipment. Dc suppression. 0: disables the DCC. 1: Open, high-pass filter mode (better suppression effect, but will damage the signal in the range of DC to 100 KHZ); 2: Open, manual bias mode (need manual calibration, but not low frequency damage signal).
                 ("QDCMode",QDCMode_TypeDef),                                #Suitable for specific equipment. IQ amplitude and phase corrector. QDCOff: disables the QDC function. QDCManualMode: Enable and use manual mode; QDCAutoMode: Enables and uses the automatic QDC mode.
                 ("QDCIGain",c_float),                                       #Suitable for specific equipment. Normalized linear gain I, 1.0 indicates no gain, set range 0.8 to 1.2.
@@ -981,13 +1122,21 @@ if hasattr(dll, 'Device_GetDecimateFactorList'):
     dll.Device_GetDecimateFactorList.argtypes = [POINTER(c_void_p), POINTER(c_uint32), c_uint32, POINTER(c_uint32)]
     dll.Device_GetDecimateFactorList.restype = c_int
 
+#Supply voltage and current on the power port and the USB port (Device_QueryPowerSupplyState)
+class PowerSupplyState_TypeDef(Structure):
+    _fields_ = [("rf_vlotage", c_float),    #Power port voltage (V) (SDK spelling)
+                ("rf_current", c_float),    #Power port current (A)
+                ("usb_vlotage", c_float),   #USB port voltage (V)
+                ("usb_current", c_float)]   #USB port current (A)
+
+if hasattr(dll, 'Device_QueryPowerSupplyState'):
+    dll.Device_QueryPowerSupplyState.argtypes = [POINTER(c_void_p), POINTER(PowerSupplyState_TypeDef)]
+    dll.Device_QueryPowerSupplyState.restype = c_int
+
 if hasattr(dll, 'Device_QueryDeviceState_Realtime'):
     dll.Device_QueryDeviceState_Realtime.argtypes = [POINTER(c_void_p), POINTER(DeviceState_TypeDef)]
     dll.Device_QueryDeviceState_Realtime.restype = c_int
 
-if hasattr(dll, 'Device_GetTemperature'):
-    dll.Device_GetTemperature.argtypes = [POINTER(c_void_p), POINTER(c_int32)]
-    dll.Device_GetTemperature.restype = c_int
 
 if hasattr(dll, 'Device_GPIOBandSwitch'):
     dll.Device_GPIOBandSwitch.argtypes = [

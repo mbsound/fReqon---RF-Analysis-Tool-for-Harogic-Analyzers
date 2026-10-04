@@ -7,9 +7,11 @@ persistence decay time, and real-time instantaneous/max/min hold curve overlays.
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF
-from PyQt6.QtGui import QColor, QFont, QFontMetrics
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import QFont, QFontMetrics
 from .channel_marker_bar import MHzAxisItem, ChannelMarkerBar
+from .plot_grid import install_grid
+from .channel_style import channel_kind, mask_brush_pen, channel_label_html
 
 class PowerAxisItem(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
@@ -117,7 +119,7 @@ class RTSAView(QWidget):
         self.y_axis = PowerAxisItem(orientation='left')
         
         self.plot_item = self.glw.addPlot(axisItems={'bottom': self.x_axis, 'left': self.y_axis})
-        self.plot_item.showGrid(x=True, y=True, alpha=0.15)
+        self.plot_grid = install_grid(self.plot_item, x=True, y=True, alpha=0.15)
         self.plot_item.setMenuEnabled(False)
         self.plot_item.setMouseEnabled(x=True, y=False)
         # Fixed Axis Widths for Pixel-Perfect Multi-Plot Alignment
@@ -160,8 +162,8 @@ class RTSAView(QWidget):
         self.img_item.setLookupTable(self.current_lut)
         
         # 2. Trace Overlays
-        self.rt_curve = self.plot_item.plot(pen=pg.mkPen(color='#facc15', width=1.5), name="Real-Time")
-        self.max_curve = self.plot_item.plot(pen=pg.mkPen(color='#38bdf8', width=1.2), name="Max Hold")
+        self.rt_curve = self.plot_item.plot(pen=pg.mkPen(color='#facc15', width=1.0), name="Real-Time")
+        self.max_curve = self.plot_item.plot(pen=pg.mkPen(color='#38bdf8', width=1.0), name="Max Hold")
         self.min_curve = self.plot_item.plot(pen=pg.mkPen(color='#e879f9', width=1.0), name="Min Hold")
         self.max_curve.hide()
         self.min_curve.hide()
@@ -240,9 +242,7 @@ class RTSAView(QWidget):
         disp_matrix = np.transpose(np.clip(self.accumulated_density * 255.0, 0, 255).astype(np.uint8))
         
         x_min = start_f / 1e6
-        x_scale = (stop_f - start_f) / (1e6 * max(1, w))
         y_min = self.bottom_level
-        y_scale = (ref_lvl - self.bottom_level) / max(1, h)
         
         self.img_item.setImage(disp_matrix, levels=[0, 255], autoLevels=False)
         self.img_item.setRect(pg.QtCore.QRectF(x_min, y_min, (stop_f - start_f)/1e6, ref_lvl - y_min))
@@ -280,57 +280,8 @@ class RTSAView(QWidget):
         except Exception:
             return 0.0
 
-    def _fit_channel_text(self, mask_w_px, ch_label, f_start, f_stop, hdr_color, call_sign):
-        if mask_w_px < 22:
-            return ""
-            
-        line1 = f"DTV {ch_label}"
-        if mask_w_px >= 85:
-            line2 = f"{f_start:g} - {f_stop:g} MHz"
-        elif mask_w_px >= 55:
-            line2 = f"{f_start:g}-{f_stop:g} MHz"
-        else:
-            line2 = f"{int(f_start)}-{int(f_stop)}"
-            
-        display_call = None
-        if call_sign:
-            cs = str(call_sign).strip()
-            if cs.startswith("LMR"):
-                display_call = "LMR"
-            elif len(cs) > 7:
-                display_call = cs[:7]
-            else:
-                display_call = cs
-
-        lines = [line1, line2]
-        if display_call:
-            lines.append(display_call)
-            
-        avail_w = max(mask_w_px - 4, 10)
-        best_pt = 10.0
-        f = QFont('sans-serif')
-        f.setBold(True)
-        while best_pt >= 5.5:
-            f.setPointSizeF(best_pt)
-            fm = QFontMetrics(f)
-            max_line_w = max(fm.horizontalAdvance(l) for l in lines)
-            if max_line_w <= avail_w:
-                break
-            best_pt -= 0.5
-            
-        pt_h1 = f"{best_pt:.1f}pt"
-        pt_h2 = f"{max(best_pt - 1.0, 5.0):.1f}pt"
-        pt_h3 = f"{best_pt:.1f}pt"
-        
-        html = (
-            f"<div style='text-align: center; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; line-height: 1.15;'>"
-            f"<div style='color: {hdr_color}; font-weight: bold; font-size: {pt_h1};'>{line1}</div>"
-            f"<div style='color: #cbd5e1; font-size: {pt_h2}; font-weight: normal;'>{line2}</div>"
-        )
-        if display_call:
-            html += f"<div style='color: #facc15; font-weight: bold; font-size: {pt_h3};'>{display_call}</div>"
-        html += "</div>"
-        return html
+    def _fit_channel_text(self, mask_w_px, ch_label, f_start, f_stop, kind, info):
+        return channel_label_html(mask_w_px, kind, ch_label, f_start, f_stop, info)
 
     def _update_text_items(self):
         vb = self.plot_item.getViewBox()
@@ -341,7 +292,7 @@ class RTSAView(QWidget):
             if ch_id not in self.channel_text_meta:
                 continue
             meta = self.channel_text_meta[ch_id]
-            f_start, f_stop, ch_label, hdr_color, call_sign, is_active = meta
+            f_start, f_stop, ch_label, kind, info, is_active = meta
             if not is_active:
                 t_item.setVisible(False)
                 continue
@@ -351,7 +302,7 @@ class RTSAView(QWidget):
             if mask_w < 22:
                 t_item.setVisible(False)
                 continue
-            html = self._fit_channel_text(mask_w, ch_label, f_start, f_stop, hdr_color, call_sign)
+            html = self._fit_channel_text(mask_w, ch_label, f_start, f_stop, kind, info)
             t_item.setHtml(html)
             t_item.setPos((f_start + f_stop) / 2.0, y_pos)
             t_item.setVisible(True)
@@ -378,7 +329,7 @@ class RTSAView(QWidget):
                 for ch in range(band["start_ch"], band["end_ch"] + 1):
                     f_start = band["start_freq"] + (ch - band["start_ch"]) * band["spacing"]
                     f_stop = f_start + band["spacing"]
-                    all_channels[ch] = (f_start, f_stop, str(ch), "normal")
+                    all_channels[ch] = (f_start, f_stop, str(ch), band.get("type", "dtv"))
 
         y_pos = self._calc_text_y_pos()
 
@@ -386,36 +337,8 @@ class RTSAView(QWidget):
             is_active = active_dict.get(ch_id, False)
             if is_active:
                 is_ps = public_safety_dict.get(ch_id, False)
-                if is_ps:
-                    brush = pg.mkBrush(239, 68, 68, 40)
-                    pen = pg.mkPen('#ef4444', width=1, style=Qt.PenStyle.DashLine)
-                    border_color = '#ef4444'
-                    hdr_color = '#f87171'
-                elif c_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
-                    brush = pg.mkBrush(100, 116, 139, 50)
-                    pen = pg.mkPen('#94a3b8', width=1.5, style=Qt.PenStyle.DashLine)
-                    border_color = '#94a3b8'
-                    hdr_color = '#94a3b8'
-                elif c_type == "uplink":
-                    brush = pg.mkBrush(16, 185, 129, 40)
-                    pen = pg.mkPen('#10b981', width=1, style=Qt.PenStyle.DashLine)
-                    border_color = '#10b981'
-                    hdr_color = '#34d399'
-                elif c_type == "downlink":
-                    brush = pg.mkBrush(139, 92, 246, 40)
-                    pen = pg.mkPen('#8b5cf6', width=1, style=Qt.PenStyle.DashLine)
-                    border_color = '#8b5cf6'
-                    hdr_color = '#a78bfa'
-                elif c_type == "guard":
-                    brush = pg.mkBrush(100, 116, 139, 40)
-                    pen = pg.mkPen('#64748b', width=1, style=Qt.PenStyle.DashLine)
-                    border_color = '#64748b'
-                    hdr_color = '#94a3b8'
-                else:
-                    brush = pg.mkBrush(6, 182, 212, 35)
-                    pen = pg.mkPen('#06b6d4', width=1, style=Qt.PenStyle.DashLine)
-                    border_color = '#06b6d4'
-                    hdr_color = '#38bdf8'
+                kind = channel_kind(c_type, is_ps)
+                brush, pen = mask_brush_pen(kind)
 
                 if ch_id not in self.channel_masks:
                     region = pg.LinearRegionItem(
@@ -443,15 +366,15 @@ class RTSAView(QWidget):
                 else:
                     ch_title = f"{ch_label}"
 
-                call_sign = channel_names.get(ch_id) or channel_names.get(str(ch_id))
-                self.channel_text_meta[ch_id] = (f_start, f_stop, ch_title, hdr_color, call_sign, True)
+                info = channel_names.get(ch_id) or channel_names.get(str(ch_id))
+                self.channel_text_meta[ch_id] = (f_start, f_stop, ch_title, kind, info, True)
 
                 vb = self.plot_item.getViewBox()
                 p1 = vb.mapViewToDevice(QPointF(f_start, 0.0))
                 p2 = vb.mapViewToDevice(QPointF(f_stop, 0.0))
                 mask_w = abs(p2.x() - p1.x())
 
-                html_text = self._fit_channel_text(mask_w, ch_title, f_start, f_stop, hdr_color, call_sign)
+                html_text = self._fit_channel_text(mask_w, ch_title, f_start, f_stop, kind, info)
 
                 if ch_id not in self.channel_text_items:
                     t_item = pg.TextItem(

@@ -7,7 +7,7 @@ carrier frequencies, models, bands, and active TV / Public Safety exclusions.
 import os
 import re
 import csv
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any
 
 # Default ordered palette: Orange, Yellow, Blue, Violet, Purple
 # Deliberately omitting Red and Green as requested
@@ -29,8 +29,16 @@ class WWBParser:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
 
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        # utf-8-sig tolerates the byte-order mark some exports start with
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             lines = f.readlines()
+
+        def fields(raw):
+            """Split one CSV line, honouring quotes (names may contain commas)."""
+            try:
+                return [p.strip() for p in next(csv.reader([raw]))]
+            except (csv.Error, StopIteration):
+                return [p.strip() for p in raw.split(",")]
 
         site_name = os.path.splitext(os.path.basename(filepath))[0]
         # Look for show/site title in first 20 lines
@@ -72,6 +80,7 @@ class WWBParser:
                 current_group = None
                 in_primary = False
                 in_backup = False
+                in_exclusions = False  # a new zone ends any exclusions section
                 continue
 
             # Detect Primary / Backup section
@@ -97,12 +106,12 @@ class WWBParser:
 
             if in_exclusions:
                 if line.startswith("Digital,"):
-                    parts = [p.strip() for p in line.split(",") if p.strip()]
+                    parts = [p for p in fields(line) if p]
                     for p in parts[1:]:
                         if p.isdigit():
                             active_tv.append(int(p))
                 elif line.startswith("Public Safety,"):
-                    parts = [p.strip() for p in line.split(",") if p.strip()]
+                    parts = [p for p in fields(line) if p]
                     for p in parts[1:]:
                         if p.isdigit():
                             active_ps.append(int(p))
@@ -112,11 +121,11 @@ class WWBParser:
             if (in_primary or in_backup) and current_zone is not None:
                 # Header row detection
                 if "Type" in line and "Frequency" in line:
-                    parts = [p.strip() for p in raw_line.split(",")]
+                    parts = fields(raw_line)
                     header_cols = {col.lower(): idx for idx, col in enumerate(parts) if col}
                     continue
 
-                parts = [p.strip() for p in raw_line.split(",")]
+                parts = fields(raw_line)
                 first_col = parts[0] if len(parts) > 0 else ""
 
                 # Look for frequency value

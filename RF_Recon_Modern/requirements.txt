@@ -1,0 +1,7 @@
+PyQt6
+pyqtgraph
+numpy
+scipy
+pgeocode
+requests
+openpyxl

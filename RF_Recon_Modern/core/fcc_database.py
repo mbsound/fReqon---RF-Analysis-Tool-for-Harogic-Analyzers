@@ -1,11 +1,27 @@
-import os
-import time
-import sqlite3
-import zipfile
-import urllib.request
-import pgeocode
+"""
+fcc_database.py - US broadcast TV station lookup.
+
+Stations near a location are fetched live from the FCC's TV Query service
+(pipe-delimited text output; typically <1 s and a few tens of KB), instead of
+downloading the 1.6 GB LMS database dump. Every live result is cached in the
+per-user SQLite database, so a venue looked up once keeps working offline. If
+the FCC can't be reached and no cached lookup covers the location, the
+bundled station table (built from an LMS dump) is used.
+"""
+
 import math
+import os
+import sqlite3
 import threading
+import time
+
+import pgeocode
+import requests
+
+try:
+    from .app_paths import user_database
+except ImportError:
+    from app_paths import user_database
 
 T_BAND_CITIES = [
     {"name": "Boston, MA", "lat": 42.3601, "lon": -71.0589, "channels": [14, 16]},
@@ -21,386 +37,281 @@ T_BAND_CITIES = [
     {"name": "Washington, DC", "lat": 38.9072, "lon": -77.0369, "channels": [17, 18]}
 ]
 
+TVQ_URL = "https://transition.fcc.gov/fcc-bin/tvq"
+TVQ_TIMEOUT = (5, 20)  # connect, read (seconds)
+
+# Source of the most recent lookup (see FCCDatabaseManager.last_lookup)
+SOURCE_LIVE, SOURCE_CACHE, SOURCE_BUNDLED = "live", "cache", "bundled"
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return 6371.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _dms(value):
+    """Decimal degrees -> (degrees, minutes, seconds) of the magnitude."""
+    value = abs(value)
+    d = int(value)
+    m = int((value - d) * 60)
+    s = round(((value - d) * 60 - m) * 60, 1)
+    return d, m, s
+
+
+def parse_tvq_text(text):
+    """
+    Parse TV Query's pipe-delimited text output (list=4). Returns dicts with
+    call_sign, service, channel, status, city, state, erp (kW), facility_id,
+    lat, lon, licensee and distance_km (from the query point).
+    """
+    stations = []
+    for line in text.splitlines():
+        f = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(f) < 28:
+            continue
+        try:
+            channel = int(f[3])
+            lat = int(f[19]) + int(f[20]) / 60.0 + float(f[21]) / 3600.0
+            lon = int(f[23]) + int(f[24]) / 60.0 + float(f[25]) / 3600.0
+        except ValueError:
+            continue
+        if f[18] == "S":
+            lat = -lat
+        if f[22] == "W":
+            lon = -lon
+        try:
+            erp = float(f[13].split()[0])
+        except (ValueError, IndexError):
+            erp = None
+        try:
+            dist = float(f[27].split()[0])
+        except (ValueError, IndexError):
+            dist = None
+        stations.append({
+            "call_sign": f[0],
+            "service": f[2],
+            "channel": channel,
+            "status": f[8],
+            "city": f[9].title(),
+            "state": f[10],
+            "erp": erp,
+            "facility_id": f[17],
+            "lat": lat,
+            "lon": lon,
+            "licensee": f[26],
+            "distance_km": dist,
+        })
+    return stations
+
+
 class FCCDatabaseManager:
     def __init__(self, db_path="fcc_tv.db"):
+        # Relative names refer to the per-user copy (writable, independent of the
+        # working directory); absolute paths are used as given.
         if not os.path.isabs(db_path):
-            candidates = [
-                os.path.join(os.getcwd(), db_path),
-                os.path.join(os.path.dirname(__file__), db_path),
-                os.path.join(os.path.dirname(os.path.dirname(__file__)), db_path),
-                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "RF_Recon_App", db_path)
-            ]
-            for c in candidates:
-                if os.path.exists(c):
-                    db_path = c
-                    break
+            db_path = user_database(db_path)
         self.db_path = db_path
-        self.download_url = "https://enterpriseefiling.fcc.gov/dataentry/api/download/dbfile/Current_LMS_Dump.zip"
-        self.last_update_key = "last_update"
-        self.cache_days = 7
-        self.is_downloading = False
-        
+        # {"source": live|cache|bundled, "fetched_at": epoch or None, "error": str or None}
+        self.last_lookup = {"source": None, "fetched_at": None, "error": None}
         self._init_db()
 
     def _init_db(self):
+        # One connection, shared by the GUI thread and lookup worker threads;
+        # every use goes through _db_lock.
+        self._db_lock = threading.RLock()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS stations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                application_id TEXT,
-                service TEXT,
-                lms_application_id TEXT,
-                call_sign TEXT,
-                lat REAL,
-                lon REAL,
-                channel INTEGER,
-                erp REAL,
-                is_public_safety BOOLEAN DEFAULT 0
-            )
-        """)
-        self.conn.commit()
+        with self._db_lock, self.conn:
+            self.conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+            # Bundled fallback, built from an LMS dump
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS stations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id TEXT, service TEXT, lms_application_id TEXT,
+                    call_sign TEXT, lat REAL, lon REAL, channel INTEGER, erp REAL,
+                    is_public_safety BOOLEAN DEFAULT 0
+                )""")
+            # Cache of live TV Query lookups
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS live_queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lat REAL, lon REAL, radius_km REAL, fetched_at REAL
+                )""")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS live_stations (
+                    query_id INTEGER REFERENCES live_queries(id) ON DELETE CASCADE,
+                    call_sign TEXT, service TEXT, channel INTEGER, status TEXT,
+                    city TEXT, state TEXT, erp REAL, facility_id TEXT,
+                    lat REAL, lon REAL, licensee TEXT
+                )""")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS live_stations_query ON live_stations(query_id)")
+
+    def _query(self, sql, params=()):
+        with self._db_lock:
+            return self.conn.execute(sql, params).fetchall()
 
     def get_last_update_time(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT value FROM metadata WHERE key=?", (self.last_update_key,))
-        row = cursor.fetchone()
-        if row:
-            try:
-                return float(row[0])
-            except ValueError:
-                return 0.0
-        return 0.0
+        """Time of the most recent successful live lookup (0 if none)."""
+        rows = self._query("SELECT MAX(fetched_at) FROM live_queries")
+        return float(rows[0][0]) if rows and rows[0][0] else 0.0
 
-    def needs_update(self):
-        last_update = self.get_last_update_time()
-        if last_update == 0.0:
-            return True
-        days_since_update = (time.time() - last_update) / (24 * 3600)
-        return days_since_update > self.cache_days
-        
     def has_data(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM stations")
-        return cursor.fetchone()[0] > 0
+        return (self._query("SELECT COUNT(*) FROM live_stations")[0][0] > 0 or
+                self._query("SELECT COUNT(*) FROM stations")[0][0] > 0)
 
-    def download_and_update_async(self, progress_callback=None, completion_callback=None):
-        if self.is_downloading:
-            return
-        
-        self.is_downloading = True
-        
-        def _task():
+    # --- Live lookup -----------------------------------------------------
+
+    def fetch_live(self, lat, lon, radius_km, first_channel=2, last_channel=36):
+        """Query the FCC TV Query service. Raises on network or HTTP errors."""
+        dlat, mlat, slat = _dms(lat)
+        dlon, mlon, slon = _dms(lon)
+        params = {
+            "call": "", "chan": first_channel, "cha2": last_channel, "serv": "", "type": 0,
+            "status": 3,  # licensed facilities
+            "facid": "", "list": 4,  # pipe-delimited text
+            "dist": round(radius_km, 1),
+            "dlat2": dlat, "mlat2": mlat, "slat2": slat, "NS": "N" if lat >= 0 else "S",
+            "dlon2": dlon, "mlon2": mlon, "slon2": slon, "EW": "W" if lon < 0 else "E",
+            "size": 9,
+        }
+        r = requests.get(TVQ_URL, params=params, timeout=TVQ_TIMEOUT,
+                         headers={"User-Agent": "Freqon (RF coordination tool)"})
+        r.raise_for_status()
+        return parse_tvq_text(r.text)
+
+    def _store_live(self, lat, lon, radius_km, stations):
+        with self._db_lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO live_queries (lat, lon, radius_km, fetched_at) VALUES (?, ?, ?, ?)",
+                (lat, lon, radius_km, time.time()))
+            qid = cur.lastrowid
+            self.conn.executemany(
+                "INSERT INTO live_stations (query_id, call_sign, service, channel, status, city, "
+                "state, erp, facility_id, lat, lon, licensee) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(qid, s["call_sign"], s["service"], s["channel"], s["status"], s["city"],
+                  s["state"], s["erp"], s["facility_id"], s["lat"], s["lon"], s["licensee"])
+                 for s in stations])
+            # Keep only the newest lookup for (roughly) the same place and radius
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            old = self.conn.execute(
+                "SELECT id FROM live_queries WHERE id != ? AND ABS(lat - ?) < 0.01 AND "
+                "ABS(lon - ?) < 0.01 AND ABS(radius_km - ?) < 1", (qid, lat, lon, radius_km)).fetchall()
+            for (oid,) in old:
+                self.conn.execute("DELETE FROM live_stations WHERE query_id = ?", (oid,))
+                self.conn.execute("DELETE FROM live_queries WHERE id = ?", (oid,))
+
+    def _from_cache(self, lat, lon, radius_km):
+        """Stations from the newest cached lookup whose area covers this one."""
+        best = None
+        for qid, qlat, qlon, qrad, fetched in self._query(
+                "SELECT id, lat, lon, radius_km, fetched_at FROM live_queries ORDER BY fetched_at DESC"):
+            if _haversine_km(lat, lon, qlat, qlon) + radius_km <= qrad + 1.0:
+                best = (qid, fetched)
+                break
+        if best is None:
+            return None, None
+        rows = self._query(
+            "SELECT call_sign, service, channel, status, city, state, erp, facility_id, lat, lon, "
+            "licensee FROM live_stations WHERE query_id = ?", (best[0],))
+        keys = ("call_sign", "service", "channel", "status", "city", "state", "erp",
+                "facility_id", "lat", "lon", "licensee")
+        stations = []
+        for row in rows:
+            s = dict(zip(keys, row))
+            s["distance_km"] = round(_haversine_km(lat, lon, s["lat"], s["lon"]), 2)
+            if s["distance_km"] <= radius_km:
+                stations.append(s)
+        return stations, best[1]
+
+    def _from_bundled(self, lat, lon, radius_km):
+        lat_delta = radius_km / 111.0
+        lon_delta = radius_km / (111.0 * max(0.1, math.cos(math.radians(lat))))
+        rows = self._query(
+            "SELECT call_sign, lat, lon, channel, erp FROM stations "
+            "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+            (lat - lat_delta, lat + lat_delta, lon - lon_delta, lon + lon_delta))
+        stations = []
+        for call_sign, slat, slon, channel, erp in rows:
+            if slat is None or slon is None:
+                continue
+            dist = _haversine_km(lat, lon, slat, slon)
+            if dist <= radius_km:
+                stations.append({"call_sign": call_sign, "channel": channel, "erp": erp,
+                                 "lat": slat, "lon": slon, "distance_km": round(dist, 2)})
+        return stations
+
+    def lookup(self, lat, lon, radius_km, allow_network=True):
+        """
+        Stations within radius_km of (lat, lon): live when possible, otherwise
+        from a cached lookup covering the area, otherwise the bundled table.
+        Sets self.last_lookup to describe where the data came from.
+        """
+        error = None
+        if allow_network:
             try:
-                self.download_and_update(progress_callback)
-                if completion_callback:
-                    completion_callback(True)
-            except Exception as e:
-                print(f"Error in async FCC DB download: {e}")
-                if completion_callback:
-                    completion_callback(False)
-            finally:
-                self.is_downloading = False
-                
-        t = threading.Thread(target=_task)
-        t.daemon = True
-        t.start()
+                stations = self.fetch_live(lat, lon, radius_km)
+                self._store_live(lat, lon, radius_km, stations)
+                self.last_lookup = {"source": SOURCE_LIVE, "fetched_at": time.time(), "error": None}
+                return self._finish(stations, lat, lon, radius_km)
+            except Exception as e:  # network down, FCC unavailable, ...
+                error = str(e)
+        stations, fetched = self._from_cache(lat, lon, radius_km)
+        if stations is not None:
+            self.last_lookup = {"source": SOURCE_CACHE, "fetched_at": fetched, "error": error}
+            return self._finish(stations, lat, lon, radius_km)
+        self.last_lookup = {"source": SOURCE_BUNDLED, "fetched_at": None, "error": error}
+        return self._finish(self._from_bundled(lat, lon, radius_km), lat, lon, radius_km)
 
-    def download_and_update(self, progress_callback=None):
-        """
-        Downloads the FCC database and populates the local SQLite DB.
-        """
-        if progress_callback:
-            progress_callback(0, "Downloading FCC LMS Database...")
-            
-        zip_path = "fcc_temp.zip"
-        try:
-            # Download file
-            import requests
-            
-            headers = {'User-Agent': 'python-urllib/3.10'}
-            
-            # Check for partial download
-            file_mode = 'wb'
-            initial_size = 0
-            if os.path.exists(zip_path):
-                initial_size = os.path.getsize(zip_path)
-                headers['Range'] = f'bytes={initial_size}-'
-                file_mode = 'ab'
-                
-            try:
-                with requests.get(self.download_url, headers=headers, stream=True, timeout=10) as r:
-                    if r.status_code == 416: # Range not satisfiable (already fully downloaded)
-                        pass
-                    else:
-                        r.raise_for_status()
-                        if r.status_code == 200 and initial_size > 0:
-                            # Server ignored Range header, rewrite from scratch
-                            file_mode = 'wb'
-                            initial_size = 0
-                            
-                        total_size = int(r.headers.get('content-length', 0)) + initial_size
-                        downloaded = initial_size
-                        
-                        with open(zip_path, file_mode) as f:
-                            for chunk in r.iter_content(chunk_size=1024 * 1024): # 1MB chunks
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    if progress_callback and total_size > 0:
-                                        pct = int((downloaded / total_size) * 30)
-                                        pct = max(0, min(30, pct))
-                                        mb_down = downloaded // (1024*1024)
-                                        mb_tot = total_size // (1024*1024)
-                                        progress_callback(pct, f"Downloading FCC Database... ({mb_down}/{mb_tot} MB)")
-            except Exception as e:
-                print(f"Error downloading: {e}")
-                # If resume failed, delete temp file so next time it starts fresh
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-                raise e
-            
-            if progress_callback:
-                progress_callback(30, "Parsing FCC Database (Pass 1/5)...")
-                
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM stations")
-            
-            # Extract true data from LMS Dump
-            ant_to_erp = {}
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                if 'app_antenna_frequency.dat' in z.namelist():
-                    with z.open('app_antenna_frequency.dat') as f:
-                        headers = f.readline().decode('utf-8').strip().split('|')
-                        ant_idx = headers.index('aafq_aant_antenna_record_id')
-                        erp_idx = headers.index('aafq_power_erp_kw')
-                        max_erp_idx = headers.index('aafq_max_erp_kw')
-                        for line in f:
-                            parts = line.decode('utf-8', errors='ignore').split('|')
-                            if len(parts) > max(ant_idx, max_erp_idx):
-                                val = parts[erp_idx].strip()
-                                if not val: val = parts[max_erp_idx].strip()
-                                if val:
-                                    try:
-                                        ant_to_erp[parts[ant_idx]] = float(val)
-                                    except ValueError:
-                                        pass
-                                        
-            if progress_callback: progress_callback(45, "Parsing FCC Database (Pass 2/5)...")
-            
-            loc_to_erp = {}
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                if 'app_antenna.dat' in z.namelist():
-                    with z.open('app_antenna.dat') as f:
-                        headers = f.readline().decode('utf-8').strip().split('|')
-                        loc_idx = headers.index('aant_aloc_loc_record_id')
-                        ant_idx = headers.index('aant_antenna_record_id')
-                        for line in f:
-                            parts = line.decode('utf-8', errors='ignore').split('|')
-                            if len(parts) > max(loc_idx, ant_idx):
-                                erp = ant_to_erp.get(parts[ant_idx])
-                                if erp is not None:
-                                    loc_to_erp[parts[loc_idx]] = erp
-            ant_to_erp.clear() # save memory
-            
-            if progress_callback: progress_callback(60, "Parsing FCC Database (Pass 3/4)...")
-            
-            fac_info = {}
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                if 'facility.dat' in z.namelist():
-                    with z.open('facility.dat') as f:
-                        headers = f.readline().decode('utf-8').strip().split('|')
-                        fac_id_idx = headers.index('facility_id')
-                        stat_idx = headers.index('facility_status')
-                        call_idx = headers.index('callsign')
-                        chan_idx = headers.index('channel')
-                        act_idx = headers.index('active_ind')
-                        
-                        for line in f:
-                            parts = line.decode('utf-8', errors='ignore').split('|')
-                            if len(parts) > max(fac_id_idx, chan_idx, stat_idx, act_idx, call_idx):
-                                if parts[act_idx] != 'Y' or parts[stat_idx] != 'LICEN':
-                                    continue
-                                fac_id = parts[fac_id_idx].strip()
-                                try:
-                                    chan = int(parts[chan_idx])
-                                    if 7 <= chan <= 36:
-                                        callsign = parts[call_idx].strip()
-                                        if fac_id and callsign:
-                                            fac_info[fac_id] = {
-                                                'channel': chan,
-                                                'callsign': callsign
-                                            }
-                                except ValueError:
-                                    pass
+    def _finish(self, stations, lat, lon, radius_km):
+        # One row per facility and channel (a facility can have several records,
+        # e.g. distributed transmitters); keep the nearest.
+        best = {}
+        for s in stations:
+            s["is_public_safety"] = False
+            key = (s.get("facility_id") or s.get("call_sign"), s.get("channel"))
+            if key not in best or (s.get("distance_km") or 0) < (best[key].get("distance_km") or 0):
+                best[key] = s
+        result = list(best.values())
+        # T-Band public safety (LMR) is protected within ~80 km of these cities
+        for city in T_BAND_CITIES:
+            dist = _haversine_km(lat, lon, city["lat"], city["lon"])
+            if dist <= radius_km:
+                for ch in city["channels"]:
+                    result.append({"call_sign": f'LMR {city["name"]}', "distance_km": round(dist, 1),
+                                   "channel": ch, "erp": "N/A", "is_public_safety": True})
+        result.sort(key=lambda s: s.get("distance_km") or 0)
+        return result
 
-            if progress_callback: progress_callback(75, "Parsing FCC Database (Pass 4/5)...")
-            
-            app_to_info = {}
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                if 'application_facility.dat' in z.namelist():
-                    with z.open('application_facility.dat') as f:
-                        headers = f.readline().decode('utf-8').strip().split('|')
-                        app_idx = headers.index('afac_application_id')
-                        fac_idx = headers.index('afac_facility_id')
-                        act_idx = headers.index('active_ind')
-                        
-                        for line in f:
-                            parts = line.decode('utf-8', errors='ignore').split('|')
-                            if len(parts) > max(app_idx, fac_idx, act_idx):
-                                if parts[act_idx] == 'Y':
-                                    fac_id = parts[fac_idx].strip()
-                                    if fac_id in fac_info:
-                                        app_to_info[parts[app_idx].strip()] = fac_info[fac_id]
-            
-            if progress_callback: progress_callback(90, "Writing FCC Database (Pass 5/5)...")
+    # --- ZIP code entry points (used by the UI) --------------------------
 
-            stations_to_insert = []
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                if 'app_location.dat' in z.namelist():
-                    with z.open('app_location.dat') as f:
-                        headers = f.readline().decode('utf-8').strip().split('|')
-                        app_idx = headers.index('aloc_aapp_application_id')
-                        loc_idx = headers.index('aloc_loc_record_id')
-                        lat_deg_idx = headers.index('aloc_lat_deg')
-                        lat_min_idx = headers.index('aloc_lat_mm')
-                        lat_sec_idx = headers.index('aloc_lat_ss')
-                        lat_dir_idx = headers.index('aloc_lat_dir')
-                        lon_deg_idx = headers.index('aloc_long_deg')
-                        lon_min_idx = headers.index('aloc_long_mm')
-                        lon_sec_idx = headers.index('aloc_long_ss')
-                        lon_dir_idx = headers.index('aloc_long_dir')
-                        
-                        for line in f:
-                            parts = line.decode('utf-8', errors='ignore').split('|')
-                            if len(parts) > max(app_idx, lon_dir_idx, loc_idx):
-                                app_id = parts[app_idx]
-                                if app_id in app_to_info:
-                                    try:
-                                        lat = float(parts[lat_deg_idx]) + float(parts[lat_min_idx])/60.0 + float(parts[lat_sec_idx])/3600.0
-                                        if parts[lat_dir_idx] == 'S': lat = -lat
-                                        
-                                        lon = float(parts[lon_deg_idx]) + float(parts[lon_min_idx])/60.0 + float(parts[lon_sec_idx])/3600.0
-                                        if parts[lon_dir_idx] == 'W': lon = -lon
-                                        
-                                        erp = loc_to_erp.get(parts[loc_idx], 0.0)
-                                        info = app_to_info[app_id]
-                                        
-                                        stations_to_insert.append((
-                                            info['callsign'], lat, lon, info['channel'], erp, False
-                                        ))
-                                        
-                                        # Only one location per app 
-                                        del app_to_info[app_id]
-                                    except ValueError:
-                                        pass
-                                        
-            cursor.executemany("INSERT INTO stations (call_sign, lat, lon, channel, erp, is_public_safety) VALUES (?, ?, ?, ?, ?, ?)",
-                               stations_to_insert)
-            
-            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", 
-                           (self.last_update_key, str(time.time())))
-            self.conn.commit()
-            
-            if progress_callback:
-                progress_callback(100, "FCC Database Update Complete")
-                
-        except Exception as e:
-            print(f"Error updating FCC database: {e}")
-            if progress_callback:
-                progress_callback(-1, f"Error: {str(e)}")
-        finally:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
+    @staticmethod
+    def geocode_zip(zip_code):
+        res = pgeocode.Nominatim("us").query_postal_code(str(zip_code).strip()[:5])
+        if math.isnan(res.latitude) or math.isnan(res.longitude):
+            return None
+        return float(res.latitude), float(res.longitude)
 
-    def _haversine(self, lat1, lon1, lat2, lon2):
-        # Calculate distance in km
-        R = 6371.0
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return R * c
-
-    def query_by_zip(self, zip_code: str, radius_miles: float = 65):
-        """
-        Queries broadcast stations near a US ZIP code within radius in miles.
-        """
-        radius_km = radius_miles * 1.60934
-        return self.get_stations_near_zip(zip_code, radius_km=radius_km)
-
-    def get_station_name_for_channel(self, channel: int):
-        """
-        Returns the primary licensed call sign for a given RF channel.
-        """
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT call_sign FROM stations WHERE channel = ? ORDER BY erp DESC LIMIT 1", (channel,))
-            row = cursor.fetchone()
-            if row and row[0]:
-                return row[0]
-        except Exception:
-            pass
-        return None
+    def query_by_zip(self, zip_code: str, radius_miles: float = 65, allow_network=True):
+        """Stations near a US ZIP code, within radius_miles."""
+        loc = self.geocode_zip(zip_code)
+        if loc is None:
+            self.last_lookup = {"source": None, "fetched_at": None, "error": f"Unknown ZIP code {zip_code}"}
+            return []
+        return self.lookup(loc[0], loc[1], radius_miles * 1.60934, allow_network)
 
     def get_stations_near_zip(self, zip_code, radius_km=200):
-        # Convert ZIP to Lat/Lon
-        nomi = pgeocode.Nominatim('us')
-        res = nomi.query_postal_code(zip_code)
-        
-        if str(res.latitude) == 'nan' or str(res.longitude) == 'nan':
-            return []
-            
-        target_lat = float(res.latitude)
-        target_lon = float(res.longitude)
-        
-        # Spatial bounding box pre-filtering for fast indexing
-        lat_delta = radius_km / 111.0
-        cos_lat = max(0.1, math.cos(math.radians(target_lat)))
-        lon_delta = radius_km / (111.0 * cos_lat)
-        
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT call_sign, lat, lon, channel, erp, is_public_safety FROM stations "
-            "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
-            (target_lat - lat_delta, target_lat + lat_delta, target_lon - lon_delta, target_lon + lon_delta)
-        )
-        
-        nearby_stations = []
-        for row in cursor.fetchall():
-            call_sign, lat, lon, channel, erp, is_ps = row
-            if lat is None or lon is None:
-                continue
-            dist = self._haversine(target_lat, target_lon, lat, lon)
-            if dist <= radius_km:
-                nearby_stations.append({
-                    "call_sign": call_sign,
-                    "distance_km": round(dist, 1),
-                    "channel": channel,
-                    "erp": erp,
-                    "is_public_safety": bool(is_ps)
-                })
-                
-        # Inject T-Band Public Safety
-        # T-Band operations are protected within an ~80km (50 mile) radius of these centers.
-        for city in T_BAND_CITIES:
-            dist = self._haversine(target_lat, target_lon, city["lat"], city["lon"])
-            if dist <= radius_km: # Default 100km is a good safety buffer
-                for ch in city["channels"]:
-                    nearby_stations.append({
-                        "call_sign": f'LMR {city["name"]}',
-                        "distance_km": round(dist, 1),
-                        "channel": ch,
-                        "erp": "N/A",
-                        "is_public_safety": True
-                    })
-                
-        # Sort by distance
-        nearby_stations.sort(key=lambda x: x["distance_km"])
-        return nearby_stations
+        loc = self.geocode_zip(zip_code)
+        return self.lookup(loc[0], loc[1], radius_km) if loc else []
+
+    def get_station_name_for_channel(self, channel: int):
+        """Primary call sign for an RF channel, from the most recent lookup area."""
+        rows = self._query(
+            "SELECT call_sign FROM live_stations WHERE channel = ? AND query_id = "
+            "(SELECT id FROM live_queries ORDER BY fetched_at DESC LIMIT 1) ORDER BY erp DESC LIMIT 1",
+            (channel,))
+        if not rows:
+            rows = self._query("SELECT call_sign FROM stations WHERE channel = ? ORDER BY erp DESC LIMIT 1",
+                               (channel,))
+        return rows[0][0] if rows and rows[0][0] else None
