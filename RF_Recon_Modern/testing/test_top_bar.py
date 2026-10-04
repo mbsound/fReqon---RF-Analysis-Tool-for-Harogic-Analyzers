@@ -40,6 +40,13 @@ def test_slot_readouts():
     bar.set_power_state(POWER)
     assert bar.temp_label.isVisible() and bar.power_label.isVisible()
 
+    # Disconnected: no readings of an analyzer that is gone
+    bar.set_device_status(False, "Disconnected")
+    assert not bar.temp_label.isVisible() and not bar.power_label.isVisible()
+    bar.set_device_status(True, "Analyzer")
+    bar.set_device_temperature(48.0)
+    bar.set_power_state(POWER)
+
     # One analyzer: the single labels stay
     bar.set_slot_readouts([entry("slot_a", temp_c=48.0, power=POWER)])
     assert not bar.slot_chip_frame.isVisible() and bar.temp_label.isVisible()

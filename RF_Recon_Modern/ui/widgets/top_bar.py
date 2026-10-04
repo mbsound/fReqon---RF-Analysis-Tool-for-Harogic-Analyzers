@@ -800,8 +800,11 @@ class TopBar(QWidget):
 
     def set_device_status(self, connected: bool, text: str):
         if not connected:
+            # Readings of an analyzer that is no longer there are not shown
             self.power_state = None
             self.power_label.hide()
+            self.current_temp_c = None
+            self._update_temp_display()
         self._identity_text = text
         self._notice_timer.stop()
         if connected:

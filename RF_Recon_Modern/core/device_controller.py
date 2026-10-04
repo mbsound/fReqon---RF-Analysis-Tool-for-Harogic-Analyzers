@@ -1543,7 +1543,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
         # Nothing to stop or close on an analyzer that is no longer there (and the SDK can
         # wait a long time on one): the process ends and the handle goes with it
         data_queue.put(("connected", False))
-        data_queue.put(("status", "Analyzer lost: it stopped answering (unplugged or powered off). Disconnected."))
+        data_queue.put(("status", "Analyzer lost (unplugged or powered off)"))
         return
     try:
         stop_mscan_if_running()
