@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QComboBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+from ..antenna_source import AntennaSourceRow
 from PyQt6.QtGui import QColor
 
 class DTVPanel(QWidget):
@@ -100,6 +101,11 @@ class DTVPanel(QWidget):
         
         # --- 2. DETECTION & THRESHOLDS CARD ---
         thresh_card = self._create_card("OCCUPIED CHANNEL DETECTOR", layout)
+        self.antenna_row = AntennaSourceRow(
+            "Split sweep: channels are judged on the stitched sweep: analyzer A's antenna below the seam, "
+            "analyzer B's above it.",
+            "Which antenna's analyzer the occupied-channel detection runs on.")
+        thresh_card.layout().addWidget(self.antenna_row)
         t_form = QFormLayout()
         t_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
         

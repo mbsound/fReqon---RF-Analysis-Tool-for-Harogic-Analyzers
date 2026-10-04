@@ -353,6 +353,10 @@ class SpectrumView(QWidget):
 
         div_str = f"{self.scale_div:.0f}" if abs(self.scale_div - round(self.scale_div)) < 0.01 else f"{self.scale_div:.1f}"
         self.scale_badge.setText(f"REF: {self.ref_level:.1f} dBm | {div_str} dB/DIV")
+        # A second view kept on the same scale (the other antenna's, in diversity)
+        follower = getattr(self, "amplitude_follower", None)
+        if follower is not None:
+            follower.set_amplitude_scale(ref_level, scale_div)
 
         self._update_text_items()
 
@@ -429,6 +433,23 @@ class SpectrumView(QWidget):
 
     def set_span_alert(self, visible: bool):
         self.span_alert.setVisible(visible)
+
+    MIRRORED_MASKS = ("update_channel_masks", "clear_channel_masks", "set_soundbase_masks",
+                      "set_soundbase_mask_visible", "update_carrier_mask_color", "clear_soundbase_masks")
+
+    def mirror_masks_to(self, other: "SpectrumView"):
+        """
+        Keep another spectrum view's channel and carrier masks the same as this one's (the
+        second antenna's view in diversity): whatever sets them here sets them there too.
+        """
+        for name in self.MIRRORED_MASKS:
+            own = getattr(self, name)
+
+            def both(*args, _own=own, _name=name, **kwargs):
+                result = _own(*args, **kwargs)
+                getattr(other, _name)(*args, **kwargs)
+                return result
+            setattr(self, name, both)
 
     def update_channel_masks(self, active_dict: dict, standard, ps_dict: dict = None, channel_names: dict = None):
         if ps_dict is None:

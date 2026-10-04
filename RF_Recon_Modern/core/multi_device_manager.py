@@ -48,6 +48,8 @@ class DeviceSlot:
         # Input chain (antenna/cable/amplifier) correction sent to the SDK on every connect
         self.input_chain_name = ""
         self.input_comp = ([], [])
+        # Added to every sweep from this analyzer, to line it up with the others (dB)
+        self.level_trim_db = 0.0
         
         # RF Parameters
         self.start_freq_hz = 470e6
@@ -213,8 +215,8 @@ class MultiDeviceManager(QObject):
         if slot and slot.is_connected:
             slot.controller.configure_rta(center_freq_hz, decimate_factor, ref_level, trig_src, trig_mode, trig_time, preamp, atten)
 
-    def configure_det(self, center_freq_hz: float, decimate_factor: int = 2, ref_level: float = 0.0, trig_src: int = 2, trig_mode: int = 0, trig_length: int = 16240, trig_level=None, atten=None, preamp=None):
-        slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")
+    def configure_det(self, center_freq_hz: float, decimate_factor: int = 2, ref_level: float = 0.0, trig_src: int = 2, trig_mode: int = 0, trig_length: int = 16240, trig_level=None, atten=None, preamp=None, target_slot_id: str = None):
+        slot = self.slots.get(target_slot_id or self.focused_slot_id) or self.slots.get("slot_a")
         if slot and slot.is_connected:
             slot.controller.configure_det(center_freq_hz, decimate_factor, ref_level, trig_src, trig_mode, trig_length,
                                           trig_level, atten, preamp)
@@ -234,10 +236,11 @@ class MultiDeviceManager(QObject):
             if slot.is_connected:
                 slot.controller.stop_mscan()
 
-    def set_operating_mode(self, mode_str: str, params: dict = None):
+    def set_operating_mode(self, mode_str: str, params: dict = None, target_slot_id: str = None):
+        """target_slot_id: the analyzer to switch (default: the focused one)."""
         if mode_str.upper() != "MSCAN":
             self.stop_mscan()
-        slot = self.slots.get(self.focused_slot_id) or self.slots.get("slot_a")
+        slot = self.slots.get(target_slot_id or self.focused_slot_id) or self.slots.get("slot_a")
         if slot and slot.is_connected:
             slot.controller.set_operating_mode(mode_str, params)
 
@@ -542,10 +545,10 @@ class MultiDeviceManager(QObject):
 
     def _on_slot_amplitude_clamped(self, slot_id: str, ref: float, att: int):
         slot = self.slots.get(slot_id)
-        if slot:
+        # The slot keeps what was asked for (automatic attenuation stays automatic, and a
+        # manual attenuation its value): what the hardware made of it is only reported
+        if slot and slot.atten < 0:
             slot.ref_level = ref
-            if att >= 0:
-                slot.atten = att
         self.amplitude_clamped.emit(slot_id, ref, att)
 
     def _update_all_connection_state(self):
@@ -556,6 +559,8 @@ class MultiDeviceManager(QObject):
         slot = self.slots.get(slot_id)
         if not slot: return
         
+        if slot.level_trim_db:
+            power = np.asarray(power) + slot.level_trim_db
         slot.last_freq = freq
         slot.last_power = power
         slot.last_update_time = time.time()
@@ -578,6 +583,29 @@ class MultiDeviceManager(QObject):
             # Emit focused device sweep to main view
             if slot_id == self.focused_slot_id:
                 self.composite_sweep_ready.emit(freq, power)
+
+    SEAM_FRACTION = 0.1     # share of each sub-band, next to the seam, compared by seam_step_db
+
+    def seam_step_db(self):
+        """
+        Split sweep: how far the second analyzer's trace sits below the first's where the
+        two meet (dB, with the trims as they are), or None without both traces. The median
+        level of the tenth of each sub-band next to the seam is compared: carriers are
+        narrow against that, so it is the two noise floors that are lined up.
+        """
+        pair = [s for s in (self.slots.get("slot_a"), self.slots.get("slot_b"))
+                if s and s.is_connected and s.last_freq is not None and len(s.last_freq) > 8]
+        if self.topology != MultiDeviceTopology.SPLIT_SWEEP or len(pair) != 2:
+            return None
+        lo, hi = sorted(pair, key=lambda s: s.start_freq_hz)
+        seam = lo.stop_freq_hz
+        f_lo, p_lo = np.asarray(lo.last_freq), np.asarray(lo.last_power)
+        f_hi, p_hi = np.asarray(hi.last_freq), np.asarray(hi.last_power)
+        near_lo = (f_lo >= seam - self.SEAM_FRACTION * (lo.stop_freq_hz - lo.start_freq_hz)) & (f_lo <= seam)
+        near_hi = (f_hi >= seam) & (f_hi <= seam + self.SEAM_FRACTION * (hi.stop_freq_hz - hi.start_freq_hz))
+        if near_lo.sum() < 4 or near_hi.sum() < 4:
+            return None
+        return float(np.median(p_lo[near_lo]) - np.median(p_hi[near_hi])), hi.slot_id
 
     def _handle_split_sweep_stitching(self):
         """

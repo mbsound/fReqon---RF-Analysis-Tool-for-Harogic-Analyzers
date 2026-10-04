@@ -38,6 +38,8 @@ class SweepPanel(QWidget):
     linkViewToggled = pyqtSignal(bool)
     rfInputChanged = pyqtSignal(str)   # "auto" or an input id from the analyzer's capabilities
     settingsTargetChanged = pyqtSignal(object)   # slot id whose settings are shown, None: all analyzers
+    levelTrimChanged = pyqtSignal(str, float)    # slot id, dB added to that analyzer's trace
+    alignTracesClicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,6 +72,21 @@ class SweepPanel(QWidget):
         target_hint.setWordWrap(True)
         target_hint.setStyleSheet("color: #8b949e; font-size: 10px;")
         self.target_card.layout().addWidget(target_hint)
+
+        # Level trim: a few dB added to one analyzer's trace so that it lines up with the other's
+        trim_title = QLabel("LEVEL TRIM")
+        trim_title.setStyleSheet("color: #8b949e; font-size: 10px; font-weight: 700; margin-top: 4px;")
+        self.target_card.layout().addWidget(trim_title)
+        self._trim_row = QHBoxLayout()
+        self._trim_row.setSpacing(6)
+        self.target_card.layout().addLayout(self._trim_row)
+        self._trim_spins = {}
+        self.align_btn = QPushButton("Align at Seam")
+        self.align_btn.setToolTip(
+            "Split sweep: trim the upper analyzer so that its noise floor meets the lower one's\n"
+            "where the two halves join (the median level either side of the seam is compared).")
+        self.align_btn.clicked.connect(self.alignTracesClicked.emit)
+        self.target_card.layout().addWidget(self.align_btn)
         self.target_card.hide()
 
         # --- 1. ANALYZER SWEEP CARD ---
@@ -168,6 +185,11 @@ class SweepPanel(QWidget):
         self.link_view_check.setChecked(True)
         self.link_view_check.toggled.connect(self.linkViewToggled.emit)
         view_card.layout().addWidget(self.link_view_check)
+        self.view_locked_hint = QLabel("🔒 Follows the analyzer sweep. Zoom or drag the plot, or set the Analyzer "
+                                       "Sweep Range. Untick the link to set the view on its own.")
+        self.view_locked_hint.setWordWrap(True)
+        self.view_locked_hint.setStyleSheet("color: #8b949e; font-size: 10px;")
+        view_card.layout().addWidget(self.view_locked_hint)
         
         view_form = QFormLayout()
         view_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
@@ -198,6 +220,9 @@ class SweepPanel(QWidget):
         view_form.addRow("View Span:", self.view_span_spin)
         view_form.addRow("View Step:", self.view_step_spin)
         view_card.layout().addLayout(view_form)
+        self._view_form = view_form
+        self.link_view_check.toggled.connect(self._sync_view_fields)
+        self._sync_view_fields(self.link_view_check.isChecked())
         
         # --- 3. AMPLITUDE & GAIN CARD ---
         amp_card = self._create_card("AMPLITUDE & GAIN", layout)
@@ -747,6 +772,51 @@ class SweepPanel(QWidget):
         combo.setCurrentIndex(max(0, combo.findData(current)))
         combo.blockSignals(False)
         self.target_card.setVisible(len(entries) >= 2)
+
+    def _sync_view_fields(self, linked: bool):
+        """Linked, the view is the analyzer sweep: its fields only show it."""
+        tip = ("Linked to the analyzer sweep: zoom or drag the plot, or change the Analyzer Sweep Range.\n"
+               "Untick the link to set the view on its own.") if linked else ""
+        for spin in (self.view_start_spin, self.view_stop_spin, self.view_center_spin, self.view_span_spin,
+                     self.view_step_spin):
+            spin.setEnabled(not linked)
+            spin.setToolTip(tip)
+            self._view_form.labelForField(spin).setEnabled(not linked)     # the row's label dims with it
+        self.view_locked_hint.setVisible(linked)
+        self.link_view_check.setToolTip(
+            "Ticked: the view and the analyzer sweep are the same range. Zooming or dragging the plot retunes\n"
+            "the analyzer, and the fields below only show the range.\n"
+            "Unticked: the view zooms within the sweep without retuning the analyzer.")
+
+    def set_level_trims(self, entries: list, can_align: bool):
+        """
+        One trim control per connected analyzer: [(slot id, short label, trim dB)].
+        can_align: the analyzers share a seam (split sweep), so Align at Seam applies.
+        """
+        if [e[0] for e in entries] != list(self._trim_spins):
+            while self._trim_row.count():
+                w = self._trim_row.takeAt(0).widget()
+                if w:
+                    w.deleteLater()
+            self._trim_spins = {}
+            for slot_id, label, _trim in entries:
+                self._trim_row.addWidget(QLabel(label))
+                spin = QDoubleSpinBox()
+                spin.setRange(-40.0, 40.0)
+                spin.setDecimals(1)
+                spin.setSingleStep(0.5)
+                spin.setSuffix(" dB")
+                spin.setToolTip("Added to every sweep from this analyzer, in the trace and in everything\n"
+                                "measured from it. Use it to line two analyzers up with each other.")
+                spin.valueChanged.connect(lambda v, s=slot_id: self.levelTrimChanged.emit(s, float(v)))
+                self._trim_row.addWidget(spin, 1)
+                self._trim_spins[slot_id] = spin
+        for slot_id, _label, trim in entries:
+            spin = self._trim_spins[slot_id]
+            spin.blockSignals(True)
+            spin.setValue(trim)
+            spin.blockSignals(False)
+        self.align_btn.setVisible(can_align)
 
     def select_settings_target(self, slot_id):
         """Show slot_id as the chosen analyzer, without announcing a change."""

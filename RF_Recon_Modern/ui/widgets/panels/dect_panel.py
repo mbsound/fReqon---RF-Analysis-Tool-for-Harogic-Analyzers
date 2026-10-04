@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal
+from ..antenna_source import AntennaSourceRow
 from core.dect_analyzer import DECT_BANDS
 
 class DECTPanel(QWidget):
@@ -58,6 +59,11 @@ class DECTPanel(QWidget):
         
         # --- 1. CONFIGURATION CARD ---
         cfg_card = self._create_card("DECT INTERCOM MONITOR", layout)
+        self.antenna_row = AntennaSourceRow(
+            "Split sweep: the carrier list comes from the stitched sweep (analyzer A below the seam, B above). "
+            "The zero-span count of antennas and beltpacks is taken by analyzer A alone.",
+            "Which antenna's analyzer the carrier list and the zero-span count are taken from.")
+        cfg_card.layout().addWidget(self.antenna_row)
         
         # Band Selection: Title stacked above Combo for full width & no label collision
         band_lbl = QLabel("DECT Region / Band:")
