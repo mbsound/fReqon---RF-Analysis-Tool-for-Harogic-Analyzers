@@ -7,9 +7,9 @@ and real-time burst metrics.
 
 import numpy as np
 import pyqtgraph as pg
+from .plot_grid import install_grid
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox, QPushButton, QCheckBox
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
 
 class PowerAxisItem(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
@@ -26,8 +26,10 @@ class TimeAxisItem(pg.AxisItem):
                 strings.append(f"{val:.0f} ns")
             elif val < 1000000.0:
                 strings.append(f"{val/1000.0:.1f} us")
-            else:
+            elif val < 1000000000.0:
                 strings.append(f"{val/1000000.0:.2f} ms")
+            else:
+                strings.append(f"{val/1000000000.0:.2f} s")
         return strings
 
 
@@ -182,16 +184,23 @@ class DETView(QWidget):
         self.y_axis = PowerAxisItem(orientation='left')
         
         self.plot_item = self.glw.addPlot(axisItems={'bottom': self.x_axis, 'left': self.y_axis})
-        self.plot_item.showGrid(x=True, y=True, alpha=0.15)
+        self.plot_grid = install_grid(self.plot_item, x=True, y=True, alpha=0.15)
         self.plot_item.setMenuEnabled(False)
         self.plot_item.getViewBox().disableAutoRange()
+        self.plot_item.setLabel('left', 'Power (dBm)')
+        # The level scale is set from the reference level, not by the mouse (the wheel
+        # and drags move through time only), and time never runs before 0
+        self.plot_item.setMouseEnabled(x=True, y=False)
+        self.plot_item.hideButtons()
+        self.plot_item.getViewBox().setLimits(xMin=0)
+        self.plot_item.setLabel('bottom', 'Time')
         
         self.ref_level = 0.0
         self.bottom_level = -110.0
         self.plot_item.setYRange(self.bottom_level, self.ref_level + 5.0, padding=0)
         
         # Oscilloscope Waveform Curve (Emerald Green / Cyan)
-        self.power_curve = self.plot_item.plot(pen=pg.mkPen(color='#10b981', width=1.6), name="Power vs Time")
+        self.power_curve = self.plot_item.plot(pen=pg.mkPen(color='#10b981', width=1.0), name="Power vs Time")
         self.power_curve.setDownsampling(auto=True, method='peak')
         self.power_curve.setClipToView(True)
         
@@ -347,7 +356,11 @@ class DETView(QWidget):
         if abs(max_t - getattr(self, '_last_axis_max_t', 0.0)) > 1.0:
             self.plot_item.setXRange(0, max_t, padding=0.01)
             self._last_axis_max_t = max_t
-        if abs(ref_lvl - getattr(self, '_last_axis_ref_lvl', 999.0)) > 0.5:
+        # The bottom follows a noise floor under -110 dBm (narrow bandwidths), in 10 dB steps
+        floor = float(np.percentile(power_dbm, 5))
+        bottom = min(-110.0, 10.0 * np.floor((floor - 5.0) / 10.0))
+        if abs(ref_lvl - getattr(self, '_last_axis_ref_lvl', 999.0)) > 0.5 or bottom != self.bottom_level:
+            self.bottom_level = bottom
             self.plot_item.setYRange(self.bottom_level, ref_lvl + 5.0, padding=0)
             self._last_axis_ref_lvl = ref_lvl
         

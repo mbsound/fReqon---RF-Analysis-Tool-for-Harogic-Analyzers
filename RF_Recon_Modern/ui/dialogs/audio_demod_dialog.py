@@ -6,9 +6,10 @@ with interactive audio oscilloscope and audio FFT spectrum visualization.
 
 import numpy as np
 import pyqtgraph as pg
+from ..widgets.plot_grid import install_grid
 from PyQt6.QtWidgets import (
-    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSlider, QFrame, QDoubleSpinBox
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QSlider, QFrame
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ..widgets.freq_inputs import FreqSpinBox
@@ -105,17 +106,17 @@ class AudioDemodDialog(QDialog):
         
         # Audio Waveform Scope (Top)
         self.wave_plot = self.glw.addPlot(title="Audio Waveform (Time Domain)")
-        self.wave_plot.showGrid(x=True, y=True, alpha=0.15)
+        install_grid(self.wave_plot, x=True, y=True, alpha=0.15)
         self.wave_plot.setYRange(-1.0, 1.0)
-        self.wave_curve = self.wave_plot.plot(pen=pg.mkPen(color='#38bdf8', width=1.5))
+        self.wave_curve = self.wave_plot.plot(pen=pg.mkPen(color='#38bdf8', width=1.0))
         
         self.glw.nextRow()
         
         # Audio Spectrum (Bottom)
         self.fft_plot = self.glw.addPlot(title="Audio Spectrum (0 - 15 kHz)")
-        self.fft_plot.showGrid(x=True, y=True, alpha=0.15)
+        install_grid(self.fft_plot, x=True, y=True, alpha=0.15)
         self.fft_plot.setYRange(-40.0, 40.0)
-        self.fft_curve = self.fft_plot.plot(pen=pg.mkPen(color='#10b981', width=1.5))
+        self.fft_curve = self.fft_plot.plot(pen=pg.mkPen(color='#10b981', width=1.0))
         
         main_layout.addWidget(plot_frame)
         

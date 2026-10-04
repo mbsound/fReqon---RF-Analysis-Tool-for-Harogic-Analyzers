@@ -23,6 +23,7 @@ class DECTPanel(QWidget):
     tuneSweepClicked = pyqtSignal()
     openMatrixClicked = pyqtSignal()
     clearClicked = pyqtSignal()
+    countClicked = pyqtSignal()                 # count antennas and beltpacks with zero span
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -157,6 +158,19 @@ class DECTPanel(QWidget):
         action_layout.setContentsMargins(0, 2, 0, 0)
         action_layout.setSpacing(6)
         
+        self.count_btn = QPushButton("Count via Zero-Span")
+        self.count_btn.setObjectName("primaryActionBtn")
+        self.count_btn.setToolTip(
+            "Capture each occupied carrier in zero span for a few 10 ms frames and count the bursts: "
+            "antennas transmit a beacon in the first half of every frame, beltpacks on calls reply in the "
+            "second half. Takes a few seconds; the sweep resumes afterwards.")
+        self.count_btn.clicked.connect(self.countClicked.emit)
+        carriers_card.layout().addWidget(self.count_btn)
+        self.count_status_lbl = QLabel("")
+        self.count_status_lbl.setWordWrap(True)
+        self.count_status_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+        carriers_card.layout().addWidget(self.count_status_lbl)
+
         self.matrix_btn = QPushButton("TDMA Matrix...")
         self.matrix_btn.setToolTip("Open Full Time-Slot Matrix Inspector")
         self.matrix_btn.clicked.connect(self.openMatrixClicked.emit)
@@ -197,6 +211,11 @@ class DECTPanel(QWidget):
         self.load_val_lbl.setText(f"{load_pct:.0f}% ({status_str})")
         self.load_val_lbl.setStyleSheet(f"color: {color}; font-weight: 700; font-size: 11px; font-family: 'JetBrains Mono', monospace;")
         self.units_val_lbl.setText(f"{antennas} Ant | {beltpacks} Packs")
+
+    def set_count_status(self, text: str, busy: bool = False):
+        self.count_status_lbl.setText(text)
+        self.count_btn.setEnabled(not busy)
+        self.count_btn.setText("Counting…" if busy else "Count via Zero-Span")
 
     def _update_enable_btn_style(self):
         if self.enable_btn.isChecked():

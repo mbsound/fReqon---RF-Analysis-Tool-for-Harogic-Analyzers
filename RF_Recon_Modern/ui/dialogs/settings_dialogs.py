@@ -5,8 +5,8 @@ Provides editors for Quick Band Presets, Launch Defaults, Waterfall History, and
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QSpinBox, QFormLayout, QGroupBox, QDoubleSpinBox, QGridLayout, QWidget,
-    QCheckBox, QLineEdit, QSlider
+    QSpinBox, QFormLayout, QGroupBox, QDoubleSpinBox, QGridLayout, QCheckBox,
+    QLineEdit, QSlider
 )
 from PyQt6.QtCore import Qt
 
@@ -147,7 +147,9 @@ class LaunchSettingsDialog(QDialog):
         layout.setSpacing(12)
         
         # 1. Startup Region
-        reg_group = QGroupBox("Startup Default Region")
+        reg_group = QGroupBox("Region")
+        reg_group.setToolTip("The region whose TV channels, band presets and transmitter lookup are used, "
+                             "now and at startup")
         reg_layout = QVBoxLayout(reg_group)
         self.region_combo = QComboBox()
         self.region_combo.addItems(list(region_configs.keys()))

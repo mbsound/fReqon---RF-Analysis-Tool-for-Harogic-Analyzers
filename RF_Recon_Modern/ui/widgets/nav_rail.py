@@ -4,8 +4,8 @@ Provides quick switching between RF & Sweep, Broadcast/DTV, DECT/Intercom,
 2.4G/ShowLink, and Threats & Markers, with instant panel collapsing.
 """
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QButtonGroup, QLabel, QFrame, QHBoxLayout
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QButtonGroup, QLabel, QHBoxLayout
+from PyQt6.QtCore import pyqtSignal
 from ..icons import get_chevron_icon
 
 class NavRail(QWidget):
@@ -25,6 +25,7 @@ class NavRail(QWidget):
         ("Broadcast / DTV", "FCC/OFCOM broadcast television station lookups"),
         ("DECT / Intercom", "DECT & Riedel Bolero capacity and TDMA time slots"),
         ("2.4G / ShowLink", "ShowLink, Wireless DMX / CRMX and Wi-Fi coexistence"),
+        ("Locate", "Sensor network: where each carrier is and what it is, from several analyzers"),
     ]
 
     def __init__(self, parent=None):
@@ -84,6 +85,9 @@ class NavRail(QWidget):
                     color: #38bdf8;
                     border: 1px solid #38bdf8;
                 }
+                QPushButton:disabled {
+                    color: #484f58;
+                }
             """)
             if idx == 0:
                 btn.setChecked(True)
@@ -102,6 +106,16 @@ class NavRail(QWidget):
         else:
             self.toggle_btn.setIcon(get_chevron_icon("left", "#8b949e", 14))
         self.collapseToggled.emit(self.is_collapsed)
+
+    def set_mode_enabled(self, mode_idx: int, enabled: bool, reason: str = ""):
+        """Grey out a mode the connected analyzer cannot do; `reason` replaces its tooltip."""
+        if 0 <= mode_idx < len(self.buttons):
+            btn = self.buttons[mode_idx]
+            btn.setEnabled(enabled)
+            btn.setToolTip(self.MODES[mode_idx][1] if enabled or not reason else reason)
+
+    def is_mode_enabled(self, mode_idx: int) -> bool:
+        return 0 <= mode_idx < len(self.buttons) and self.buttons[mode_idx].isEnabled()
 
     def set_active_mode(self, mode_idx: int):
         if 0 <= mode_idx < len(self.buttons):

@@ -4,11 +4,13 @@ Supports Single Analyzer, Split-Span Cooperative Sweep, Antenna Diversity, and M
 Configures USB and Network/Ethernet slots, IP/Port, and subnet device assignment.
 """
 
+import os
+
 from PyQt6.QtWidgets import (
-    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
-    QPushButton, QLineEdit, QSpinBox, QCheckBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QStackedWidget, QButtonGroup,
-    QFrame, QComboBox, QMessageBox, QTabWidget, QGroupBox
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QStackedWidget, QButtonGroup, QFrame,
+    QComboBox, QMessageBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor
@@ -36,10 +38,37 @@ class NetworkScanThread(QThread):
         self.scan_completed.emit(devices)
 
 
+class UsbScanThread(QThread):
+    """Lists the analyzers on USB without blocking the GUI (probing a serial port takes a moment)."""
+    scan_completed = pyqtSignal(list)
+
+    def run(self):
+        self.scan_completed.emit(DeviceController.scan_usb_analyzers())
+
+
+def usb_device_label(dev: dict) -> str:
+    """One line for a scanned USB analyzer (see DeviceController.scan_usb_analyzers)."""
+    if dev["kind"] == "harogic":
+        ident = f"SN {dev['uid']:016x}" if dev.get("uid") else f"USB analyzer #{dev['usb_index'] + 1}"
+        text = f"Harogic {dev['model']:03d} · {ident}"
+    else:
+        port = os.path.basename(dev["port"])
+        if dev.get("error"):
+            return f"{port} · cannot be opened"
+        text = f"{dev.get('name') or 'Serial analyzer'} · {port}"
+    if dev.get("in_use_by"):
+        text += f"  (connected: {dev['in_use_by']})"
+    elif dev.get("busy"):
+        text += "  (in use by another program)"
+    return text
+
+
 class SlotConfigCard(QFrame):
     """
     Dedicated visual card for configuring an analyzer slot (USB or Ethernet).
     """
+    rescanRequested = pyqtSignal()
+
     def __init__(self, slot_id: str, title: str, default_alias: str = "", is_default_enabled: bool = True, parent=None):
         super().__init__(parent)
         self.slot_id = slot_id
@@ -112,23 +141,41 @@ class SlotConfigCard(QFrame):
         # Details Stack
         self.details_stack = QStackedWidget()
         
-        # USB Options
+        # USB Options: pick from the analyzers found on USB
         usb_w = QWidget()
-        usb_l = QHBoxLayout(usb_w)
-        usb_l.setContentsMargins(0, 0, 0, 0)
-        usb_l.setSpacing(8)
-        u_idx_lbl = QLabel("USB Device Index:")
-        u_idx_lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: 500;")
-        self.usb_index_spin = QSpinBox()
-        self.usb_index_spin.setRange(0, 15)
-        self.usb_index_spin.setValue(0 if slot_id == "slot_a" else 1)
-        self.usb_index_spin.setFixedWidth(100)
-        self.usb_index_spin.setFixedHeight(26)
-        self.usb_index_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        usb_l.addWidget(u_idx_lbl)
-        usb_l.addWidget(self.usb_index_spin)
-        usb_l.addStretch()
+        usb_v = QVBoxLayout(usb_w)
+        usb_v.setContentsMargins(0, 0, 0, 0)
+        usb_v.setSpacing(3)
+        usb_l = QHBoxLayout()
+        usb_l.setSpacing(6)
+        usb_lbl = QLabel("Analyzer:")
+        usb_lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: 500;")
+        self.usb_combo = QComboBox()
+        self.usb_combo.setMinimumWidth(180)
+        self.usb_combo.setFixedHeight(26)
+        self.usb_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.usb_combo.setToolTip("The analyzers found on USB: Harogic analyzers and tinySA / tinySA Ultra units.\n"
+                                  "Automatic takes them in the order found (Harogic analyzers first).")
+        self.usb_rescan_btn = QPushButton("Rescan")
+        self.usb_rescan_btn.setFixedHeight(24)
+        self.usb_rescan_btn.setToolTip("Look again for analyzers on USB")
+        self.usb_rescan_btn.clicked.connect(self.rescanRequested.emit)
+        usb_l.addWidget(usb_lbl)
+        usb_l.addWidget(self.usb_combo, 1)
+        usb_l.addWidget(self.usb_rescan_btn)
+        usb_v.addLayout(usb_l)
+        self.usb_status_lbl = QLabel("Looking for USB analyzers…")
+        self.usb_status_lbl.setWordWrap(True)
+        self.usb_status_lbl.setStyleSheet("color: #6e7681; font-size: 10px;")
+        usb_v.addWidget(self.usb_status_lbl)
         self.details_stack.addWidget(usb_w)
+        # What the slot is set to (kept while the scan runs, and when that analyzer is not plugged in)
+        self._auto_index = 0 if slot_id == "slot_a" else 1
+        self._usb_choice = None         # None: automatic; else the chosen device (as scanned)
+        self._usb_devices = []
+        self._usb_scanned = False
+        self.usb_combo.addItem(self._auto_label(), None)
+        self.usb_combo.activated.connect(self._on_usb_picked)
         
         # Network Options
         net_w = QWidget()
@@ -176,7 +223,51 @@ class SlotConfigCard(QFrame):
     def _on_intf_changed(self, btn_id: int):
         self.details_stack.setCurrentIndex(btn_id)
 
-    def set_config(self, enabled: bool, alias: str, intf: str, ip: str, port: int, usb_idx: int, model=None, uid=None):
+    # --- USB analyzer choice ---
+    def _auto_label(self) -> str:
+        return f"Automatic (USB analyzer #{self._auto_index + 1})"
+
+    @staticmethod
+    def _same_device(a: dict, b: dict) -> bool:
+        if a["kind"] != b["kind"]:
+            return False
+        if a["kind"] == "tinysa":
+            return a["port"] == b["port"]
+        if a.get("uid") and b.get("uid"):
+            return a["uid"] == b["uid"]
+        return a["usb_index"] == b["usb_index"] and a.get("model") == b.get("model")
+
+    def set_usb_devices(self, devices: list, status: str, scanned: bool = None):
+        """Fill the list with what the scan found, keeping this slot's choice selected.
+        scanned: a scan has finished (so a choice that is not in the list is missing)."""
+        if scanned is not None:
+            self._usb_scanned = scanned
+        self._usb_devices = list(devices)
+        combo = self.usb_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(self._auto_label(), None)
+        chosen = 0
+        for dev in devices:
+            combo.addItem(usb_device_label(dev), dev)
+            if dev.get("error"):
+                combo.model().item(combo.count() - 1).setEnabled(False)
+                combo.setItemData(combo.count() - 1, dev["error"], Qt.ItemDataRole.ToolTipRole)
+            elif self._usb_choice and self._same_device(dev, self._usb_choice):
+                chosen = combo.count() - 1
+        if self._usb_choice and not chosen:
+            missing = "  (not found)" if self._usb_scanned else ""
+            combo.addItem(usb_device_label(self._usb_choice) + missing, self._usb_choice)
+            chosen = combo.count() - 1
+        combo.setCurrentIndex(chosen)
+        combo.blockSignals(False)
+        self.usb_status_lbl.setText(status)
+
+    def _on_usb_picked(self, index: int):
+        self._usb_choice = self.usb_combo.itemData(index)
+
+    def set_config(self, enabled: bool, alias: str, intf: str, ip: str, port: int, usb_idx: int, model=None, uid=None,
+                   serial_port=None):
         self.enable_cb.setChecked(enabled)
         self.alias_edit.setText(alias)
         if intf.lower() == "network":
@@ -187,22 +278,41 @@ class SlotConfigCard(QFrame):
             self._on_intf_changed(0)
         self.ip_edit.setText(ip)
         self.port_spin.setValue(port)
-        self.usb_index_spin.setValue(usb_idx)
         self.target_model = model
         self.target_uid = uid
+        # The USB analyzer this slot is pinned to, if any
+        self._usb_choice = None
+        if intf.lower() == "tinysa" and serial_port:
+            self._usb_choice = {"kind": "tinysa", "port": serial_port, "name": "tinySA", "tinysa_index": usb_idx}
+        elif intf.lower() == "usb" and uid:
+            self._usb_choice = {"kind": "harogic", "usb_index": usb_idx, "model": model or 0, "uid": uid}
+        else:
+            self._auto_index = usb_idx
+        self.set_usb_devices(self._usb_devices, self.usb_status_lbl.text())
 
     def get_config(self) -> dict:
-        return {
+        cfg = {
             "slot_id": self.slot_id,
             "enabled": self.enable_cb.isChecked(),
             "alias": self.alias_edit.text().strip(),
             "interface": "network" if self.btn_net.isChecked() else "usb",
             "ip": self.ip_edit.text().strip(),
             "port": self.port_spin.value(),
-            "usb_index": self.usb_index_spin.value(),
+            "usb_index": self._auto_index,
             "target_model": self.target_model,
-            "target_uid": self.target_uid
+            "target_uid": self.target_uid,
+            "serial_port": None,
         }
+        if cfg["interface"] == "usb":
+            # Automatic: the n-th USB analyzer. Otherwise the chosen one: a Harogic
+            # analyzer by serial number (by index if the SDK gives none), a tinySA by port.
+            dev = self._usb_choice
+            cfg["target_model"] = cfg["target_uid"] = None
+            if dev and dev["kind"] == "tinysa":
+                cfg.update(interface="tinysa", serial_port=dev["port"], usb_index=dev.get("tinysa_index") or 0)
+            elif dev:
+                cfg.update(usb_index=dev["usb_index"], target_model=dev.get("model"), target_uid=dev.get("uid"))
+        return cfg
 
 
 class ConnectionDialog(QDialog):
@@ -216,6 +326,8 @@ class ConnectionDialog(QDialog):
         self.resize(720, 620)
         self.manager = manager
         self.scan_thread = None
+        self.usb_scan_thread = None
+        self._usb_devices, self._usb_status, self._usb_scanned = [], "Looking for USB analyzers…", False
         
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(16, 16, 16, 16)
@@ -266,13 +378,18 @@ class ConnectionDialog(QDialog):
         self.topo_btn_group.addButton(self.btn_single, 0)
         self.topo_btn_group.addButton(self.btn_split, 1)
         self.topo_btn_group.addButton(self.btn_diversity, 2)
+        self.btn_sensors = QPushButton("Sensor Network (N)")
+        self.btn_sensors.setObjectName("pillBtn")
+        self.btn_sensors.setCheckable(True)
         self.topo_btn_group.addButton(self.btn_multizone, 3)
+        self.topo_btn_group.addButton(self.btn_sensors, 4)
         self.topo_btn_group.idClicked.connect(self._on_topology_button_clicked)
         
         topo_btns_layout.addWidget(self.btn_single)
         topo_btns_layout.addWidget(self.btn_split)
         topo_btns_layout.addWidget(self.btn_diversity)
         topo_btns_layout.addWidget(self.btn_multizone)
+        topo_btns_layout.addWidget(self.btn_sensors)
         topo_layout.addLayout(topo_btns_layout)
         
         self.topo_desc_lbl = QLabel("Single analyzer active for standard RF sweeping.")
@@ -291,6 +408,34 @@ class ConnectionDialog(QDialog):
         slots_layout.addWidget(self.card_a)
         slots_layout.addWidget(self.card_b)
         main_layout.addLayout(slots_layout)
+        # Sensor networks: further analyzers (C, D, ...) in a second row
+        self.cards = {"slot_a": self.card_a, "slot_b": self.card_b}
+        self.extra_slots_layout = QHBoxLayout()
+        self.extra_slots_layout.setSpacing(10)
+        main_layout.addLayout(self.extra_slots_layout)
+        self.extra_row = QHBoxLayout()
+        self.add_slot_btn = QPushButton("+ Add analyzer")
+        self.add_slot_btn.setFixedHeight(24)
+        self.add_slot_btn.clicked.connect(lambda: self._add_extra_card())
+        self.remove_slot_btn = QPushButton("− Remove last")
+        self.remove_slot_btn.setFixedHeight(24)
+        self.remove_slot_btn.clicked.connect(self._remove_extra_card)
+        self.extra_row.addWidget(self.add_slot_btn)
+        self.extra_row.addWidget(self.remove_slot_btn)
+        self.extra_row.addStretch()
+        self.assign_extra_combo = QComboBox()
+        self.assign_extra_combo.setToolTip("Assign the selected discovered analyzer to this sensor slot")
+        self.assign_extra_btn = QPushButton("Assign to…")
+        self.assign_extra_btn.setFixedHeight(24)
+        self.assign_extra_btn.clicked.connect(lambda: self._assign_selected_to_slot(self.assign_extra_combo.currentData()))
+        self.extra_row.addWidget(self.assign_extra_combo)
+        self.extra_row.addWidget(self.assign_extra_btn)
+        main_layout.addLayout(self.extra_row)
+        self._set_extra_visible(False)
+        if manager is not None:
+            for sid in sorted(manager.slots):
+                if sid not in self.cards:
+                    self._add_extra_card(sid)
         
         # --- 3. DISCOVERY SUBNET CARD ---
         disc_card = QFrame()
@@ -425,6 +570,56 @@ class ConnectionDialog(QDialog):
         # Initialize from existing Manager state if present
         self._load_from_manager()
         self._populate_network_interfaces()
+        for card in (self.card_a, self.card_b):     # sensor cards are hooked up as they are added
+            card.rescanRequested.connect(self.scan_usb)
+        self.scan_usb()
+
+    # --- USB analyzers ---
+    def scan_usb(self):
+        """Look for analyzers on USB (in the background) and offer them in every slot."""
+        if self.usb_scan_thread is not None and self.usb_scan_thread.isRunning():
+            return
+        self._usb_status = "Looking for USB analyzers…"
+        for card in self.cards.values():
+            card.usb_status_lbl.setText(self._usb_status)
+            card.usb_rescan_btn.setEnabled(False)
+        self.usb_scan_thread = UsbScanThread(self)
+        self.usb_scan_thread.scan_completed.connect(self._on_usb_scan_completed)
+        self.usb_scan_thread.start()
+
+    def _on_usb_scan_completed(self, devices: list):
+        # Name the analyzers that connected slots already hold: a tinySA's port is
+        # busy (it cannot be asked what it is), and it helps to see which is which
+        for dev in devices:
+            for slot_id, slot in (self.manager.slots.items() if self.manager else ()):
+                if not slot.is_connected:
+                    continue
+                label = slot.role_alias.strip() or slot.name
+                if dev["kind"] == "tinysa" and slot.device_description.get("port") == dev["port"]:
+                    dev["in_use_by"] = label
+                    dev["name"] = (slot.capabilities or {}).get("name", "tinySA")
+                elif dev["kind"] == "harogic" and dev.get("uid") and dev["uid"] == slot.detected_uid:
+                    dev["in_use_by"] = label
+        usable = [d for d in devices if not d.get("error")]
+        harogic = sum(d["kind"] == "harogic" for d in usable)
+        tinysa = sum(d["kind"] == "tinysa" for d in usable)
+        if usable:
+            parts = ([f"{harogic} Harogic"] if harogic else []) + ([f"{tinysa} tinySA"] if tinysa else [])
+            status = "Found on USB: " + ", ".join(parts) + "."
+        else:
+            status = "No USB analyzers found. Check the cable and power, then Rescan."
+        errors = [d["error"] for d in devices if d.get("error")]
+        if errors:
+            status += " " + errors[0]
+        self._usb_devices, self._usb_status, self._usb_scanned = devices, status, True
+        for card in self.cards.values():
+            card.set_usb_devices(devices, status, scanned=True)
+            card.usb_rescan_btn.setEnabled(True)
+
+    def done(self, result):
+        if self.usb_scan_thread is not None:
+            self.usb_scan_thread.wait(3000)     # a scan in progress must not outlive the dialog
+        super().done(result)
 
     def _load_from_manager(self):
         if not self.manager:
@@ -442,6 +637,9 @@ class ConnectionDialog(QDialog):
         elif topo == MultiDeviceTopology.INDEPENDENT:
             self.btn_multizone.setChecked(True)
             self._on_topology_button_clicked(3)
+        elif topo == MultiDeviceTopology.SENSOR_NET:
+            self.btn_sensors.setChecked(True)
+            self._on_topology_button_clicked(4)
         else:
             self.btn_single.setChecked(True)
             self._on_topology_button_clicked(0)
@@ -451,7 +649,7 @@ class ConnectionDialog(QDialog):
             self.card_a.set_config(
                 slot_a.is_enabled, slot_a.role_alias, slot_a.interface_type,
                 slot_a.ip_address, slot_a.port, slot_a.usb_index,
-                slot_a.target_model, slot_a.target_uid
+                slot_a.target_model, slot_a.target_uid, slot_a.serial_port
             )
             
         slot_b = self.manager.slots.get("slot_b")
@@ -459,10 +657,56 @@ class ConnectionDialog(QDialog):
             self.card_b.set_config(
                 slot_b.is_enabled, slot_b.role_alias, slot_b.interface_type,
                 slot_b.ip_address, slot_b.port, slot_b.usb_index,
-                slot_b.target_model, slot_b.target_uid
+                slot_b.target_model, slot_b.target_uid, slot_b.serial_port
             )
 
+    def _set_extra_visible(self, visible: bool):
+        for sid, card in self.cards.items():
+            if sid not in ("slot_a", "slot_b"):
+                card.setVisible(visible)
+        for w in (self.add_slot_btn, self.remove_slot_btn, self.assign_extra_combo, self.assign_extra_btn):
+            w.setVisible(visible)
+
+    def _add_extra_card(self, slot_id: str = None):
+        if slot_id is None:
+            n = len(self.cards)
+            if n >= 16:
+                return
+            slot_id = f"slot_{chr(ord('a') + n)}"
+        if slot_id in self.cards:
+            return
+        letter = slot_id.split("_")[-1].upper()
+        card = SlotConfigCard(slot_id, f"SENSOR {letter}", "", True, self)
+        card.btn_net.setChecked(True); card._on_intf_changed(1)
+        card.ip_edit.setText(f"192.168.1.{50 + len(self.cards)}")
+        if self.manager is not None:
+            slot = self.manager.ensure_slot(slot_id)
+            card.set_config(slot.is_enabled or True, slot.role_alias, slot.interface_type, slot.ip_address,
+                            slot.port, slot.usb_index, slot.target_model, slot.target_uid, slot.serial_port)
+        else:
+            card._auto_index = len(self.cards)
+        card.set_usb_devices(self._usb_devices, self._usb_status, scanned=self._usb_scanned)
+        card.rescanRequested.connect(self.scan_usb)
+        self.cards[slot_id] = card
+        self.extra_slots_layout.addWidget(card)
+        self.assign_extra_combo.addItem(f"Sensor {letter}", slot_id)
+        card.setVisible(getattr(self, "selected_topology", None) == MultiDeviceTopology.SENSOR_NET)
+
+    def _remove_extra_card(self):
+        extra = [sid for sid in self.cards if sid not in ("slot_a", "slot_b")]
+        if not extra:
+            return
+        sid = sorted(extra)[-1]
+        card = self.cards.pop(sid)
+        self.extra_slots_layout.removeWidget(card); card.deleteLater()
+        i = self.assign_extra_combo.findData(sid)
+        if i >= 0:
+            self.assign_extra_combo.removeItem(i)
+        if self.manager is not None:
+            self.manager.remove_slot(sid)
+
     def _on_topology_button_clicked(self, btn_id: int):
+        self._set_extra_visible(btn_id == 4)
         if btn_id == 1:
             self.selected_topology = MultiDeviceTopology.SPLIT_SWEEP
             self.topo_desc_lbl.setText("Split Span: Automatically divides wide sweep spans across 2 analyzers on the same antenna, doubling sweep frame rate (2x speed).")
@@ -495,6 +739,18 @@ class ConnectionDialog(QDialog):
             self.assign_b_btn.setText("Assign to Slot B")
             self.assign_b_btn.show()
             self.connect_btn.setText("Connect All Active")
+        elif btn_id == 4:
+            self.selected_topology = MultiDeviceTopology.SENSOR_NET
+            self.topo_desc_lbl.setText("Sensor Network: any number of analyzers sweep the same span from known "
+                                       "positions; the Locate mode estimates where each carrier is and what it is.")
+            for sid, card in self.cards.items():
+                card.enable_cb.setText(f"SENSOR {sid.split('_')[-1].upper()}")
+                card.alias_edit.setPlaceholderText("Sensor name (e.g. Stage Left)")
+                card.show()
+            self.card_a.enable_cb.setChecked(True)
+            self.assign_a_btn.setText("Assign to A"); self.assign_a_btn.show()
+            self.assign_b_btn.setText("Assign to B"); self.assign_b_btn.show()
+            self.connect_btn.setText("Connect All Sensors")
         elif btn_id == 3:
             self.selected_topology = MultiDeviceTopology.INDEPENDENT
             self.topo_desc_lbl.setText("Multi-Zone Roles: Analyzers run completely independent frequency ranges and parameters, routing directly to bound analysis modules.")
@@ -606,8 +862,9 @@ class ConnectionDialog(QDialog):
         self.scan_status_lbl.setStyleSheet("color: #10b981; font-size: 10px;")
         
         for r_idx, dev in enumerate(devices):
-            m_item = QTableWidgetItem(f"Model {dev['model']:03d}")
-            s_item = QTableWidgetItem(f"{dev['uid']:016x}")
+            # Network scans can't identify the analyzer; it is read on connect
+            m_item = QTableWidgetItem(f"Model {dev['model']:03d}" if dev.get('model') is not None else "Harogic")
+            s_item = QTableWidgetItem(f"{dev['uid']:016x}" if dev.get('uid') is not None else "read on connect")
             h_text = dev.get('hostname') or dev.get('alias') or "--"
             h_item = QTableWidgetItem(h_text)
             ip_item = QTableWidgetItem(dev['ip'])
@@ -615,7 +872,10 @@ class ConnectionDialog(QDialog):
             nic_item = QTableWidgetItem(dev.get('interface', ''))
             
             is_cal = dev.get('is_calibrated', False)
-            if is_cal:
+            if is_cal is None:
+                cal_item = QTableWidgetItem("Checked on connect")
+                cal_item.setForeground(QColor("#8b949e"))
+            elif is_cal:
                 cal_item = QTableWidgetItem("[OK] Ready")
                 cal_item.setForeground(QColor("#10b981"))
             else:
@@ -648,7 +908,9 @@ class ConnectionDialog(QDialog):
         dev = m_item.data(Qt.ItemDataRole.UserRole)
         if not dev: return
         
-        target_card = self.card_a if target_slot_id == "slot_a" else self.card_b
+        target_card = self.cards.get(target_slot_id)
+        if target_card is None:
+            return
         target_card.btn_net.setChecked(True)
         target_card._on_intf_changed(1)
         # Use hostname if available, else IP
@@ -658,7 +920,8 @@ class ConnectionDialog(QDialog):
         target_card.enable_cb.setChecked(True)
         
         assigned_name = dev.get('hostname') or dev['ip']
-        self.scan_status_lbl.setText(f"Assigned Model {dev['model']:03d} ({assigned_name}) to {target_card.enable_cb.text()}.")
+        what = f"Model {dev['model']:03d}" if dev.get('model') is not None else "analyzer"
+        self.scan_status_lbl.setText(f"Assigned {what} ({assigned_name}) to {target_card.enable_cb.text()}.")
         self.scan_status_lbl.setStyleSheet("color: #38bdf8; font-size: 10px;")
 
     def _on_connect_clicked(self):
@@ -668,8 +931,5 @@ class ConnectionDialog(QDialog):
         return {
             "topology": getattr(self, "selected_topology", MultiDeviceTopology.SINGLE),
             "remember": self.remember_cb.isChecked(),
-            "slots": {
-                "slot_a": self.card_a.get_config(),
-                "slot_b": self.card_b.get_config()
-            }
+            "slots": {sid: card.get_config() for sid, card in self.cards.items()}
         }

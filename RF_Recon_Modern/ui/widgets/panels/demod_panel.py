@@ -10,7 +10,7 @@ Provides controls for:
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QDoubleSpinBox, QSpinBox, QFrame, QScrollArea, QGridLayout
+    QDoubleSpinBox, QFrame, QScrollArea, QGridLayout
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ..freq_inputs import FreqSpinBox

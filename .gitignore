@@ -49,3 +49,21 @@ Image Files/
 Old Resources/
 Screenshots/
 Soundbase Resources/
+
+# Native macOS SDK build (copied from macos_port/dist)
+RF_Recon_Modern/lib/macos/
+
+# Calibration files are specific to each analyzer and are not distributed with
+# fReqon. Analyzers supply their RF/IF calibration when they connect; extras
+# (ampcomp, licences) are imported with the Calibration Manager.
+**/CalFile
+**/CalFile/
+*_rfacal.txt
+*_ifacal.txt
+*ampcomp.txt
+*.lic
+
+# Working notes kept out of the public repository
+BUGS.md
+STATUS.md
+docs/LOCATE_TDOA.md

@@ -7,11 +7,13 @@ multiplying horizontal pixel density by 2x-8x for high-resolution narrowband RF 
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QFrame, QSizePolicy, QScrollArea
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QFrame, QScrollArea
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from .channel_marker_bar import MHzAxisItem, ChannelMarkerBar
+from .plot_grid import install_grid
+from .channel_style import channel_kind, mask_brush_pen
 from core.constants import COLORMAP_CSS, WATERFALL_COLORMAPS
 
 class WaterfallRowStrip(QWidget):
@@ -76,7 +78,7 @@ class WaterfallRowStrip(QWidget):
         self.plot_widget = pg.PlotWidget(axisItems={'bottom': MHzAxisItem(orientation='bottom')})
         self.plot_widget.setBackground('#0d1117')
         self.plot_widget.setLabel('left', 'Sweeps', units='')
-        self.plot_widget.showGrid(x=True, y=False, alpha=0.15)
+        self.plot_grid = install_grid(self.plot_widget, x=True, y=False, alpha=0.15)
         self.plot_widget.hideButtons()
         self.plot_widget.getViewBox().setMouseEnabled(x=False, y=False)
         self.plot_widget.getViewBox().disableAutoRange()
@@ -190,7 +192,7 @@ class WaterfallRowStrip(QWidget):
                     ch_idx = ch - s_ch
                     f1 = s_f + (ch_idx * sp)
                     f2 = f1 + sp
-                    all_channels.append((ch, f1, f2, "dtv"))
+                    all_channels.append((ch, f1, f2, band.get("type", "dtv")))
 
         for ch_id, f_start, f_stop, ch_type in all_channels:
             is_active = active_dict.get(ch_id, False)
@@ -203,24 +205,8 @@ class WaterfallRowStrip(QWidget):
                         self.channel_masks[ch_id].setVisible(False)
                     continue
 
-            if is_ps:
-                brush = pg.mkBrush(QColor(239, 68, 68, 40))
-                pen = pg.mkPen(QColor(248, 113, 113, 120), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
-                brush = pg.mkBrush(QColor(100, 116, 139, 50))
-                pen = pg.mkPen(QColor(148, 163, 184, 130), width=1.5, style=Qt.PenStyle.DashLine)
-            elif ch_type == "uplink":
-                brush = pg.mkBrush(QColor(236, 72, 153, 35))
-                pen = pg.mkPen(QColor(244, 114, 182, 110), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "downlink":
-                brush = pg.mkBrush(QColor(168, 85, 247, 35))
-                pen = pg.mkPen(QColor(192, 132, 252, 110), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "guard":
-                brush = pg.mkBrush(QColor(100, 116, 139, 30))
-                pen = pg.mkPen(QColor(148, 163, 184, 90), width=1, style=Qt.PenStyle.DashLine)
-            else:
-                brush = pg.mkBrush(QColor(6, 182, 212, 35))
-                pen = pg.mkPen(QColor(6, 182, 212, 110), width=1, style=Qt.PenStyle.DashLine)
+            kind = channel_kind(ch_type, is_ps)
+            brush, pen = mask_brush_pen(kind)
 
             if is_active:
                 if ch_id not in self.channel_masks:
@@ -467,6 +453,12 @@ class MultiRowWaterfallView(QWidget):
             sub_f_stop = self._last_f_start_mhz + (i + 1) * span_per_row if i < self.num_rows - 1 else self._last_f_stop_mhz
             sub_buf = self._last_master_buffer[:, c_start:c_end]
             strip.update_strip(sub_buf.T, sub_f_start, sub_f_stop)
+
+    def clear_data(self):
+        """Empty every strip (no analyzer is supplying sweeps)."""
+        self._last_master_buffer = None
+        for s in self.strips:
+            s.img_item.clear()
 
     def update_sweep_data(self, master_buffer: np.ndarray, f_start_mhz: float, f_stop_mhz: float):
         """

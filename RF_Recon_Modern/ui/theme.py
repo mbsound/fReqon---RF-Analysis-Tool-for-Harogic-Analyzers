@@ -4,10 +4,7 @@ Provides professional dark-mode stylesheets, color palettes, and styling constan
 Zero emojis, clean vector aesthetics, crisp typography, and high-contrast precision readouts.
 """
 
-import os
 from pathlib import Path
-from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtCore import Qt
 
 # Vector Asset Path Resolution & Auto-Generation
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"

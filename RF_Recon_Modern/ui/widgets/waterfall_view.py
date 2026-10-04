@@ -5,10 +5,12 @@ and synchronized frequency axis tracking.
 """
 
 import pyqtgraph as pg
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QSlider, QMenu
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QMenu
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor
+from PyQt6.QtGui import QColor
 from .channel_marker_bar import MHzAxisItem, ChannelMarkerBar
+from .plot_grid import install_grid
+from .channel_style import channel_kind, mask_brush_pen
 from core.constants import COLORMAP_CSS, WATERFALL_COLORMAPS
 
 class WaterfallView(QWidget):
@@ -62,7 +64,7 @@ class WaterfallView(QWidget):
         self.waterfall_widget = pg.PlotWidget(axisItems={'bottom': MHzAxisItem(orientation='bottom')})
         self.waterfall_widget.setBackground('#0d1117')
         self.waterfall_widget.setLabel('left', 'History', units='Sweeps')
-        self.waterfall_widget.showGrid(x=True, y=False, alpha=0.15)
+        self.plot_grid = install_grid(self.waterfall_widget, x=True, y=False, alpha=0.15)
         self.waterfall_widget.hideButtons()
         self.waterfall_widget.getViewBox().setMouseEnabled(x=True, y=False)
         self.waterfall_widget.getViewBox().disableAutoRange()
@@ -186,6 +188,11 @@ class WaterfallView(QWidget):
         self.history_depth = max(10, int(depth))
         self.waterfall_widget.setYRange(0, self.history_depth, padding=0)
 
+    def clear_image(self):
+        """Empty the waterfall (no analyzer is supplying sweeps)."""
+        self.waterfall_img.clear()
+        self._last_rect = None
+
     def update_image(self, img_data, rect_tuple):
         # rect_tuple: (x, y, w, h)
         if len(rect_tuple) == 4 and (rect_tuple[2] <= 0 or rect_tuple[3] <= 0):
@@ -220,30 +227,14 @@ class WaterfallView(QWidget):
                     ch_idx = ch - s_ch
                     f1 = s_f + (ch_idx * sp)
                     f2 = f1 + sp
-                    all_channels.append((ch, f1, f2, "dtv"))
+                    all_channels.append((ch, f1, f2, band.get("type", "dtv")))
 
         for ch_id, f_start, f_stop, ch_type in all_channels:
             is_active = active_dict.get(ch_id, False)
             is_ps = ps_dict.get(ch_id, False)
 
-            if is_ps:
-                brush = pg.mkBrush(QColor(239, 68, 68, 40))
-                pen = pg.mkPen(QColor(248, 113, 113, 120), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "ch37" or ch_id == 37 or str(ch_id).strip() == "37":
-                brush = pg.mkBrush(QColor(100, 116, 139, 50))
-                pen = pg.mkPen(QColor(148, 163, 184, 130), width=1.5, style=Qt.PenStyle.DashLine)
-            elif ch_type == "uplink":
-                brush = pg.mkBrush(QColor(236, 72, 153, 35))
-                pen = pg.mkPen(QColor(244, 114, 182, 110), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "downlink":
-                brush = pg.mkBrush(QColor(168, 85, 247, 35))
-                pen = pg.mkPen(QColor(192, 132, 252, 110), width=1, style=Qt.PenStyle.DashLine)
-            elif ch_type == "guard":
-                brush = pg.mkBrush(QColor(100, 116, 139, 30))
-                pen = pg.mkPen(QColor(148, 163, 184, 90), width=1, style=Qt.PenStyle.DashLine)
-            else:
-                brush = pg.mkBrush(QColor(6, 182, 212, 35))
-                pen = pg.mkPen(QColor(6, 182, 212, 110), width=1, style=Qt.PenStyle.DashLine)
+            kind = channel_kind(ch_type, is_ps)
+            brush, pen = mask_brush_pen(kind)
 
             if is_active:
                 if ch_id not in self.channel_masks:

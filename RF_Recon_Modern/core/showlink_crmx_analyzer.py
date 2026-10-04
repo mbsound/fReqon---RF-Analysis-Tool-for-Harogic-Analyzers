@@ -1,7 +1,8 @@
 """
-showlink_crmx_analyzer.py - 2.4 GHz ShowLink & Wireless DMX (CRMX / W-DMX) Coexistence Engine
-Provides real-time ShowLink channel health ratings, Wi-Fi 1/6/11 footprint mapping,
-and CRMX / FHSS hopping density analysis for live entertainment RF coordination.
+showlink_crmx_analyzer.py - 2.4 GHz ShowLink & Wireless DMX (CRMX / W-DMX) coexistence engine.
+Per ShowLink (802.15.4) channel: how busy, with what (Wi-Fi, hopping, wideband), and
+how the channel in use is doing; all 13 Wi-Fi channels; airtime from zero span.
+The analysis itself is core/band24.py.
 """
 
 import time
@@ -9,49 +10,52 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
-    QGridLayout, QFrame, QWidget, QScrollArea, QProgressBar
+    QGroupBox, QGridLayout, QFrame, QProgressBar
 )
-from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QFont
 
-SHOWLINK_CHANNELS = {
-    11: {"freq_mhz": 2405.0, "wifi_overlap": "Wi-Fi 1"},
-    12: {"freq_mhz": 2410.0, "wifi_overlap": "Wi-Fi 1"},
-    13: {"freq_mhz": 2415.0, "wifi_overlap": "Wi-Fi 1"},
-    14: {"freq_mhz": 2420.0, "wifi_overlap": "Wi-Fi 1"},
-    15: {"freq_mhz": 2425.0, "wifi_overlap": "None (Clean Gap 1-6)"},
-    16: {"freq_mhz": 2430.0, "wifi_overlap": "Wi-Fi 6"},
-    17: {"freq_mhz": 2435.0, "wifi_overlap": "Wi-Fi 6"},
-    18: {"freq_mhz": 2440.0, "wifi_overlap": "Wi-Fi 6"},
-    19: {"freq_mhz": 2445.0, "wifi_overlap": "Wi-Fi 6"},
-    20: {"freq_mhz": 2450.0, "wifi_overlap": "None (Clean Gap 6-11)"},
-    21: {"freq_mhz": 2455.0, "wifi_overlap": "Wi-Fi 11"},
-    22: {"freq_mhz": 2460.0, "wifi_overlap": "Wi-Fi 11"},
-    23: {"freq_mhz": 2465.0, "wifi_overlap": "Wi-Fi 11"},
-    24: {"freq_mhz": 2470.0, "wifi_overlap": "Wi-Fi 11"},
-    25: {"freq_mhz": 2475.0, "wifi_overlap": "None (Upper Edge)"},
-    26: {"freq_mhz": 2480.0, "wifi_overlap": "None (Top Edge / Best)"}
-}
+from . import band24
 
-WIFI_2G_CHANNELS = {
-    1: {"name": "Wi-Fi Ch 1", "center_mhz": 2412.0, "start_mhz": 2401.0, "stop_mhz": 2423.0},
-    6: {"name": "Wi-Fi Ch 6", "center_mhz": 2437.0, "start_mhz": 2426.0, "stop_mhz": 2448.0},
-    11: {"name": "Wi-Fi Ch 11", "center_mhz": 2462.0, "start_mhz": 2451.0, "stop_mhz": 2473.0}
-}
+# ShowLink (802.15.4 / Zigbee) channels 11-26 and which Wi-Fi channels of the usual
+# three (1, 6, 11) sit on top of each; the monitor itself looks at all 13 Wi-Fi channels
+def _overlap_label(cf):
+    for n in (1, 6, 11):
+        if abs(band24.WIFI_CHANNELS[n] - cf) < 11.0:
+            return f"Wi-Fi {n}"
+    return {2425.0: "None (Clean Gap 1-6)", 2450.0: "None (Clean Gap 6-11)",
+            2475.0: "None (Upper Edge)", 2480.0: "None (Top Edge / Best)"}.get(cf, "None")
+
+
+SHOWLINK_CHANNELS = {k: {"freq_mhz": cf, "wifi_overlap": _overlap_label(cf)} for k, cf in band24.ZIGBEE_CHANNELS.items()}
+
+WIFI_2G_CHANNELS = {n: {"name": f"Wi-Fi Ch {n}", "center_mhz": cf, "start_mhz": cf - 10.0, "stop_mhz": cf + 10.0}
+                    for n, cf in band24.WIFI_CHANNELS.items()}
+
 
 class ShowLinkCRMXEngine(QObject):
     """
-    Engine that analyzes 2.4 GHz spectrum sweeps to evaluate Shure ShowLink channels,
-    Wi-Fi congestion footprints, and Wireless DMX (CRMX/W-DMX) hopping activity.
+    What is on the 2.4 GHz band (core/band24.py): per ShowLink channel how often it
+    is busy and with what (Wi-Fi, hopping, wideband, Zigbee), per Wi-Fi channel how
+    busy it is, how the chosen ShowLink channel is doing, and the airtime of a
+    channel from a zero-span capture.
     """
     analysis_updated = pyqtSignal(dict)
+
+    WINDOW_SWEEPS = 50
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.is_enabled = False
         self.threshold_dbm = -80.0
-        self.channel_stats = {} # {ch: {"freq_mhz": float, "peak_dbm": float, "avg_dbm": float, "status": str, "color": str}}
-        self.wifi_stats = {} # {wifi_ch: {"peak_dbm": float, "avg_dbm": float, "active": bool}}
+        self.my_channel = None               # the ShowLink channel to judge; None: the one seen on the air
+        self.detected_channel = None         # where Zigbee-shaped traffic is seen most
+        self.monitor = band24.Band24Monitor(self.WINDOW_SWEEPS)
+        self.channel_stats = {}              # {ch: {...}} as the panel and map show them
+        self.wifi_stats = {}                 # {n: {"name", "center_mhz", "peak_dbm", "busy_pct", "active"}}
+        self.mix = {}
+        self.assessment = None
+        self.feasibility = {"clear": [], "verdict": "UNKNOWN", "wifi_in_use": [], "disable": []}
+        self.survey_text = ""
+        self.airtime = {}                    # {ch: {"busy_pct", "bursts", "median_us", "longest_us", "time"}}
         self.crmx_activity_pct = 0.0
         self.best_channels = []
         self._last_time = 0.0
@@ -64,111 +68,105 @@ class ShowLinkCRMXEngine(QObject):
     def set_threshold(self, threshold_dbm):
         self.threshold_dbm = float(threshold_dbm)
 
+    def set_my_channel(self, ch):
+        """ch: a ShowLink channel 11-26 to judge, or None / 0 for the one detected on the air."""
+        self.my_channel = int(ch) if ch else None
+        if self.monitor.sweeps:
+            self._publish(time.time())
+
+    @property
+    def judged_channel(self):
+        return self.my_channel or self.detected_channel
+
     def reset_data(self):
+        self.monitor.reset()
         self.channel_stats.clear()
         self.wifi_stats.clear()
+        self.airtime.clear()
+        self.mix = {}
+        self.assessment = None
         self.crmx_activity_pct = 0.0
         self.best_channels.clear()
 
     def process_sweep_data(self, freq_hz_array, power_dbm_array):
-        """
-        Analyzes real incoming 2.4 GHz sweep data.
-        """
         if not self.is_enabled or len(freq_hz_array) == 0 or len(power_dbm_array) == 0:
             return
-
         now = time.time()
         if now - self._last_time < 0.08:
             return
         self._last_time = now
-
-        freq_mhz = np.asarray(freq_hz_array) / 1e6
-        power_dbm = np.asarray(power_dbm_array)
-
-        # Ensure sweep covers 2.4 GHz band
-        if freq_mhz[-1] < 2400.0 or freq_mhz[0] > 2483.5:
+        if self.monitor.update(np.asarray(freq_hz_array) / 1e6, power_dbm_array, self.threshold_dbm) is None:
             return
+        self._publish(now)
 
-        # 1. Analyze Wi-Fi 1, 6, 11 Power Footprints
-        for w_ch, w_info in WIFI_2G_CHANNELS.items():
-            mask = (freq_mhz >= w_info["start_mhz"]) & (freq_mhz <= w_info["stop_mhz"])
-            if np.any(mask):
-                w_pwr = power_dbm[mask]
-                w_peak = float(np.max(w_pwr))
-                w_avg = float(np.mean(w_pwr))
-                self.wifi_stats[w_ch] = {
-                    "name": w_info["name"],
-                    "peak_dbm": w_peak,
-                    "avg_dbm": w_avg,
-                    "active": w_peak >= self.threshold_dbm
-                }
+    def process_zero_span(self, center_freq_hz, time_ns, power_dbm):
+        """Airtime of the ShowLink channel a zero-span capture was taken on; None if off any."""
+        ch = min(band24.ZIGBEE_CHANNELS, key=lambda c: abs(band24.ZIGBEE_CHANNELS[c] * 1e6 - center_freq_hz))
+        if abs(band24.ZIGBEE_CHANNELS[ch] * 1e6 - center_freq_hz) > 1.5e6:
+            return None
+        a = band24.airtime(np.asarray(time_ns, dtype=float) * 1e-9, power_dbm, self.threshold_dbm)
+        if a is None:
+            return None
+        prev = self.airtime.get(ch)
+        if prev and time.time() - prev["time"] < 10.0:
+            # Several captures in a row: average the airtime, keep the longest burst
+            n = prev["captures"] + 1
+            a["busy_pct"] = (prev["busy_pct"] * prev["captures"] + a["busy_pct"]) / n
+            a["bursts"] += prev["bursts"]
+            a["longest_us"] = max(a["longest_us"], prev["longest_us"])
+            a["captures"] = n
+        else:
+            a["captures"] = 1
+        a["time"] = time.time()
+        a["ch"] = ch
+        self.airtime[ch] = a
+        self._publish(time.time())
+        return a
 
-        # 2. Analyze all 16 ShowLink Channels (Ch 11–26, 2 MHz BW each)
-        for ch, s_info in SHOWLINK_CHANNELS.items():
-            cf = s_info["freq_mhz"]
-            mask = (freq_mhz >= cf - 1.0) & (freq_mhz <= cf + 1.0)
-            if not np.any(mask):
-                continue
-
-            c_pwr = power_dbm[mask]
-            peak_val = float(np.max(c_pwr))
-            avg_val = float(np.mean(c_pwr))
-            overlap = s_info["wifi_overlap"]
-
-            # Determine Health Status
-            if peak_val >= self.threshold_dbm:
-                if "Wi-Fi" in overlap:
-                    status = "🔴 CONGESTED (Wi-Fi Overlap)"
-                    color = "#e53935"
-                else:
-                    status = "🟡 ACTIVE RF / CRMX Hopping"
-                    color = "#fbc02d"
-            elif peak_val >= self.threshold_dbm - 10.0:
-                status = "🟡 MODERATE NOISE"
-                color = "#ffb300"
+    def _publish(self, now):
+        s = self.monitor.summary()
+        self.mix = s["mix"]
+        self.channel_stats = {}
+        for ch, z in s["zigbee"].items():
+            busy, other = z["busy_pct"], z["interference_pct"]
+            kinds = {k: v for k, v in z["kinds"].items() if v >= 2.0}
+            what = ", ".join(band24.KIND_LABEL[k] for k, _v in sorted(kinds.items(), key=lambda kv: -kv[1]))
+            if z["kinds"].get("continuous", 0) + z["kinds"].get("wide", 0) >= 20.0:
+                status, color = f"🔴 WIDEBAND ENERGY {busy:.0f}%", "#e53935"
+            elif other >= 35.0:
+                status, color = f"🔴 CONGESTED {other:.0f}% ({what})", "#e53935"
+            elif other >= 10.0:
+                status, color = f"🟡 MODERATE {other:.0f}% ({what})", "#ffb300"
+            elif busy >= 10.0:
+                status, color = f"🔵 ZIGBEE {busy:.0f}%", "#38bdf8"
+            elif "None" in SHOWLINK_CHANNELS[ch]["wifi_overlap"]:
+                status, color = f"🟢 EXCELLENT {busy:.0f}%", "#00e676"
             else:
-                if "None" in overlap:
-                    status = "🟢 EXCELLENT (Clean Gap)"
-                    color = "#00e676"
-                else:
-                    status = "🟢 CLEAR (Low Traffic)"
-                    color = "#66bb6a"
-
+                status, color = f"🟢 CLEAR {busy:.0f}%", "#66bb6a"
             self.channel_stats[ch] = {
-                "ch": ch,
-                "freq_mhz": cf,
-                "peak_dbm": peak_val,
-                "avg_dbm": avg_val,
-                "overlap": overlap,
-                "status": status,
-                "color": color
+                "ch": ch, "freq_mhz": z["freq_mhz"], "peak_dbm": z["peak_dbm"], "avg_dbm": z["mean_peak_dbm"],
+                "busy_pct": busy, "interference_pct": other, "kinds": z["kinds"], "what": what,
+                "wifi_channels": z["wifi"], "overlap": SHOWLINK_CHANNELS[ch]["wifi_overlap"],
+                "status": status, "color": color, "airtime": self.airtime.get(ch),
             }
-
-        # 3. Detect CRMX / Frequency-Hopping Spread Spectrum Activity
-        # CRMX causes uniform intermittent energy bursts across the entire 2.4 GHz band
-        in_band_mask = (freq_mhz >= 2402.0) & (freq_mhz <= 2480.0)
-        if np.any(in_band_mask):
-            band_pwr = power_dbm[in_band_mask]
-            active_bins = np.sum(band_pwr >= self.threshold_dbm)
-            total_bins = len(band_pwr)
-            self.crmx_activity_pct = min(100.0, float((active_bins / max(1, total_bins)) * 100.0 * 2.5))
-
-        # 4. Rank Best ShowLink Channels (Lowest peak power + non-overlapping Wi-Fi preferred)
-        ranked = sorted(
-            self.channel_stats.values(),
-            key=lambda x: (x["peak_dbm"], 0 if "None" in x["overlap"] else 1)
-        )
-        self.best_channels = [c["ch"] for c in ranked[:3]]
-
-        result = {
-            "channels": self.channel_stats,
-            "wifi": self.wifi_stats,
-            "crmx_activity_pct": self.crmx_activity_pct,
-            "best_channels": self.best_channels,
-            "threshold_dbm": self.threshold_dbm,
-            "timestamp": now
-        }
-        self.analysis_updated.emit(result)
+        self.wifi_stats = {n: {"name": f"Wi-Fi Ch {n}", "center_mhz": w["center_mhz"], "peak_dbm": w["peak_dbm"],
+                               "avg_dbm": w["peak_dbm"], "busy_pct": w["busy_pct"], "active": w["busy_pct"] >= 10.0}
+                           for n, w in s["wifi"].items()}
+        self.crmx_activity_pct = s["mix"].get("hop", 0.0)
+        self.detected_channel = band24.showlink_channel(s)
+        judged = self.judged_channel
+        self.assessment = band24.assess(s, judged) if judged else None
+        self.feasibility = band24.feasibility(s)
+        self.survey_text = band24.survey_text(s, self.feasibility, self.detected_channel)
+        self.best_channels = (list(self.assessment["alternatives"]) if self.assessment
+                              else [c for c, _s in sorted(s["zigbee"].items(), key=lambda kv: kv[1]["busy_pct"])][:3])
+        self.analysis_updated.emit({
+            "channels": self.channel_stats, "wifi": self.wifi_stats, "mix": self.mix,
+            "my_channel": judged, "detected_channel": self.detected_channel, "assessment": self.assessment,
+            "feasibility": self.feasibility, "survey_text": self.survey_text,
+            "crmx_activity_pct": self.crmx_activity_pct, "best_channels": self.best_channels,
+            "sweeps": s["sweeps"], "threshold_dbm": self.threshold_dbm, "timestamp": now,
+        })
 
 
 class ShowlinkMapDialog(QDialog):

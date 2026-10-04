@@ -5,13 +5,11 @@ drag-and-drop ingestion, manual file mapping, alias renaming, and active staging
 Strict zero-emoji professional industrial test & measurement aesthetic.
 """
 
-import os
-import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QMessageBox,
-    QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QInputDialog,
-    QSplitter, QWidget, QScrollArea, QSizePolicy
+    QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QInputDialog, QSplitter,
+    QWidget, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor
@@ -562,17 +560,20 @@ class CalibrationManagerDialog(QDialog):
             self.status_msg_lbl.setText(msg)
             self._refresh_selected_device()
         else:
-            # Try auto-importing across library
+            # No device selected: import what was dropped (folders in full, files
+            # individually), identifying each device from the filenames
             count = 0
+            files = []
             for fp in file_paths:
                 p = Path(fp)
                 if p.is_dir():
                     c, _ = self.cal_manager.import_from_directory(str(p))
                     count += c
                 elif p.is_file():
-                    c, _ = self.cal_manager.import_from_directory(str(p.parent))
-                    count += c
-                    break
+                    files.append(str(p))
+            if files:
+                c, _ = self.cal_manager.import_files(files)
+                count += c
             self.status_msg_lbl.setText(f"Imported {count} file(s) into calibration library.")
             self._populate_devices_table()
 
@@ -580,9 +581,7 @@ class CalibrationManagerDialog(QDialog):
         if not self.selected_device:
             self._populate_devices_table()
             return
-        m = self.selected_device["model"]
-        u = self.selected_device["uid"]
-        self.target_uid = u
+        self.target_uid = self.selected_device["uid"]
         self._populate_devices_table()
 
     def _on_rename_alias(self):
@@ -634,7 +633,7 @@ class CalibrationManagerDialog(QDialog):
         u = self.selected_device["uid"]
         ok = self.cal_manager.deploy_cal_files(m, u)
         if ok:
-            self.status_msg_lbl.setText(f"Calibration staged to active runtime stage for Analyzer {m:03d}_{u:016x}.")
+            self.status_msg_lbl.setText(f"Calibration staged for Analyzer {m:03d}_{u:016x} (primary slot).")
             self.accept()
         else:
             QMessageBox.warning(self, "Staging Failed", "Failed to stage calibration files.")

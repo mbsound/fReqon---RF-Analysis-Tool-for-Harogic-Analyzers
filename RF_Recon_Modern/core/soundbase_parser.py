@@ -7,7 +7,7 @@ extracting hierarchical sites, zones, groups, and carriers with colors and bandw
 import gzip
 import json
 import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any
 
 class SoundbaseParser:
     """
@@ -62,9 +62,14 @@ class SoundbaseParser:
                 elif cname == 'coordFreq':
                     freqs_raw.append(val)
 
-        # Handle dictionary structure if exported differently
+        # A dictionary of collections. A zone export ("ZoneExport_<zone>_<date>.json") is one:
+        # {"siteId", "zone": {...}, "groups": [...], "freqs": [...], "broadbandFreqs": [...]},
+        # with the one zone as an object and no site record, only the site's id
         elif isinstance(raw_data, dict):
             for k, val_list in raw_data.items():
+                if isinstance(val_list, dict) and k.lower() in ("site", "zone") and (val_list.get("_id") or val_list.get("name")):
+                    target = sites_raw if k.lower() == "site" else zones_raw
+                    target[val_list.get("_id", f"{k.lower()}_{len(target)}")] = val_list
                 if isinstance(val_list, list):
                     for v in val_list:
                         if not isinstance(v, dict):
@@ -81,10 +86,15 @@ class SoundbaseParser:
                         elif 'freq' in k.lower() or 'channel' in k.lower():
                             freqs_raw.append(v)
 
-        # If no site was explicitly defined, provide a default root
+        # If no site was explicitly defined, provide a default root (under the id the
+        # file's records refer to, when it gives one)
         if not sites_raw:
-            default_site_id = "default_site"
+            file_site_id = raw_data.get("siteId") if isinstance(raw_data, dict) else None
+            default_site_id = file_site_id if isinstance(file_site_id, str) and file_site_id else "default_site"
             site_name = os.path.splitext(os.path.basename(filepath))[0]
+            if len(zones_raw) == 1:
+                # A zone export: the zone's name says more than "ZoneExport_..."
+                site_name = next(iter(zones_raw.values())).get("name") or site_name
             sites_raw[default_site_id] = {"_id": default_site_id, "name": site_name, "color": "#505C62"}
 
         # Build Sites hierarchy
@@ -208,9 +218,17 @@ class SoundbaseParser:
                             target_group = target_zone["groups"][g_id]
                         break
 
-            # If the carrier points to a non-existent / deleted zone not present in coordZone, skip it
+            # A carrier that points to a zone the file does not have belongs to a deleted zone
+            # and is skipped. A file that lists no zones at all has not deleted any: its
+            # carriers are kept, under one general zone.
             if target_zone is None:
-                continue
+                if zones_raw:
+                    continue
+                z_auto = f"zone_auto_{first_site_id}"
+                target_zone = sites[first_site_id]["zones"].setdefault(z_auto, {
+                    "id": z_auto, "siteId": first_site_id, "name": "General Zone",
+                    "color": sites[first_site_id]["color"], "groups": {}})
+                target_group = target_zone["groups"].get(g_id)
 
             # If the zone is valid but the group is missing or unassigned, place under an Unassigned group in that specific zone
             if target_group is None:
@@ -238,6 +256,7 @@ class SoundbaseParser:
                 "color": carrier_color,
                 "model": model_name,
                 "manufacturer": mfg_name,
+                "is_wmas": bool(model_info.get("isWmas")),
                 "f_start_mhz": f_start_mhz,
                 "f_stop_mhz": f_stop_mhz,
                 "group_id": target_group["id"],

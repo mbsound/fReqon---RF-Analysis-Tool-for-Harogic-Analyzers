@@ -7,10 +7,37 @@ master sweep play/pause controls, live threat banners, trace pills, and regional
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QPushButton, QComboBox, QFrame, QSizePolicy, QMenu
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor
+
+
+class ElidedLabel(QLabel):
+    """A label that shortens its text with an ellipsis instead of being
+    clipped, keeping the full text in the tooltip."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full = text
+        self.setMinimumWidth(90)
+        self.setMaximumWidth(200)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text: str):
+        self._full = text
+        self._refit()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def _refit(self):
+        fm = self.fontMetrics()
+        avail = max(20, self.maximumWidth() if self.width() <= 1 else self.width())
+        super().setText(fm.elidedText(self._full, Qt.TextElideMode.ElideRight, avail))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._refit()
 from ..icons import get_play_icon, get_pause_icon, get_settings_icon, get_chevron_icon
-from .trace_controls import SimpleColorPicker
 from core.multi_device_manager import MultiDeviceTopology
 
 class TopBar(QWidget):
@@ -23,6 +50,7 @@ class TopBar(QWidget):
     regionChanged = pyqtSignal(str)
     settingsClicked = pyqtSignal()
     calManagerClicked = pyqtSignal()
+    inputChainsClicked = pyqtSignal()
     traceToggled = pyqtSignal(str, bool)
     traceColorChanged = pyqtSignal(str, QColor)
     viewModeChanged = pyqtSignal(str)
@@ -55,6 +83,7 @@ class TopBar(QWidget):
         
         # 2. Hardware Device Chip & Multi-Device Selector
         self.hw_endorsements = None
+        self.power_state = None
         self.dev_chip = QFrame()
         self.dev_chip.setObjectName("cardFrame")
         self.dev_chip.setStyleSheet("background-color: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 2px 6px;")
@@ -70,9 +99,12 @@ class TopBar(QWidget):
         self.status_dot.setToolTip("Click to view Hardware Endorsements & Licenses")
         self.status_dot.mousePressEvent = lambda ev: self._show_endorsements_menu()
         
-        self.dev_label = QLabel("Disconnected")
+        self.dev_label = ElidedLabel("Disconnected")
         self.dev_label.setStyleSheet("font-weight: 600; font-size: 11px; color: #8b949e;")
-        self.dev_label.setMinimumWidth(140)
+        self._identity_text = "Disconnected"   # what the label returns to after a transient notice
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(lambda: self.dev_label.setText(self._identity_text))
         self.dev_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dev_label.setToolTip("Click to view Hardware Endorsements & Licenses")
         self.dev_label.mousePressEvent = lambda ev: self._show_endorsements_menu()
@@ -169,6 +201,11 @@ class TopBar(QWidget):
         dev_chip_layout.addWidget(self.dev_label)
         dev_chip_layout.addWidget(self.topo_badge)
         dev_chip_layout.addWidget(self.temp_label)
+
+        # Supply power (total W); per-port detail in the tooltip and device menu
+        self.power_label = QLabel("-- W")
+        self.power_label.hide()
+        dev_chip_layout.addWidget(self.power_label)
         dev_chip_layout.addWidget(self.interface_btn)
         dev_chip_layout.addWidget(self.connect_btn)
         main_layout.addWidget(self.dev_chip, 0)
@@ -311,12 +348,12 @@ class TopBar(QWidget):
         self.view_mode_combo.currentTextChanged.connect(self.viewModeChanged.emit)
         main_layout.addWidget(self.view_mode_combo)
         
-        # 7. Region Switcher
-        self.region_combo = QComboBox()
+        # 7. Region: chosen in Preferences & Settings (the gear button), not here. The
+        # combo is kept, hidden, as the list set_regions() fills.
+        self.region_combo = QComboBox(self)
         self.region_combo.setObjectName("regionCombo")
-        self.region_combo.setMaximumWidth(120)
         self.region_combo.currentTextChanged.connect(self.regionChanged.emit)
-        main_layout.addWidget(self.region_combo)
+        self.region_combo.hide()
         
         # 8. Settings, Audio & Cal Buttons
         self.audio_btn = QPushButton("Listen")
@@ -326,10 +363,15 @@ class TopBar(QWidget):
         self.audio_btn.clicked.connect(self.audioDemodClicked.emit)
         main_layout.addWidget(self.audio_btn)
         
-        self.cal_btn = QPushButton("Calibration")
+        self.cal_btn = QPushButton("Calibration ▾")
         self.cal_btn.setFixedHeight(24)
-        self.cal_btn.clicked.connect(self.calManagerClicked.emit)
+        cal_menu = QMenu(self.cal_btn)
+        cal_menu.addAction("Calibration Manager…", self.calManagerClicked.emit)
+        cal_menu.addAction("Input Chains (Antenna / Cable / Amplifier)…", self.inputChainsClicked.emit)
+        self.cal_btn.setMenu(cal_menu)
         main_layout.addWidget(self.cal_btn)
+
+        self.set_input_chain_state({})
         
         self.settings_btn = QPushButton()
         self.settings_btn.setObjectName("iconBtn")
@@ -367,6 +409,85 @@ class TopBar(QWidget):
             border: 1px solid #30363d;
         """)
 
+    # USB 3 ports supply up to 0.9 A; warn a little before that
+    USB_CURRENT_WARN_A = 0.8
+    # Below this, nothing is connected to the analyzer's power port
+    POWER_PORT_MIN_V = 3.0
+
+    @classmethod
+    def describe_power(cls, p: dict, interface: str = "USB Direct"):
+        """(summary lines, warning or None) for a power reading. USB analyzers
+        report the power port and the USB port separately; network analyzers
+        (e.g. model 0x43) report their DC input in the second pair of fields."""
+        port_w, usb_w = p["port_v"] * p["port_a"], p["usb_v"] * p["usb_a"]
+        if interface.lower().startswith("network"):
+            v, a = (p["port_v"], p["port_a"]) if p["port_v"] >= cls.POWER_PORT_MIN_V else (p["usb_v"], p["usb_a"])
+            return [f"DC input: {v:.2f} V  {a:.2f} A  ({v * a:.1f} W)"], None
+        lines = [f"Power port: {p['port_v']:.2f} V  {p['port_a']:.2f} A  ({port_w:.1f} W)",
+                 f"USB port: {p['usb_v']:.2f} V  {p['usb_a']:.2f} A  ({usb_w:.1f} W)"]
+        warning = None
+        if p["port_v"] < cls.POWER_PORT_MIN_V:
+            warning = ("Running on USB bus power. Connect the analyzer's power supply for "
+                       "high-rate RTA/IQ streaming; bus power can drop the analyzer off USB.")
+        elif p["usb_a"] >= cls.USB_CURRENT_WARN_A:
+            warning = f"USB port current {p['usb_a']:.2f} A is near the 0.9 A limit of a USB 3 port."
+        return lines, warning
+
+    def set_power_state(self, p: dict, interface: str = "USB Direct"):
+        self.power_state = p
+        self.power_interface = interface
+        lines, warning = self.describe_power(p, interface)
+        total_w = p["port_v"] * p["port_a"] + p["usb_v"] * p["usb_a"]
+        bus_powered = p["port_v"] < self.POWER_PORT_MIN_V and not interface.lower().startswith("network")
+        self.power_label.setText(f"{'USB ' if bus_powered else ''}{total_w:.1f} W")
+        self.power_label.setToolTip("Analyzer supply\n" + "\n".join(lines) + (f"\n\n⚠ {warning}" if warning else ""))
+        color = "#f59e0b" if warning else "#8b949e"
+        self.power_label.setStyleSheet(f"""
+            background-color: #21262d;
+            color: {color};
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 5px;
+            border-radius: 3px;
+            border: 1px solid #30363d;
+        """)
+        self.power_label.show()
+
+    def set_input_chain_state(self, lines: dict):
+        """lines: {analyzer label: 'chain name: correction summary'} for analyzers with a chain."""
+        if lines:
+            self.cal_btn.setText("Calibration ● ▾")
+            self.cal_btn.setStyleSheet("QPushButton { color: #38bdf8; border: 1px solid #38bdf8; }")
+            self.cal_btn.setToolTip("Input chain correction applied to levels:\n"
+                                    + "\n".join(f"{k}: {v}" for k, v in lines.items()))
+        else:
+            self.cal_btn.setText("Calibration ▾")
+            self.cal_btn.setStyleSheet("")
+            self.cal_btn.setToolTip("Calibration files and input chains (antenna / cable / amplifier). "
+                                    "No input chain is applied: levels are at the analyzer's input.")
+
+    def flash_status(self, text: str, ms: int = 4000):
+        """Show a transient notice in the device label, then restore the analyzer name."""
+        self.dev_label.setText(text)
+        self._notice_timer.start(ms)
+
+    # Trace toggles shorten their labels only when the bar runs out of room
+    TRACE_SHORT = {"Real-Time": "Live", "Max. Hold": "Max", "Min. Hold": "Min", "Average": "Avg"}
+
+    def _fit(self):
+        for name, btn in self.trace_buttons.items():
+            btn.setText(name)
+        self.layout().activate()
+        if self.layout().sizeHint().width() > self.width():
+            for name, btn in self.trace_buttons.items():
+                btn.setText(self.TRACE_SHORT[name])
+                btn.setToolTip(name)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit()
+
     def _add_separator(self, layout):
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -387,15 +508,16 @@ class TopBar(QWidget):
             self.topo_badge.show()
             self.focus_combo.addItems(["A+B Overlay", "Antenna A", "Antenna B", "Delta (A-B)"])
             self.multi_ctrl_frame.show()
-        elif topology == MultiDeviceTopology.INDEPENDENT:
-            self.topo_badge.setText("MULTI-ZONE")
+        elif topology in (MultiDeviceTopology.INDEPENDENT, MultiDeviceTopology.SENSOR_NET):
+            n = sum(1 for s in slots.values() if s.get("enabled"))
+            self.topo_badge.setText("MULTI-ZONE" if topology == MultiDeviceTopology.INDEPENDENT else f"SENSORS {n}")
             self.topo_badge.show()
-            raw_a = slots.get("slot_a", {}).get("alias", "")
-            raw_b = slots.get("slot_b", {}).get("alias", "")
-            alias_a = raw_a.strip() if (raw_a and raw_a.strip()) else "Analyzer A"
-            alias_b = raw_b.strip() if (raw_b and raw_b.strip()) else "Analyzer B"
-            self.focus_combo.addItem(f"Focus: {alias_a}", "slot_a")
-            self.focus_combo.addItem(f"Focus: {alias_b}", "slot_b")
+            for slot_id in sorted(slots):
+                if topology == MultiDeviceTopology.SENSOR_NET and not slots[slot_id].get("enabled"):
+                    continue
+                raw = slots[slot_id].get("alias", "")
+                alias = raw.strip() if (raw and raw.strip()) else f"Analyzer {slot_id.split('_')[-1].upper()}"
+                self.focus_combo.addItem(f"Focus: {alias}", slot_id)
             self.multi_ctrl_frame.show()
         else:
             self.topo_badge.hide()
@@ -426,6 +548,11 @@ class TopBar(QWidget):
             self.interface_btn.setToolTip("USB Direct Connection")
 
     def set_device_status(self, connected: bool, text: str):
+        if not connected:
+            self.power_state = None
+            self.power_label.hide()
+        self._identity_text = text
+        self._notice_timer.stop()
         if connected:
             self.status_dot.setStyleSheet("color: #10b981; font-size: 12px;")
             self.dev_label.setText(text)
@@ -481,7 +608,7 @@ class TopBar(QWidget):
             if current_freq is not None:
                 self.intr_label.setText(f"Threat {current_idx + 1}/{count}: {current_freq:.2f} MHz")
             else:
-                self.intr_label.setText(f"Threats Detected ({count})")
+                self.intr_label.setText(f"Threats ({count})")
         else:
             self.intruder_frame.hide()
 
@@ -500,6 +627,11 @@ class TopBar(QWidget):
 
     def set_hw_endorsements(self, data: dict):
         self.hw_endorsements = data
+
+    def set_audio_available(self, available: bool, reason: str = ""):
+        """Grey out Listen when the analyzer has no IQ stream to demodulate."""
+        self.audio_btn.setEnabled(available)
+        self.audio_btn.setToolTip("Live Analog AM/FM Audio Demodulation & Acoustic Monitor" if available else reason)
 
     def _on_dev_chip_clicked(self, event):
         child = self.dev_chip.childAt(event.pos())
@@ -556,19 +688,27 @@ class TopBar(QWidget):
         ffw = self.hw_endorsements.get('ffw_ver', 'Unknown')
         interface = self.hw_endorsements.get('interface', 'USB Direct')
         
-        # 1. Device Header
-        hdr = menu.addAction(f"HAROGIC MODEL {model} (Hardware Rev {hw_ver})")
+        # 1. Device Header (analyzers other than Harogic ones supply their own title)
+        title = self.hw_endorsements.get('title')
+        hdr = menu.addAction(f"{title} (Hardware Rev {hw_ver})" if title else f"HAROGIC MODEL {model} (Hardware Rev {hw_ver})")
         hdr.setEnabled(False)
         uid_act = menu.addAction(f"Serial UID: 0x{uid}")
         uid_act.setEnabled(False)
+        if_act = menu.addAction(f"Interface: {interface}")
+        if_act.setEnabled(False)
+        if self.power_state:
+            lines, warning = self.describe_power(self.power_state, getattr(self, "power_interface", "USB Direct"))
+            for line in lines + ([f"⚠ {warning}"] if warning else []):
+                menu.addAction(line).setEnabled(False)
         
         menu.addSeparator()
-        
-        # 2. Licenses & Endorsements Section
-        lic_hdr = menu.addAction("LICENSES && ENDORSEMENTS")
-        lic_hdr.setEnabled(False)
-        
+
+        # 2. Licenses & Endorsements Section (licenses None: the analyzer has no license options)
         licenses = self.hw_endorsements.get('licenses', [])
+        if licenses is not None:
+            lic_hdr = menu.addAction("LICENSES && ENDORSEMENTS")
+            lic_hdr.setEnabled(False)
+
         if licenses:
             sorted_licenses = sorted(licenses, key=lambda x: (not x.get('enabled', False), x.get('name', '')))
             for lic in sorted_licenses:
@@ -580,29 +720,36 @@ class TopBar(QWidget):
                 else:
                     act = menu.addAction(f"[NOT LICENSED]  {desc}")
                 act.setEnabled(False)
-        else:
+        elif licenses is not None:
             none_act = menu.addAction("No license options configured in baseband flash")
             none_act.setEnabled(False)
-            
-        menu.addSeparator()
-        
+
+        if licenses is not None:
+            menu.addSeparator()
+
         # 3. Hardware Features Section
-        hw_hdr = menu.addAction("HARDWARE MODULES && ARCHITECTURE")
-        hw_hdr.setEnabled(False)
-        
         hw_features = self.hw_endorsements.get('hardware_features', [])
-        if hw_features:
+        if title:
+            hw_hdr = menu.addAction("HARDWARE")
+            hw_hdr.setEnabled(False)
             for feat in hw_features:
-                act = menu.addAction(f"[INSTALLED]  {feat}")
-                act.setEnabled(False)
+                menu.addAction(feat).setEnabled(False)
         else:
-            act = menu.addAction("Standard Front-End Architecture")
-            act.setEnabled(False)
-            
+            hw_hdr = menu.addAction("HARDWARE MODULES && ARCHITECTURE")
+            hw_hdr.setEnabled(False)
+            if hw_features:
+                for feat in hw_features:
+                    act = menu.addAction(f"[INSTALLED]  {feat}")
+                    act.setEnabled(False)
+            else:
+                act = menu.addAction("Standard Front-End Architecture")
+                act.setEnabled(False)
+
         menu.addSeparator()
-        
+
         # 4. Telemetry Details
-        fw_act = menu.addAction(f"Firmware: MCU {mfw} / FPGA {ffw}")
+        firmware = self.hw_endorsements.get('firmware')
+        fw_act = menu.addAction(f"Firmware: {firmware}" if firmware else f"Firmware: MCU {mfw} / FPGA {ffw}")
         fw_act.setEnabled(False)
         if full_uid and full_uid != uid:
             full_act = menu.addAction(f"Full Hardware ID: {full_uid}")

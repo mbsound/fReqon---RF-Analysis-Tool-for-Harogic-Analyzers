@@ -3,8 +3,8 @@ trace_controls.py - Multi-Trace Management & Color Picker.
 Provides quick trace activation pills, freeze toggles, and custom color swatch selectors.
 """
 
-from PyQt6.QtWidgets import QPushButton, QMenu, QColorDialog, QWidget, QHBoxLayout, QLabel, QCheckBox, QSpinBox
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen
+from PyQt6.QtWidgets import QPushButton, QMenu, QColorDialog
+from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt, pyqtSignal
 
 class SimpleColorPicker(QPushButton):

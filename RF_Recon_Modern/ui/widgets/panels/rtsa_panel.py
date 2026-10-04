@@ -6,7 +6,7 @@ Reference Level, Attenuation, Pre-Amplifier, Persistence Decay, and Trigger Sour
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QDoubleSpinBox, QSpinBox, QSlider, QFrame, QScrollArea
+    QDoubleSpinBox, QSlider, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from ..freq_inputs import FreqSpinBox
