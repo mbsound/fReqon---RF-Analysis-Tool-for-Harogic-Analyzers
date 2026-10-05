@@ -4,6 +4,7 @@ where each carrier is estimated to be.
 """
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from ... import combo_popups
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
@@ -17,8 +18,10 @@ class LocatePanel(QWidget):
     carrierSelected = pyqtSignal(float)             # freq_hz
     tdoaRequested = pyqtSignal(float)               # freq_hz (Phase 2)
     openConnections = pyqtSignal()
+    restartAverages = pyqtSignal()                  # forget the GNSS fixes averaged so far, on every sensor
 
-    SENSOR_COLS = ("Sensor", "Position", "Lat / X (m)", "Lon / Y (m)", "Status")
+    SENSOR_COLS = ("Sensor", "Position", "Lat / X (m)", "Lon / Y (m)", "Lock")
+    SENSOR_ROW_H = 30
     CARRIER_COLS = ("MHz", "Device", "Conf", "Seen by", "Strongest", "Position", "±m")
 
     def __init__(self, parent=None):
@@ -40,15 +43,33 @@ class LocatePanel(QWidget):
         self.conn_btn = QPushButton("Analyzers…"); self.conn_btn.setFixedHeight(22)
         self.conn_btn.setToolTip("Add analyzers and choose the Sensor Network topology in the Connection dialog")
         self.conn_btn.clicked.connect(self.openConnections.emit)
+        self.restart_btn = QPushButton("Restart averaging"); self.restart_btn.setFixedHeight(22)
+        self.restart_btn.setToolTip("Each sensor's GNSS position is the mean of its fixes. Start those means again:\n"
+                                    "after moving an antenna, or once a weak signal has become a good one.")
+        self.restart_btn.clicked.connect(self.restartAverages.emit)
+        hdr.addWidget(self.restart_btn)
         hdr.addWidget(self.conn_btn)
         root.addLayout(hdr)
 
         self.sensor_table = QTableWidget(0, len(self.SENSOR_COLS))
         self.sensor_table.setHorizontalHeaderLabels(self.SENSOR_COLS)
-        self.sensor_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.sensor_table.horizontalHeader().setStretchLastSection(True)
+        # The whole table fits the panel: the coordinates share what the fixed columns leave
+        sh = self.sensor_table.horizontalHeader()
+        sh.setMinimumSectionSize(30)
+        Mode = QHeaderView.ResizeMode
+        for col, mode in enumerate((Mode.ResizeToContents, Mode.Fixed, Mode.Stretch, Mode.Stretch, Mode.ResizeToContents)):
+            sh.setSectionResizeMode(col, mode)
+        self.sensor_table.setColumnWidth(1, 76)             # the GNSS / Manual selector
+        self.sensor_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sensor_table.setStyleSheet("QTableWidget { font-size: 11px; } QTableWidget::item { padding: 2px 3px; } "
+                                        "QHeaderView::section { padding: 3px 3px; font-size: 10px; }")
+        self.sensor_table.setMinimumHeight(40 + 2 * self.SENSOR_ROW_H)       # the header and two analyzers, always (no scroll bar)
+        self.sensor_table.horizontalHeaderItem(4).setToolTip(
+            "Locked: the analyzer has a GNSS fix. Searching: GNSS is running without a fix yet.\n"
+            "Height, satellites and signal are listed for each analyzer under the table.")
         self._last_sensor_rows = None
         self.sensor_table.verticalHeader().setVisible(False)
+        self.sensor_table.verticalHeader().setDefaultSectionSize(self.SENSOR_ROW_H)
         self.sensor_table.setMaximumHeight(170)
         self.sensor_table.cellChanged.connect(self._on_sensor_cell_changed)
         root.addWidget(self.sensor_table)
@@ -66,13 +87,30 @@ class LocatePanel(QWidget):
 
         form = QFormLayout(); form.setContentsMargins(0, 4, 0, 4)
         self.exp_spin = QDoubleSpinBox(); self.exp_spin.setRange(1.5, 5.0); self.exp_spin.setSingleStep(0.1); self.exp_spin.setValue(3.0)
-        self.exp_spin.setToolTip("Path-loss exponent: 2.0 free space, ~2.5 open air, 3–3.5 inside a venue")
+        exp_tip = ("How quickly a signal is taken to weaken with distance. Locate turns the difference in level\n"
+                   "between two sensors into a difference in distance, and this is the conversion rate.\n\n"
+                   "    2.0    free space, clear line of sight (6 dB weaker per doubling of distance)\n"
+                   "    2.5    open air outdoors\n"
+                   "    3.0 to 3.5    inside a venue: walls, people, scenery (9 to 10.5 dB per doubling)\n\n"
+                   "Too low pushes estimates towards the loudest sensor; too high pulls them towards the middle.\n"
+                   "To set it for a room, key a transmitter at a known spot and adjust until Locate puts it there.\n"
+                   "Used by the power-based position only, not by Locate precisely (TDOA).")
+        self.exp_spin.setToolTip(exp_tip)
         self.exp_spin.valueChanged.connect(self._emit_settings)
         form.addRow("Path-loss exponent:", self.exp_spin)
         self.margin_spin = QDoubleSpinBox(); self.margin_spin.setRange(6, 40); self.margin_spin.setValue(12); self.margin_spin.setSuffix(" dB")
-        self.margin_spin.setToolTip("A carrier counts when it is this far above a sensor's noise floor")
+        margin_tip = ("How far above a sensor's noise floor something must be to be listed as a carrier.\n"
+                      "The floor is taken from an average of that sensor's last sweeps.\n\n"
+                      "Lower: weaker carriers are listed, and more false ones with them.\n"
+                      "Higher: only strong, unmistakable carriers.\n\n"
+                      "A listed carrier is given a device name only once it is 20 dB over the floor at its\n"
+                      "best sensor; below that it reads \"Too weak to identify\".")
+        self.margin_spin.setToolTip(margin_tip)
         self.margin_spin.valueChanged.connect(self._emit_settings)
         form.addRow("Detection margin:", self.margin_spin)
+        # The same explanation on the words as on the fields
+        form.labelForField(self.exp_spin).setToolTip(exp_tip)
+        form.labelForField(self.margin_spin).setToolTip(margin_tip)
         root.addLayout(form)
 
         lbl2 = QLabel("CARRIERS"); lbl2.setStyleSheet("font-size: 10px; font-weight: 700; color: #8b949e; letter-spacing: 0.5px;")
@@ -100,38 +138,75 @@ class LocatePanel(QWidget):
 
     # --- sensors ---
     def show_sensors(self, sensors):
-        """sensors: [(slot_id, name, source, lat, lon, x_m, y_m, status, connected)]"""
+        """
+        sensors: [{"id", "name", "source" ("gnss" / "manual"), "lat", "lon", "x_m", "y_m",
+        "connected", "height", "sats", "lock", "has_fix"}]
+        """
         if sensors == self._last_sensor_rows:
-            return          # rebuilding replaces the cell widgets; only do it on a change
-        self._last_sensor_rows = list(sensors)
+            return
+        # The selectors are only replaced when the list of sensors or a source changes
+        # (replacing one closes its open list and makes the row flicker); a new fix only
+        # rewrites the text
+        shape = lambda rows: [(d["id"], d["source"]) for d in rows or []]
+        rebuild = shape(sensors) != shape(self._last_sensor_rows)
+        self._last_sensor_rows = [dict(d) for d in sensors]
         self._loading = True
         t = self.sensor_table
         t.setRowCount(len(sensors))
-        for r, (sid, name, source, lat, lon, x_m, y_m, status, connected) in enumerate(sensors):
+        for r, d in enumerate(sensors):
+            sid, name, source, connected = d["id"], d["name"], d["source"], d["connected"]
+            lat, lon, x_m, y_m = d["lat"], d["lon"], d["x_m"], d["y_m"]
             it = QTableWidgetItem(name); it.setData(Qt.ItemDataRole.UserRole, sid)
             it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
             it.setForeground(QColor("#c9d1d9" if connected else "#6e7681"))
             t.setItem(r, 0, it)
-            cb = QComboBox(); cb.addItems(["GNSS", "Manual"]); cb.setCurrentIndex(0 if source == "gnss" else 1)
-            cb.currentIndexChanged.connect(lambda i, s=sid: self._on_source_changed(s, i))
-            t.setCellWidget(r, 1, cb)
+            if rebuild or t.cellWidget(r, 1) is None:
+                cb = QComboBox(); cb.addItems(["GNSS", "Manual"]); cb.setCurrentIndex(0 if source == "gnss" else 1)
+                cb.setStyleSheet("QComboBox { padding: 1px 4px; min-height: 20px; font-size: 11px; }")
+                cb.currentIndexChanged.connect(lambda i, s=sid: self._on_source_changed(s, i))
+                combo_popups.fit_list(cb)       # the cell is narrower than "Manual" with its tick
+                t.setCellWidget(r, 1, cb)
+            t.setRowHeight(r, self.SENSOR_ROW_H)
             if source == "manual" and x_m is not None:
                 a, b = f"{x_m:g}", f"{y_m:g}"
             else:
-                a = "" if lat is None else f"{lat:.6f}"
-                b = "" if lon is None else f"{lon:.6f}"
+                # A GNSS position to the metre here (the readout below has it in full); one typed
+                # in is shown as typed
+                digits = 5 if source == "gnss" else 6
+                a = "" if lat is None else f"{lat:.{digits}f}"
+                b = "" if lon is None else f"{lon:.{digits}f}"
             for c, v in ((2, a), (3, b)):
                 it = QTableWidgetItem(v)
+                it.setToolTip(v)                # in full, should the column ever be too narrow
+                font = it.font(); font.setPixelSize(10); it.setFont(font)      # ten characters of longitude fit
                 if source != "manual":
                     it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable); it.setForeground(QColor("#8b949e"))
                 t.setItem(r, c, it)
-            it = QTableWidgetItem(status); it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            lock_color = {"Locked": "#10b981", "Searching": "#f59e0b", "Weak fix": "#f59e0b", "Manual": "#c9d1d9",
+                          "Disconnected": "#f43f5e"}.get(d["lock"], "#6e7681")
+            it = QTableWidgetItem(d["lock"]); it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            it.setForeground(QColor(lock_color if connected or d["lock"] == "Disconnected" else "#6e7681"))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if d.get("weak"):
+                it.setToolTip(f"Locked, but on a weak fix ({d['weak']}): this position can be tens of metres out.\n"
+                              "A better sky view for its GNSS antenna, then Restart averaging.")
             t.setItem(r, 4, it)
         self._loading = False
 
     def show_gnss(self, lines):
-        """lines: [(sensor name, one-line GNSS summary)], shown under the sensor table."""
-        text = "<br>".join(f"<b>{name}</b>: {summary}" for name, summary in lines)
+        """
+        lines: [(sensor name, GNSS readout)], shown under the sensor table. A readout is a
+        sentence, or [(label, value)] rows laid out as a small table per sensor.
+        """
+        blocks = []
+        for name, readout in lines:
+            if isinstance(readout, str):
+                blocks.append(f"<b>{name}</b>: {readout}")
+                continue
+            rows = "".join(f"<tr><td style='color:#8b949e; padding-right:10px;'>{label}</td><td>{value}</td></tr>"
+                           for label, value in readout)
+            blocks.append(f"<b>{name}</b><table cellspacing='0' cellpadding='1'>{rows}</table>")
+        text = "".join(f"<div style='margin-bottom:4px;'>{b}</div>" for b in blocks)
         if text != self.gnss_lbl.text():
             self.gnss_lbl.setText(text)
         self.gnss_lbl.setVisible(bool(lines))

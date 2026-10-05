@@ -435,6 +435,7 @@ class MainWindow(QMainWindow):
         self.locate_panel.tdoaRequested.connect(self.start_tdoa)
         self.map_view.carrierClicked.connect(self._on_locate_carrier_selected)
         self.locate_panel.openConnections.connect(self.open_connection_manager)
+        self.locate_panel.restartAverages.connect(self._restart_position_averages)
         self._load_sensor_positions()
         self._restore_slots()
         self._sync_sensors()
@@ -763,6 +764,8 @@ class MainWindow(QMainWindow):
 
     def _on_all_connection_status(self, any_connected: bool):
         self.is_connected = any_connected
+        if self.panel_stack.currentIndex() == 9:
+            self._sync_sensors()            # Locate: a sensor that has gone says so at once
         self._refresh_slot_readouts()
         self._refresh_connection_dot()
         self._refresh_antenna_sources()
@@ -4466,26 +4469,56 @@ class MainWindow(QMainWindow):
         for sid in list(self.sensor_net.sensors):
             if sid not in mdm.slots:
                 self.sensor_net.remove_sensor(sid)
-        rows = []
         for sid in sorted(mdm.slots):
             slot = mdm.slots[sid]
             s = self.sensor_net.ensure_sensor(sid, self._slot_label(sid))
-            if slot.gnss and not s.gnss:
+            if not slot.is_connected:
+                if s.gnss:
+                    s.went_offline()
+            elif slot.gnss and not s.gnss:
                 s.add_fix(slot.gnss)
+        if not self.locate_panel.sensor_table.hasFocus():
+            self.locate_panel.show_sensors(self._locate_sensor_rows())
+        self.locate_panel.show_gnss([(s.name, s.gnss_rows() if mdm.slots[sid].is_connected else "disconnected.")
+                                     for sid, s in sorted(self.sensor_net.sensors.items())
+                                     if sid in mdm.slots and (mdm.slots[sid].is_connected or mdm.slots[sid].is_enabled)])
+
+    def _locate_sensor_rows(self) -> list:
+        """
+        The Locate panel's sensor rows (one place builds them: two that disagreed made the
+        GNSS position blink in and out).
+        """
+        rows = []
+        for sid in sorted(self.multi_device_manager.slots):
+            slot = self.multi_device_manager.slots[sid]
+            s = self.sensor_net.ensure_sensor(sid)
             # With GNSS as the source the table shows the (averaged) fix, not the manual fields
             lat, lon = s.lat, s.lon
             if s.position_source == "gnss":
                 ll = s.latlon()
                 lat, lon = (round(ll[0], 6), round(ll[1], 6)) if ll else (None, None)
-            rows.append((sid, s.name, s.position_source, lat, lon, s.x_m, s.y_m, s.status(), slot.is_connected))
-        self.locate_panel.show_sensors(rows)
-        self.locate_panel.show_gnss([(s.name, s.gnss_summary()) for sid, s in sorted(self.sensor_net.sensors.items())
-                                     if sid in mdm.slots and (mdm.slots[sid].is_connected or s.gnss)])
+            row = {"id": sid, "name": s.name, "source": s.position_source, "lat": lat, "lon": lon,
+                   "x_m": s.x_m, "y_m": s.y_m, "connected": slot.is_connected, **s.table_fields()}
+            if not slot.is_connected:
+                # Nothing is heard from it: not "searching", whatever it said last
+                row["lock"] = "Disconnected" if slot.is_enabled else "Not in use"
+            rows.append(row)
+        return rows
 
     def _on_gnss_updated(self, slot_id: str, g: dict):
         self.sensor_net.set_gnss(slot_id, g)
         if self.panel_stack.currentIndex() == 9:        # Locate is showing: keep its readout current
             self._sync_sensors()
+
+    def _restart_position_averages(self):
+        """Every sensor's GNSS position starts again from its next fix."""
+        for s in self.sensor_net.sensors.values():
+            s.restart_average()
+        self.sensor_net.origin = None       # the local frame is rebuilt from the new positions
+        self._sync_sensors()
+        self._refresh_locate(force=True)
+        self.locate_panel.set_status("Position averages restarted: each sensor's position builds up again from its next fixes.")
+        self._locate_status_hold = time.monotonic() + 6.0
 
     def _on_sensor_position_edited(self, slot_id: str, d: dict):
         s = self.sensor_net.ensure_sensor(slot_id)
@@ -4629,14 +4662,8 @@ class MainWindow(QMainWindow):
         else:
             self.locate_panel.set_status(f"{n_on} sensor(s) connected, {n_pos} positioned. Power-based fixes; "
                                          "expect tens of metres outdoors, a zone indoors.")
-        if self.panel_stack.currentIndex() == 9:
-            rows = []
-            for sid in sorted(self.multi_device_manager.slots):
-                s = net.ensure_sensor(sid)
-                slot = self.multi_device_manager.slots[sid]
-                rows.append((sid, s.name, s.position_source, s.lat, s.lon, s.x_m, s.y_m, s.status(), slot.is_connected))
-            if not self.locate_panel.sensor_table.hasFocus():
-                self.locate_panel.show_sensors(rows)
+        if self.panel_stack.currentIndex() == 9 and not self.locate_panel.sensor_table.hasFocus():
+            self.locate_panel.show_sensors(self._locate_sensor_rows())
 
     def _save_sensor_positions(self):
         d = {sid: {"source": s.position_source, "lat": s.lat, "lon": s.lon, "x_m": s.x_m, "y_m": s.y_m}

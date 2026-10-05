@@ -514,6 +514,7 @@ class MultiDeviceManager(QObject):
             slot.is_connected = is_connected
             if not is_connected:
                 slot.capabilities = None
+                slot.gnss = {}          # what its receiver last said is not its state any more
             self.capabilities_changed.emit(slot_id)
             self.slot_status_changed.emit(slot_id, is_connected, slot.status_message)
         self._update_all_connection_state()

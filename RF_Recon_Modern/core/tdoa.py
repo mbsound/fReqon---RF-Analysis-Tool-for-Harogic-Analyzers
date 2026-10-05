@@ -9,10 +9,16 @@ or more such differences give a position (core/geolocate.tdoa_locate).
 
 What limits it, in order:
 
-  * each analyzer's 1PPS edge wanders against true GPS time by tens of
-    nanoseconds with a good sky view and a few hundred with a poor one
-    (30 ns is 9 m), independently on every sensor, so one second's answer
-    is rough and the session takes the median over several seconds;
+  * a PPS-triggered capture starts on the first sample after the second, so
+    its start is spread evenly over one sample period, independently on every
+    sensor. At the rate a narrow carrier needs (1-2 MS/s) that is 500-1000 ns,
+    150-300 m. So the analyzer captures fast (CAPTURE_DECIMATION: 32 ns
+    samples, 9 ns rms) and the capture is brought down to the wanted rate
+    here (reduce_rate), which keeps the start where it was;
+  * each analyzer's 1PPS edge wanders against true GPS time: about 18 ns rms
+    measured with an active antenna (5 m), more with a poor sky view,
+    independently on every sensor, so one second's answer is rough and the
+    session takes the median over several seconds;
   * indoors the strongest arrival is often a reflection, which puts the
     answer metres to tens of metres off however good the timing is;
   * the analyzers' reference oscillators differ by a few tenths of a ppm
@@ -34,6 +40,44 @@ from .geolocate import tdoa_locate, Fix
 
 C = 299_792_458.0
 PPS_TRIGGER = 9                 # IQS trigger source: the analyzer's own GNSS 1PPS
+CAPTURE_DECIMATION = 4          # the analyzer's decimation while capturing on the PPS (32 ns samples)
+BASE_SAMPLE_PERIOD_NS = 8.0     # at decimation 1 (125 MS/s)
+
+# Half-band low-pass for halving a sample rate: windowed sinc, cut-off at a quarter of the
+# input rate. Symmetric, so it adds no delay (applied centred).
+_HALF_TAPS = 31
+_n = np.arange(_HALF_TAPS) - (_HALF_TAPS - 1) / 2.0
+_HALF_BAND = (0.5 * np.sinc(0.5 * _n) * np.hamming(_HALF_TAPS)).astype(np.float32)
+_HALF_BAND /= _HALF_BAND.sum()
+
+
+def capture_plan(decimate: int, samples: int, trigger_source: int = PPS_TRIGGER):
+    """
+    How to take a capture wanted at `decimate` with `samples` points: (the analyzer's
+    decimation, samples to capture, the factor to reduce by afterwards). Only a capture
+    timed by the PPS is taken fast; any other has no start worth preserving.
+    """
+    decimate, samples = int(decimate), int(samples)
+    if int(trigger_source) != PPS_TRIGGER or decimate <= CAPTURE_DECIMATION:
+        return decimate, samples, 1
+    factor = decimate // CAPTURE_DECIMATION
+    factor = 1 << (factor.bit_length() - 1)             # a power of two: halved step by step
+    return decimate // factor, samples * factor, factor
+
+
+def reduce_rate(iq, factor: int):
+    """
+    Bring a capture down to 1/factor of its sample rate (factor a power of two), keeping
+    its first sample as the first sample: every halving filters with a centred symmetric
+    filter and keeps the even samples. Two sensors' captures treated alike stay aligned
+    to within what their own starts differed by.
+    """
+    out = np.asarray(iq, dtype=np.complex64)
+    factor = int(factor)
+    while factor > 1:
+        out = np.convolve(out, _HALF_BAND, mode="same")[::2].astype(np.complex64)
+        factor //= 2
+    return out
 MIN_QUALITY_DB = 6.0            # correlation peak over the highest sidelobe: below this, no usable peak
 
 
@@ -123,11 +167,16 @@ class TDOASession:
         self.freq_hz = float(freq_hz)
         self.delays_s = dict(delays_s or {})
         self.captures = {}          # GPS second -> {sensor id: (iq, info)}
+        self.unlocked = {}          # sensor id -> captures refused because GNSS was not locked
         self.rounds = []            # per solved second: {"second", "ref", "tdoa": {sid: s}, "quality": {sid: dB}}
 
     def add_capture(self, sensor_id, iq, info: dict):
         """A capture from one sensor. Returns the round it completed, if it completed one."""
         if iq is None or not info.get("ok") or sensor_id not in self.sensors:
+            return None
+        if info.get("gnss_lock") is False:
+            # Taken without a GNSS lock: the analyzer's time pulse was not the GPS second
+            self.unlocked[sensor_id] = self.unlocked.get(sensor_id, 0) + 1
             return None
         sec = gps_second(info)
         group = self.captures.setdefault(sec, {})
@@ -176,6 +225,11 @@ class TDOASession:
             out["note"] = ("No second gave a clear correlation peak on every sensor: the carrier is too weak "
                            "at one of them, or it stopped transmitting." if self.rounds else
                            "No complete set of captures: the sensors did not all capture the same GPS second.")
+            if self.unlocked and not self.rounds:
+                who = ", ".join(f"{sid.split('_')[-1].upper()} ({n} captures)" for sid, n in sorted(self.unlocked.items()))
+                out["note"] = (f"GNSS was not locked on analyzer {who} while capturing, so its captures were not on "
+                               "the GPS second and were left out. It needs a steady lock (more satellites, a better "
+                               "sky view for its antenna).")
             return out
         # Use the reference most rounds chose, and re-express the others against it
         ref = max({r["ref"] for r in rounds}, key=lambda s: sum(1 for r in rounds if r["ref"] == s))

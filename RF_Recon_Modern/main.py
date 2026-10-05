@@ -72,6 +72,8 @@ def main():
 
     # Apply Modern Obsidian Stylesheet
     app.setStyleSheet(MODERN_STYLE_SHEET)
+    from ui import combo_popups
+    combo_popups.install(app)           # drop-down lists as wide as their entries, everywhere
 
     window = MainWindow()
     window.show()

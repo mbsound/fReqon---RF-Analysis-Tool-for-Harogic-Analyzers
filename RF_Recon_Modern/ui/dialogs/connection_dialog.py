@@ -423,13 +423,6 @@ class ConnectionDialog(QDialog):
         self.extra_row.addWidget(self.add_slot_btn)
         self.extra_row.addWidget(self.remove_slot_btn)
         self.extra_row.addStretch()
-        self.assign_extra_combo = QComboBox()
-        self.assign_extra_combo.setToolTip("Assign the selected discovered analyzer to this sensor slot")
-        self.assign_extra_btn = QPushButton("Assign to…")
-        self.assign_extra_btn.setFixedHeight(24)
-        self.assign_extra_btn.clicked.connect(lambda: self._assign_selected_to_slot(self.assign_extra_combo.currentData()))
-        self.extra_row.addWidget(self.assign_extra_combo)
-        self.extra_row.addWidget(self.assign_extra_btn)
         main_layout.addLayout(self.extra_row)
         self._set_extra_visible(False)
         if manager is not None:
@@ -458,17 +451,19 @@ class ConnectionDialog(QDialog):
         disc_header.addWidget(disc_title)
         disc_header.addStretch()
         
-        self.assign_a_btn = QPushButton("Assign to Slot A")
-        self.assign_a_btn.setObjectName("pillBtn")
-        self.assign_a_btn.setFixedHeight(22)
-        self.assign_a_btn.clicked.connect(lambda: self._assign_selected_to_slot("slot_a"))
-        disc_header.addWidget(self.assign_a_btn)
-        
-        self.assign_b_btn = QPushButton("Assign to Slot B")
-        self.assign_b_btn.setObjectName("pillBtn")
-        self.assign_b_btn.setFixedHeight(22)
-        self.assign_b_btn.clicked.connect(lambda: self._assign_selected_to_slot("slot_b"))
-        disc_header.addWidget(self.assign_b_btn)
+        # One selector for however many analyzers the topology has (A and B, or sensors A to P)
+        assign_lbl = QLabel("Assign selected to:")
+        assign_lbl.setStyleSheet("font-size: 11px; color: #8b949e;")
+        disc_header.addWidget(assign_lbl)
+        self.assign_combo = QComboBox()
+        self.assign_combo.setMinimumWidth(150)
+        self.assign_combo.setToolTip("The analyzer slot that takes the device selected in the list below")
+        disc_header.addWidget(self.assign_combo)
+        self.assign_btn = QPushButton("Assign")
+        self.assign_btn.setObjectName("pillBtn")
+        self.assign_btn.setFixedHeight(22)
+        self.assign_btn.clicked.connect(lambda: self._assign_selected_to_slot(self.assign_combo.currentData()))
+        disc_header.addWidget(self.assign_btn)
         disc_card_layout.addLayout(disc_header)
 
         # Interface Selector & Scan Controls Row
@@ -664,7 +659,7 @@ class ConnectionDialog(QDialog):
         for sid, card in self.cards.items():
             if sid not in ("slot_a", "slot_b"):
                 card.setVisible(visible)
-        for w in (self.add_slot_btn, self.remove_slot_btn, self.assign_extra_combo, self.assign_extra_btn):
+        for w in (self.add_slot_btn, self.remove_slot_btn):
             w.setVisible(visible)
 
     def _add_extra_card(self, slot_id: str = None):
@@ -689,8 +684,8 @@ class ConnectionDialog(QDialog):
         card.rescanRequested.connect(self.scan_usb)
         self.cards[slot_id] = card
         self.extra_slots_layout.addWidget(card)
-        self.assign_extra_combo.addItem(f"Sensor {letter}", slot_id)
         card.setVisible(getattr(self, "selected_topology", None) == MultiDeviceTopology.SENSOR_NET)
+        self._refresh_assign_targets()
 
     def _remove_extra_card(self):
         extra = [sid for sid in self.cards if sid not in ("slot_a", "slot_b")]
@@ -699,11 +694,39 @@ class ConnectionDialog(QDialog):
         sid = sorted(extra)[-1]
         card = self.cards.pop(sid)
         self.extra_slots_layout.removeWidget(card); card.deleteLater()
-        i = self.assign_extra_combo.findData(sid)
-        if i >= 0:
-            self.assign_extra_combo.removeItem(i)
         if self.manager is not None:
             self.manager.remove_slot(sid)
+        self._refresh_assign_targets()
+
+    def _refresh_assign_targets(self):
+        """The slots a discovered analyzer can be assigned to: those the chosen topology uses."""
+        combo = getattr(self, "assign_combo", None)
+        if combo is None:
+            return                          # the discovery card is built after the slot cards
+        topo = getattr(self, "selected_topology", MultiDeviceTopology.SINGLE)
+        if topo == MultiDeviceTopology.SINGLE:
+            wanted = ["slot_a"]
+        elif topo == MultiDeviceTopology.SENSOR_NET:
+            wanted = sorted(self.cards)
+        else:
+            wanted = ["slot_a", "slot_b"]
+        keep = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for sid in wanted:
+            card = self.cards.get(sid)
+            if card is None:
+                continue
+            label = card.enable_cb.text().title()
+            alias = card.alias_edit.text().strip()
+            combo.addItem(f"{label} ({alias})" if alias else label, sid)
+        i = combo.findData(keep)
+        if i < 0:
+            # The first slot that has not been given a network analyzer yet, else the first
+            i = next((k for k in range(combo.count())
+                      if not self.cards[combo.itemData(k)].btn_net.isChecked()), 0)
+        combo.setCurrentIndex(max(0, i))
+        combo.blockSignals(False)
 
     def _on_topology_button_clicked(self, btn_id: int):
         self._set_extra_visible(btn_id == 4)
@@ -718,10 +741,6 @@ class ConnectionDialog(QDialog):
             self.card_b.alias_edit.setPlaceholderText("Role Alias (e.g. High Band)")
             self.card_b.enable_cb.setChecked(True)
             self.card_b.show()
-            self.assign_a_btn.setText("Assign to Slot A")
-            self.assign_a_btn.show()
-            self.assign_b_btn.setText("Assign to Slot B")
-            self.assign_b_btn.show()
             self.connect_btn.setText("Connect All Active")
         elif btn_id == 2:
             self.selected_topology = MultiDeviceTopology.DIVERSITY
@@ -734,10 +753,6 @@ class ConnectionDialog(QDialog):
             self.card_b.alias_edit.setPlaceholderText("Role Alias (e.g. Ant Aux)")
             self.card_b.enable_cb.setChecked(True)
             self.card_b.show()
-            self.assign_a_btn.setText("Assign to Slot A")
-            self.assign_a_btn.show()
-            self.assign_b_btn.setText("Assign to Slot B")
-            self.assign_b_btn.show()
             self.connect_btn.setText("Connect All Active")
         elif btn_id == 4:
             self.selected_topology = MultiDeviceTopology.SENSOR_NET
@@ -748,8 +763,6 @@ class ConnectionDialog(QDialog):
                 card.alias_edit.setPlaceholderText("Sensor name (e.g. Stage Left)")
                 card.show()
             self.card_a.enable_cb.setChecked(True)
-            self.assign_a_btn.setText("Assign to A"); self.assign_a_btn.show()
-            self.assign_b_btn.setText("Assign to B"); self.assign_b_btn.show()
             self.connect_btn.setText("Connect All Sensors")
         elif btn_id == 3:
             self.selected_topology = MultiDeviceTopology.INDEPENDENT
@@ -762,10 +775,6 @@ class ConnectionDialog(QDialog):
             self.card_b.alias_edit.setPlaceholderText("Role Alias (e.g. DECT / ShowLink)")
             self.card_b.enable_cb.setChecked(True)
             self.card_b.show()
-            self.assign_a_btn.setText("Assign to Slot A")
-            self.assign_a_btn.show()
-            self.assign_b_btn.setText("Assign to Slot B")
-            self.assign_b_btn.show()
             self.connect_btn.setText("Connect All Active")
         else:
             self.selected_topology = MultiDeviceTopology.SINGLE
@@ -776,10 +785,8 @@ class ConnectionDialog(QDialog):
             self.card_a.show()
             self.card_b.enable_cb.setChecked(False)
             self.card_b.hide()
-            self.assign_a_btn.setText("Assign to Analyzer")
-            self.assign_a_btn.show()
-            self.assign_b_btn.hide()
             self.connect_btn.setText("Connect Analyzer")
+        self._refresh_assign_targets()
 
     def _populate_network_interfaces(self):
         """
@@ -923,6 +930,10 @@ class ConnectionDialog(QDialog):
         what = f"Model {dev['model']:03d}" if dev.get('model') is not None else "analyzer"
         self.scan_status_lbl.setText(f"Assigned {what} ({assigned_name}) to {target_card.enable_cb.text()}.")
         self.scan_status_lbl.setStyleSheet("color: #38bdf8; font-size: 10px;")
+        # Ready for the next one: the selector moves on to the following slot
+        i = self.assign_combo.findData(target_slot_id)
+        if 0 <= i < self.assign_combo.count() - 1:
+            self.assign_combo.setCurrentIndex(i + 1)
 
     def _on_connect_clicked(self):
         self.accept()

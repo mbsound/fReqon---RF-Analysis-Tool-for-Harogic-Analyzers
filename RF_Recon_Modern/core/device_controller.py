@@ -871,6 +871,15 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                 stop_mscan_if_running()
                 result = {"id": req_id, "center_freq": float(c_freq), "trigger_source": int(trig_src), "ok": False}
                 try:
+                    # A capture timed by the PPS starts on the first sample after the second:
+                    # it is taken at a fast rate, so that this is tens of nanoseconds and not
+                    # a microsecond, and brought down to the rate asked for afterwards
+                    try:
+                        from .tdoa import capture_plan, reduce_rate, BASE_SAMPLE_PERIOD_NS
+                    except ImportError:
+                        from tdoa import capture_plan, reduce_rate, BASE_SAMPLE_PERIOD_NS
+                    want_dec, want_samples = int(dec_factor), int(n_samp)
+                    dec_factor, n_samp, reduce_by = capture_plan(want_dec, want_samples, trig_src)
                     prof_in, prof_out, s_info = IQS_Profile_TypeDef(), IQS_Profile_TypeDef(), IQS_StreamInfo_TypeDef()
                     dll.IQS_ProfileDeInit(ctypes.pointer(device), ctypes.pointer(prof_in))
                     prof_in.CenterFreq_Hz = float(c_freq)
@@ -917,8 +926,25 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                     k = float(scale.value) if scale.value > 0 else 1.97e-6
                     iq = (arr[0::2].astype(np.float32) + 1j * arr[1::2].astype(np.float32)) * np.float32(k)
                     sr = float(s_info.IQSampleRate) or IQ_FALLBACK_BASE_RATE_HZ / max(1, int(prof_out.DecimateFactor))
-                    result.update({"ok": True, "sample_rate": sr, "decimate": int(prof_out.DecimateFactor),
-                                   "samples": len(iq), "bandwidth": float(s_info.Bandwidth)})
+                    hw_dec = int(prof_out.DecimateFactor)
+                    if hw_dec != int(dec_factor):
+                        # The analyzer chose another rate: reduce by what still gets nearest to the one asked for
+                        reduce_by = max(1, want_dec // max(hw_dec, 1))
+                        reduce_by = 1 << (reduce_by.bit_length() - 1)
+                    iq = reduce_rate(iq, reduce_by)[:want_samples]
+                    # Whether GNSS was locked when this was taken: without a lock the analyzer
+                    # still fires on a time pulse, but not on the GPS second
+                    try:
+                        g_now = GNSSInfo_TypeDef()
+                        if dll.Device_GetGNSSInfo(ctypes.pointer(device), ctypes.pointer(g_now)) == 0:
+                            result["gnss_lock"] = bool(g_now.GNSS_LockState)
+                            result["gnss_sats"] = int(g_now.SatsNum)
+                    except Exception:
+                        pass
+                    result.update({"ok": True, "sample_rate": sr / reduce_by, "decimate": hw_dec * reduce_by,
+                                   "samples": len(iq), "bandwidth": float(s_info.Bandwidth),
+                                   "capture_decimate": hw_dec, "capture_samples": int(n_samp),
+                                   "start_grid_ns": BASE_SAMPLE_PERIOD_NS * hw_dec})
                     data_queue.put(("timed_capture", (iq.astype(np.complex64), result)))
                 except Exception as e:
                     result["error"] = str(e)

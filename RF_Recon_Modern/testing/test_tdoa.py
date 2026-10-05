@@ -15,6 +15,7 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from core import tdoa
 from core.tdoa import TDOASession, synth_captures, correlate, decimation_for, gps_second, C
 
 SENSORS = {"a": (0.0, 0.0), "b": (120.0, 0.0), "c": (60.0, 100.0), "d": (0.0, 90.0)}
@@ -89,6 +90,47 @@ def test_session():
     assert err_m(s.result()) < 1.5
 
 
+def test_unlocked_captures_are_left_out():
+    """A capture taken without a GNSS lock is not on the GPS second: it is refused, and the result says why."""
+    session = TDOASession({"slot_a": (0.0, 0.0), "slot_b": (50.0, 0.0)}, 539e6)
+    iq = np.ones(256, dtype=np.complex64)
+    for sec in range(100, 104):
+        session.add_capture("slot_a", iq, {"ok": True, "ns_since_epoch": sec * 10**9 - 104, "sample_rate": 1e6, "gnss_lock": True})
+        assert session.add_capture("slot_b", iq, {"ok": True, "ns_since_epoch": sec * 10**9 - 104, "sample_rate": 1e6,
+                                                  "gnss_lock": False}) is None
+    assert session.unlocked == {"slot_b": 4} and not session.rounds
+    res = session.result()
+    assert res["fix"] is None and "not locked on analyzer B" in res["note"], res["note"]
+
+
+def test_fast_capture_reduced():
+    """A PPS capture is taken fast and reduced: the start keeps the fast rate's resolution."""
+    assert tdoa.capture_plan(64, 32768) == (4, 32768 * 16, 16)
+    assert tdoa.capture_plan(128, 32768) == (4, 32768 * 32, 32)
+    assert tdoa.capture_plan(4, 4096) == (4, 4096, 1) and tdoa.capture_plan(2, 4096) == (2, 4096, 1)
+    assert tdoa.capture_plan(64, 32768, trigger_source=2) == (64, 32768, 1), "only PPS captures"
+
+    # A 200 kHz-wide carrier at 31.25 MS/s, and the same arriving 3 fast samples (96 ns) later:
+    # far less than one sample of the reduced rate (512 ns), and still measured
+    rng = np.random.default_rng(3)
+    fast, n, factor = 125e6 / 4, 1 << 19, 16
+    spec = np.zeros(n, dtype=complex)
+    k = int(n * 100e3 / fast)
+    spec[:k] = rng.normal(size=k) + 1j * rng.normal(size=k)
+    spec[-k:] = rng.normal(size=k) + 1j * rng.normal(size=k)
+    sig = np.fft.ifft(spec).astype(np.complex64)
+    sig /= np.abs(sig).std()
+    noise = lambda: (rng.normal(0, 0.05, n) + 1j * rng.normal(0, 0.05, n)).astype(np.complex64)
+    a, b = sig + noise(), np.roll(sig, 3) + noise()
+    ra, rb = tdoa.reduce_rate(a, factor), tdoa.reduce_rate(b, factor)
+    assert len(ra) == n // factor and ra.dtype == np.complex64
+    delay, quality, _f = tdoa.correlate(ra, rb, fast / factor)
+    assert abs(delay * 1e9 - 96.0) < 10.0, delay * 1e9
+    # Out-of-band energy does not fold into the reduced capture
+    tone = np.exp(2j * np.pi * 5e6 * np.arange(n) / fast).astype(np.complex64)
+    assert np.abs(tdoa.reduce_rate(tone, factor)[64:-64]).max() < 0.01
+
+
 def test_run_in_main_window():
     from PyQt6.QtCore import QSettings
     from PyQt6.QtWidgets import QApplication
@@ -152,7 +194,8 @@ def test_run_in_main_window():
 
 
 if __name__ == "__main__":
-    for test in (test_correlation, test_session, test_run_in_main_window):
+    for test in (test_correlation, test_session, test_unlocked_captures_are_left_out, test_fast_capture_reduced,
+                 test_run_in_main_window):
         t0 = time.monotonic()
         test()
         print(f"ok  {test.__name__}  ({time.monotonic() - t0:.1f} s)")

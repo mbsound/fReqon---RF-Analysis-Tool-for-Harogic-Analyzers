@@ -26,6 +26,17 @@ STALE_S = 10.0              # a sensor's sighting counts for this long
 TDOA_FRESH_S = 300.0        # a time-difference fix is shown this long (the transmitter may move)
 MEASURE_PERIOD_S = 0.1      # fingerprint measurements per sensor per carrier
 SOLVE_PERIOD_S = 1.0        # position/device refresh
+# Carriers are looked for in the average of the last sweeps, not in single sweeps: one sweep
+# of noise alone has points 10 dB and more above its floor, somewhere different every time,
+# and each of those used to be listed (and given a device name). Averaged, the noise is
+# within a few dB of flat and what stands out of it is there sweep after sweep.
+AVG_SWEEPS = 16             # sweeps in the running average
+MIN_AVG_SWEEPS = 8          # nothing is detected before this many
+MIN_PROMINENCE_DB = 6.0     # a carrier stands this far out of what is around it (ripple on a TV channel does not)
+# A GNSS fix on a weak signal or few satellites can be tens of metres out, steadily: flagged
+WEAK_FIX_SNR_DBHZ = 25      # average signal of the satellites in use, below this
+WEAK_FIX_SATS = 6           # satellites in use, fewer than this
+IDENTIFY_MIN_SNR_DB = 20.0  # below this over the floor, at the best sensor, a carrier is listed but not named
 
 
 @dataclass
@@ -53,10 +64,15 @@ class Sensor:
     last_sweep: tuple = None
     last_measure: float = 0.0
     floor_dbm: float = -120.0
+    avg_mw: object = None        # running average of the sweeps (linear power), and how many are in it
+    avg_n: int = 0
+    avg_span: tuple = None
 
     def has_fix(self) -> bool:
         g = self.gnss
-        return bool(g) and bool(g.get("lock")) and g.get("lat") not in (None, 0.0)
+        # (The first report after connecting can say "locked" with no satellites and a
+        # height of zero: values from before any data arrived. That is not a fix.)
+        return bool(g) and bool(g.get("lock")) and g.get("lat") not in (None, 0.0) and g.get("sats", 1) != 0
 
     MOVED_M = 40.0                # a fix this far from the mean: the sensor has been moved
     MAX_FIXES = 720               # the mean follows slow drift (an hour of fixes at 5 s)
@@ -101,12 +117,14 @@ class Sensor:
         if g.get("sats_in_view"):
             sats += f" of {g['sats_in_view']} in view"
         if g.get("snr_avg"):
-            sats += f", signal {g['snr_avg']} dB-Hz (best {g.get('snr_max', '?')})"
+            sats += f", signal {g['snr_avg']} dB-Hz"
+            if g.get("snr_min") and g.get("snr_max"):
+                sats += f" ({g['snr_min']} to {g['snr_max']})"
         parts.append(sats)
         parts.append(f"altitude {self.fix_alt:.0f} m")
         t = g.get("time")
         if t and t[0]:
-            parts.append(f"{t[3]:02d}:{t[4]:02d}:{t[5]:02d} UTC")
+            parts.append(f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d} {t[3]:02d}:{t[4]:02d}:{t[5]:02d} UTC")
         off = g.get("ref_offset_ppm")
         off_txt = f"{off:+.2f} ppm from GNSS" if off is not None else ""
         if g.get("docxo_lock"):
@@ -129,6 +147,92 @@ class Sensor:
         if self.lat is not None and self.lon is not None:
             return self.lat, self.lon, self.alt or 0.0
         return None
+
+    def gnss_rows(self):
+        """
+        The GNSS receiver's state as [(label, value)] (what the analyzer's own software
+        lists: lock, position, height, satellites, signal, time, reference), or a sentence
+        when there is nothing to tabulate.
+        """
+        g = self.gnss
+        if not g:
+            return "No GNSS data from this analyzer."
+        if not self.has_fix():
+            n = g.get("sats_in_view") or 0
+            seen = f"{n} satellite{'' if n == 1 else 's'} in view" if n else "no satellites in view yet"
+            return [("Lock", "<span style='color:#f59e0b'>Searching</span>"), ("Satellites", seen)]
+        spread = self.fix_spread_m()
+        weak = self.weak_fix()
+        rows = [("Lock", "<span style='color:#10b981'>Locked</span>")]
+        if weak:
+            rows = [("Lock", "<span style='color:#f59e0b'>Locked, weak fix</span>"),
+                    ("", f"<span style='color:#f59e0b'>Position unreliable ({weak}): it can be tens of metres out</span>")]
+        rows += [("Position", f"{self.fix_lat:.6f}, {self.fix_lon:.6f}"),
+                ("", f"mean of {self.fix_n} fixes" + (f", ±{spread:.1f} m" if spread is not None else "")),
+                ("Height", f"{self.fix_alt:.0f} m")]
+        sats = f"{g.get('sats_used', g.get('sats', '?'))} used"
+        if g.get("sats_in_view"):
+            sats += f" of {g['sats_in_view']} in view"
+        rows.append(("Satellites", sats))
+        if g.get("snr_avg"):
+            rows.append(("Signal", f"{g['snr_avg']} dB-Hz average"
+                         + (f" ({g['snr_min']} to {g['snr_max']})" if g.get("snr_min") and g.get("snr_max") else "")))
+        t = g.get("time")
+        if t and t[0]:
+            rows.append(("Time", f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d} {t[3]:02d}:{t[4]:02d}:{t[5]:02d} UTC"))
+        off = g.get("ref_offset_ppm")
+        off_txt = f"{off:+.2f} ppm" if off is not None else ""
+        if g.get("docxo_lock"):
+            ref = "locked to GNSS" + (f" ({off_txt})" if off_txt else "")
+        elif g.get("ocxo_type") == 0:
+            ref = "free-running" + (f", {off_txt} from GNSS" if off_txt else "")
+        else:
+            ref = "not locked to GNSS" + (f", {off_txt}" if off_txt else "")
+        rows.append(("Reference", ref))
+        return rows
+
+    def weak_fix(self):
+        """Why the present fix should not be trusted for the sensor's position ("signal 9 dB-Hz,
+        4 satellites"), or None when it is sound or there is no fix."""
+        if self.position_source != "gnss" or not self.has_fix():
+            return None
+        g = self.gnss
+        why = []
+        snr = g.get("snr_avg")
+        if snr and snr < WEAK_FIX_SNR_DBHZ:
+            why.append(f"signal {snr} dB-Hz")
+        used = g.get("sats_used", g.get("sats"))
+        if used is not None and used < WEAK_FIX_SATS:
+            why.append(f"{used} satellite{'' if used == 1 else 's'}")
+        return ", ".join(why) or None
+
+    def restart_average(self):
+        """Forget the fixes averaged so far (the antenna was moved, or they were taken on a weak signal)."""
+        self.fix_n, self.fix_var_m2 = 0, 0.0
+
+    def went_offline(self):
+        """The analyzer is disconnected: its last GNSS report no longer describes it. (The mean
+        of its fixes is kept: reconnected in the same place, it carries on from there.)"""
+        self.gnss = {}
+
+    def table_fields(self) -> dict:
+        """What the sensor table shows besides the position: height, satellites, lock."""
+        g = self.gnss or {}
+        fix = self.has_fix()
+        if self.position_source == "gnss":
+            lock = ("Weak fix" if self.weak_fix() else "Locked") if fix else ("Searching" if g else "No GNSS")
+        else:
+            lock = "Manual" if (self.x_m is not None or self.lat is not None) else "No position"
+        ll = self.latlon()
+        height = f"{ll[2]:.0f} m" if (ll and self.position_source == "gnss") else ""
+        used, view = g.get("sats_used", g.get("sats")), g.get("sats_in_view")
+        if not g:
+            sats = ""
+        elif fix and used:
+            sats = f"{used}/{view}" if view else f"{used}"
+        else:
+            sats = f"0/{view}" if view else "0"
+        return {"height": height, "sats": sats, "lock": lock, "has_fix": fix, "weak": self.weak_fix() or ""}
 
     def status(self) -> str:
         if self.position_source == "gnss":
@@ -213,20 +317,33 @@ class SensorNet:
         if len(f) < 10:
             return
         now = time.time()
-        floor = float(np.percentile(p, 20))
-        s.floor_dbm = floor
         s.last_sweep = (f, p)
+        # The running average (in linear power), started again when the sweep's range changes
+        span = (len(f), float(f[0]), float(f[-1]))
+        mw = np.power(10.0, np.clip(p, -200.0, 60.0) / 10.0)
+        if s.avg_mw is None or s.avg_span != span:
+            s.avg_mw, s.avg_n, s.avg_span = mw, 1, span
+            s.sightings.clear()
+        else:
+            s.avg_n = min(s.avg_n + 1, AVG_SWEEPS)
+            s.avg_mw = s.avg_mw + (mw - s.avg_mw) / s.avg_n
+        raw = p
+        p = 10.0 * np.log10(np.maximum(s.avg_mw, 1e-20))
+        floor = float(np.median(p))
+        s.floor_dbm = floor
+        if s.avg_n < MIN_AVG_SWEEPS:
+            return
         thresh = floor + self.margin_db
-        peaks, _ = signal.find_peaks(p, height=thresh, prominence=1.0, distance=3)
+        peaks, _ = signal.find_peaks(p, height=thresh, prominence=MIN_PROMINENCE_DB, distance=3)
         seen = {}
         for i in peaks[np.argsort(-p[peaks])]:
             fk = self._key(f[i])
-            if any(abs(fk - k) < MATCH_HZ for k in seen):
+            if any(abs(fk - k) <= MATCH_HZ for k in seen):
                 continue
             seen[fk] = float(p[i])
         for fk, lvl in seen.items():
             # fold into an existing sighting within the match tolerance
-            key = next((k for k in s.sightings if abs(k - fk) < MATCH_HZ), fk)
+            key = next((k for k in s.sightings if abs(k - fk) <= MATCH_HZ), fk)
             s.sightings[key] = (lvl, floor, now)
         # carriers other sensors see: record this sensor's level there too (maybe below threshold)
         for key in list(self.estimates):
@@ -240,7 +357,7 @@ class SensorNet:
             s.last_measure = now
             recent = [k for k, (lvl, fl, t) in s.sightings.items() if now - t < STALE_S and lvl >= fl + 8]
             if recent:
-                s.fingerprinter.update_sweep(f, p, recent, rbw_hz)
+                s.fingerprinter.update_sweep(f, raw, recent, rbw_hz)      # single sweeps: how it behaves in time
         for k in [k for k, v in s.sightings.items() if now - v[2] > STALE_S * 3]:
             del s.sightings[k]
             s.fingerprinter.forget(k)
@@ -281,7 +398,9 @@ class SensorNet:
             est.levels = levels
             est.last_seen = now
             v = vote_device(fps)
-            if v:
+            if fps and max(snr for _r, snr in fps) < IDENTIFY_MIN_SNR_DB:
+                est.device, est.confidence, est.candidates = "Too weak to identify", 0, []
+            elif v:
                 est.device, est.confidence, est.candidates = v
             # position from the sensors that both see it and know where they are
             usable = [(pos[sid], lvl) for sid, lvl in levels.items() if sid in pos]
