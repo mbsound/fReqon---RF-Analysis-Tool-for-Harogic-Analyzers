@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QFormLayout, QGroupBox, QDoubleSpinBox, QGridLayout, QCheckBox,
     QLineEdit, QSlider
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 class WaterfallSettingsDialog(QDialog):
     """
@@ -126,16 +126,19 @@ class QuickSettingsDialog(QDialog):
 
 class LaunchSettingsDialog(QDialog):
     """
-    Startup Defaults & Launch State Preference Dialog.
+    Startup Defaults & Launch State Preference Dialog, and the spectrum export.
     """
+    exportRequested = pyqtSignal(list)      # names of the traces to export as CSV
+
     def __init__(self, region_configs: dict, current_region="North America",
                  sweep_start=470.0, sweep_stop=608.0, sweep_anchors=None,
                  view_start=470.0, view_stop=608.0, view_anchors=None,
-                 link_view=True, parent=None):
+                 link_view=True, export_traces=None, parent=None):
+        """export_traces: [(trace name, label, why it cannot be exported or "")], in the order shown."""
         super().__init__(parent)
-        self.setWindowTitle("Launch Settings & Startup Defaults")
+        self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(600, 480)
+        self.resize(600, 600)
         
         self.region_configs = region_configs
         self.current_region = current_region
@@ -186,6 +189,43 @@ class LaunchSettingsDialog(QDialog):
         self.link_view_cb.setChecked(link_view)
         view_layout.addWidget(self.link_view_cb)
         layout.addWidget(view_group)
+
+        # 4. Spectrum export (acts at once; it is not one of the saved preferences)
+        exp_group = QGroupBox("Export Spectrum to CSV")
+        exp_group.setToolTip("The traces as they are now, in the layout SAStudio4 exports: four header lines, then\n"
+                             "one \"frequency in Hz, level in dBm\" row per point. One file per trace.\n"
+                             "In Soundbase, import them with the SAN-60 importer.")
+        exp_layout = QVBoxLayout(exp_group)
+        row = QHBoxLayout()
+        row.setSpacing(18)
+        self.export_checks = {}
+        for name, label, why_not in (export_traces or []):
+            cb = QCheckBox(label)
+            cb.setEnabled(not why_not)
+            cb.setChecked(not why_not)
+            cb.setToolTip(why_not or f"Export the {label} trace")
+            cb.toggled.connect(self._sync_export_btn)
+            self.export_checks[name] = cb
+            row.addWidget(cb)
+        row.addStretch()
+        self.export_btn = QPushButton("Export CSV…")
+        self.export_btn.clicked.connect(lambda: self.exportRequested.emit(self.export_selection()))
+        row.addWidget(self.export_btn)
+        exp_layout.addLayout(row)
+        self.export_note = QLabel("One file per trace, named fReqon_<date>_<time>_<trace>.csv, "
+                                  "for example fReqon_20261005_155043_MaxHold.csv.")
+        self.export_note.setWordWrap(True)
+        self.export_note.setStyleSheet("color: #8b949e; font-size: 11px;")
+        exp_layout.addWidget(self.export_note)
+        # (Stays put: the line above is replaced by the result of an export)
+        self.export_hint = QLabel("To bring a file into Soundbase, use Soundbase's <b>SAN-60</b> importer: "
+                                  "the files are in that analyzer's export layout.")
+        self.export_hint.setWordWrap(True)
+        self.export_hint.setTextFormat(Qt.TextFormat.RichText)
+        self.export_hint.setStyleSheet("color: #c9d1d9; font-size: 11px;")
+        exp_layout.addWidget(self.export_hint)
+        layout.addWidget(exp_group)
+        self._sync_export_btn()
         
         layout.addStretch()
         
@@ -201,6 +241,17 @@ class LaunchSettingsDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
         layout.addLayout(btn_layout)
+
+    def export_selection(self) -> list:
+        return [name for name, cb in self.export_checks.items() if cb.isEnabled() and cb.isChecked()]
+
+    def _sync_export_btn(self, *_):
+        self.export_btn.setEnabled(bool(self.export_selection()))
+
+    def set_export_result(self, text: str, ok: bool = True):
+        """Say under the export controls what was written, or why nothing was."""
+        self.export_note.setText(text)
+        self.export_note.setStyleSheet(f"color: {'#10b981' if ok else '#f59e0b'}; font-size: 11px;")
 
     def get_settings(self):
         return {

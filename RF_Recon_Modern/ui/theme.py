@@ -291,7 +291,7 @@ QDoubleSpinBox:focus, QSpinBox:focus {{
     background-color: #1c2128;
 }}
 
-QLabel:disabled {{
+QLabel:disabled, QCheckBox:disabled {{
     color: {TEXT_MUTED};
 }}
 

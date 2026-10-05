@@ -118,6 +118,9 @@ class MainWindow(QMainWindow):
         self._fp_background = False     # Analyzer B fingerprinting continuously
         self._fp_bg_channels = ()
         self._rbw_by_slot = {}
+        self._bw_by_slot = {}               # slot -> (RBW, VBW) the analyzer last reported
+        self._holds_restart_pending = False
+        self._last_detect = None
         # Intermodulation analysis (see core/intermod.py)
         self.coord_carriers = []        # coordinated carriers with zone and spare flag
         self._im_map = None
@@ -888,7 +891,30 @@ class MainWindow(QMainWindow):
             self.sweep_panel.atten_spin.blockSignals(False)
         self.top_bar.flash_status(f"Ref Level adjusted to {ref_level:.1f} dBm by hardware")
 
+    def _restart_held_traces(self, why: str = ""):
+        """
+        Max hold, min hold and average start again from the next sweep. They are built from
+        earlier sweeps, and once the bandwidth or the detector changes those sweeps are not
+        comparable: a max hold kept from a wide VBW stays up at the old noise peaks for good,
+        on screen and in an export.
+        """
+        had = self.max_hold_data is not None or self.min_hold_data is not None or bool(self.avg_history)
+        self.max_hold_data = self.min_hold_data = None
+        self.avg_history = []
+        self._reset_b_holds()
+        if had and why:
+            self.top_bar.flash_status(f"Max / Min / Average restarted: {why}", 4000)
+
     def _on_bandwidth_updated(self, slot_id: str, rbw_hz: float, vbw_hz: float):
+        # The analyzer reports its bandwidths each time the sweep is re-armed, ahead of the
+        # first sweep taken with them: the moment to restart the held traces
+        before = self._bw_by_slot.get(slot_id)
+        self._bw_by_slot[slot_id] = (round(float(rbw_hz), 3), round(float(vbw_hz), 3))
+        if before is not None and before != self._bw_by_slot[slot_id]:
+            self._restart_held_traces("the bandwidth changed")
+        elif self._holds_restart_pending:
+            self._restart_held_traces("the detector changed")
+        self._holds_restart_pending = False
         self._rbw_by_slot[slot_id] = rbw_hz
         if not self._settings_slot or slot_id == self._settings_slot:
             self.sweep_panel.update_hardware_bandwidth(rbw_hz, vbw_hz)
@@ -2253,6 +2279,9 @@ class MainWindow(QMainWindow):
         if not self.is_connected: return
         det = self.sweep_panel.detector_combo.currentIndex()
         tdet = self.sweep_panel.trace_detector_combo.currentIndex()
+        if self._last_detect is not None and self._last_detect != (det, tdet):
+            self._holds_restart_pending = True          # acted on when the analyzer has re-armed
+        self._last_detect = (det, tdet)
         target_slot = self._settings_target()
         self.multi_device_manager.set_detect_params(det, tdet, target_slot_id=target_slot)
         self._store_panel_settings()
@@ -2390,11 +2419,16 @@ class MainWindow(QMainWindow):
             self._update_region_ui()
 
     def open_launch_settings(self):
+        traces = self._exportable_traces()
         dlg = LaunchSettingsDialog(
             self.region_configs, self.current_region,
             self.sweep_panel.start_spin.value(), self.sweep_panel.stop_spin.value(),
-            link_view=self.sweep_panel.link_view_check.isChecked(), parent=self
+            link_view=self.sweep_panel.link_view_check.isChecked(),
+            export_traces=[(name, label, "" if name in traces else why)
+                           for name, label, why in self._export_choices(traces)],
+            parent=self
         )
+        dlg.exportRequested.connect(lambda names: self._export_spectrum_csv(names, dlg))
         if dlg.exec():
             res = dlg.get_settings()
             self.settings.setValue("launch_default_region", res["default_region"])
@@ -2405,6 +2439,64 @@ class MainWindow(QMainWindow):
             self.settings.setValue("launch_sweep_start", res["sweep_start"])
             self.settings.setValue("launch_sweep_stop", res["sweep_stop"])
             self.settings.setValue("launch_link_view", res["link_view"])
+
+    # --- Spectrum export (core/spectrum_export.py: the layout SAStudio4 exports) ---
+    def _exportable_traces(self) -> dict:
+        """{trace name: (frequencies Hz, levels dBm)} for the traces that are on and have data."""
+        if self._last_sweep is None or len(self._last_sweep[0]) < 2:
+            return {}
+        f, live = self._last_sweep
+        rows = self.sweep_panel.trace_rows
+        on = lambda name: rows[name]["cb"].isChecked()
+        out = {}
+        if on("Real-Time"):
+            out["Real-Time"] = (f, live)
+        if on("Max. Hold") and self.max_hold_data is not None and len(self.max_hold_data) == len(f):
+            out["Max. Hold"] = (f, self.max_hold_data)
+        if on("Min. Hold") and self.min_hold_data is not None and len(self.min_hold_data) == len(f):
+            out["Min. Hold"] = (f, self.min_hold_data)
+        if on("Average") and self.avg_history and len(self.avg_history[0]) == len(f):
+            out["Average"] = (f, np.mean(self.avg_history, axis=0))
+        return out
+
+    def _export_choices(self, traces: dict) -> list:
+        """[(trace name, label, why it cannot be exported)] for the settings dialog."""
+        rows = self.sweep_panel.trace_rows
+        choices = []
+        for name, label in (("Real-Time", "Live"), ("Max. Hold", "Max hold"), ("Min. Hold", "Min hold"), ("Average", "Average")):
+            if self._last_sweep is None:
+                why = "No sweep yet: connect an analyzer and sweep first."
+            elif not rows[name]["cb"].isChecked():
+                why = f"The {label} trace is switched off (the trace buttons in the top bar)."
+            else:
+                why = f"The {label} trace has no data yet."
+            choices.append((name, label, why))
+        return choices
+
+    def _export_spectrum_csv(self, names: list, dlg=None):
+        """Write the chosen traces, one file each, into a folder the user picks. Returns the paths."""
+        from datetime import datetime
+        from PyQt6.QtWidgets import QFileDialog
+        from core import spectrum_export
+        traces = self._exportable_traces()
+        names = [n for n in names if n in traces]
+        say = (lambda text, ok=True: dlg.set_export_result(text, ok)) if dlg is not None else (lambda text, ok=True: self.top_bar.flash_status(text, 6000))
+        if not names:
+            say("Nothing to export: no trace that is switched on has data.", False)
+            return []
+        start = self.settings.value("export_folder", "") or os.path.expanduser("~/Documents")
+        folder = QFileDialog.getExistingDirectory(dlg or self, "Export spectrum CSV to folder", start)
+        if not folder:
+            return []
+        self.settings.setValue("export_folder", folder)
+        when = datetime.now()               # one time stamp for the set: the files belong together
+        try:
+            paths = [spectrum_export.write_csv(folder, n, *traces[n], when=when) for n in names]
+        except OSError as e:
+            say(f"Export failed: {e}", False)
+            return []
+        say(f"Exported {len(paths)} file{'' if len(paths) == 1 else 's'} to {folder}: " + ", ".join(p.name for p in paths))
+        return paths
 
     # --- DTV & Broadcast Coordination ---
     def _on_fcc_lookup(self, zip_code: str):
