@@ -696,6 +696,16 @@ class MainWindow(QMainWindow):
     # --- Hardware & Multi-Device Sweep Loop ---
     def toggle_connection(self):
         if not self.is_connected:
+            busy = self.multi_device_manager.connecting()
+            if busy:
+                # An open is under way (a network analyzer takes 5 s or more): starting over
+                # would abandon it half-way and the analyzer may then refuse the next one
+                names = ", ".join(self._slot_label(sid) for sid in busy)
+                self.top_bar.flash_status(f"Still connecting to {names}… (click again to give up and reconnect)", 3000)
+                self._connect_pressed_while_busy = getattr(self, "_connect_pressed_while_busy", 0) + 1
+                if self._connect_pressed_while_busy < 2:
+                    return
+            self._connect_pressed_while_busy = 0
             self.top_bar.set_device_status(False, "Connecting...")
             started = self.multi_device_manager.connect_all_enabled()
             if not started:
@@ -4531,7 +4541,12 @@ class MainWindow(QMainWindow):
                 self.connect_analyzer()
 
     def _restore_slots(self):
-        """Extra analyzer slots and their addresses from the last remembered Connection dialog."""
+        """
+        Every analyzer slot as the Connection dialog last remembered it: interface, address,
+        the analyzer it was given, alias. (Slots A and B used to be left at their defaults,
+        so a saved Ethernet analyzer came back as "USB Direct" at the next launch and the
+        Connect button looked for a USB analyzer that was not there.)
+        """
         try:
             slots = json.loads(self.settings.value("multi_device_slots", "") or "{}")
         except (TypeError, ValueError):
@@ -4540,10 +4555,11 @@ class MainWindow(QMainWindow):
         if topo:
             self.multi_device_manager.set_topology(topo)
         for s_id, s_cfg in slots.items():
-            if s_id in ("slot_a", "slot_b") or not isinstance(s_cfg, dict):
+            if not isinstance(s_cfg, dict):
                 continue
             slot = self.multi_device_manager.ensure_slot(s_id)
-            slot.is_enabled = bool(s_cfg.get("enabled", False))
+            # Slot A is always in use on its own; the others as remembered
+            slot.is_enabled = True if s_id == "slot_a" else bool(s_cfg.get("enabled", False))
             slot.role_alias = (s_cfg.get("alias") or "").strip()
             slot.interface_type = s_cfg.get("interface", slot.interface_type)
             slot.ip_address = s_cfg.get("ip", slot.ip_address)

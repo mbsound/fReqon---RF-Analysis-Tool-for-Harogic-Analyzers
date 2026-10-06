@@ -59,8 +59,72 @@ def test_interface_choice():
         socket.gethostbyname, net_route._interface_from_mdns = real_gh, real_if
 
 
+def test_renamed_analyzers_are_found():
+    """Discovery goes by what a unit serves, not by its name: an owner may rename it."""
+    addresses = {"67-0123456789abcdef.local": "192.168.1.100", "Stage-Left.local": "192.168.2.100",
+                 "mattbook.local": "192.168.2.50", "Other-Subnet.local": "10.9.8.7"}
+    resolve = lambda host: addresses[host] if host in addresses else (_ for _ in ()).throw(OSError("unknown"))
+    harogic = {"192.168.1.100", "192.168.2.100"}                 # answer on the Harogic ports over IPv4
+    sa6 = ("fe80::1", 0, 0, 7)
+    v6 = {"Other-Subnet.local": (sa6, "en7"), "mattbook.local": (("fe80::2", 0, 0, 7), "en7")}
+    kw = dict(resolve=resolve, probe=lambda ip: ip in harogic, resolve6=lambda h: v6.get(h),
+              probe6=lambda sa: sa == sa6, info=lambda where: {"harogic": True, "device_id": "67-00000000000000aa"}
+              if where == sa6 else None)
+    # The factory name: model and serial from the name
+    e = net_route.identify("67-0123456789abcdef", "en7", **kw)
+    assert e == {"hostname": "67-0123456789abcdef.local", "model": 67, "uid": 0x0123456789abcdef,
+                 "interface": "en7", "ip": "192.168.1.100", "via": "ipv4"}, e
+    # A renamed unit: found by its ports; model and serial read later, on connecting
+    e = net_route.identify("Stage-Left", "en7", **kw)
+    assert e == {"hostname": "Stage-Left.local", "model": None, "uid": None, "interface": "en7",
+                 "ip": "192.168.2.100", "via": "ipv4"}, e
+    assert net_route.identify("Stage-Left.local.", "en7", **kw)["hostname"] == "Stage-Left.local"
+    # A renamed unit on another subnet: found over IPv6 link-local, and it says what it is
+    e = net_route.identify("Other-Subnet", "", **kw)
+    assert e == {"hostname": "Other-Subnet.local", "model": 67, "uid": 0xaa, "interface": "en7",
+                 "ip": "10.9.8.7", "via": "ipv6"}, e
+    # Another computer announcing itself, or a name that does not resolve: not an analyzer
+    assert net_route.identify("mattbook", "en7", **kw) is None
+    assert net_route.identify("gone-away", "en7", **kw) is None
+
+
+def test_link_local_forwarder():
+    """The SDK's IPv4 connection to 127.0.0.1 is carried over IPv6, both ways, intact."""
+    import threading
+    echo = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    echo.bind(("::1", 0)); echo.listen(2)
+    eport = echo.getsockname()[1]
+    def serve():
+        c, _ = echo.accept()
+        while True:
+            d = c.recv(65536)
+            if not d: break
+            c.sendall(d)
+        c.close()
+    threading.Thread(target=serve, daemon=True).start()
+    fwd = net_route.LinkLocalForwarder(("::1", 0, 0, 0), eport)
+    lport = fwd.start()
+    c = socket.create_connection(("127.0.0.1", lport), timeout=5)
+    blob = os.urandom(2_000_000)
+    got = bytearray()
+    def reader():
+        while len(got) < len(blob):
+            d = c.recv(262144)
+            if not d: break
+            got.extend(d)
+    t = threading.Thread(target=reader); t.start()
+    c.sendall(blob); t.join(10)
+    assert bytes(got) == blob
+    c.close(); fwd.close()
+    # An address typed in is used as it is; a name on a local subnet takes the normal way
+    ifcs = [{"name": "en7", "ip": "192.168.2.2", "mask": "255.255.255.0"}]
+    assert net_route.link_local_route("192.168.9.9", 5000, ifcs) is None
+    assert net_route.link_local_route("x.local", 5000, ifcs, ipv4="192.168.2.100") is None
+    assert net_route.on_local_subnet("192.168.2.100", ifcs) and not net_route.on_local_subnet("192.168.1.100", ifcs)
+
+
 if __name__ == "__main__":
-    for test in (test_names, test_interface_choice):
+    for test in (test_names, test_interface_choice, test_renamed_analyzers_are_found, test_link_local_forwarder):
         t0 = time.monotonic()
         test()
         print(f"ok  {test.__name__}  ({time.monotonic() - t0:.1f} s)")

@@ -200,6 +200,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
     boot_profile = BootProfile_TypeDef()
     boot_info = BootInfo_TypeDef()
 
+    shown_port = port               # the analyzer's port, for messages (a link-local forwarder has its own)
     if interface_type.lower() == "network":
         boot_profile.PhysicalInterface = PhysicalInterface_TypeDef.ETH
         boot_profile.DevicePowerSupply = DevicePowerSupply_TypeDef.Others
@@ -215,12 +216,30 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                 local_ifcs = [i for i in DeviceController.get_local_network_interfaces() if i.get("state") == "up"]
             except Exception:
                 local_ifcs = []
-            resolved_ip, net_if, route_note = net_route.resolve(target_str, int(port), local_ifcs)
+            try:
+                resolved_ip, net_if, route_note = net_route.resolve(target_str, int(port), local_ifcs)
+            except OSError:
+                resolved_ip, net_if, route_note = None, None, ""      # perhaps reachable over IPv6 only
+            # Not on any of this computer's networks (or no IPv4 at all): over the cable by
+            # IPv6 link-local, through a local forwarder (the SDK connects to it over IPv4)
+            ll = net_route.link_local_route(target_str, int(port), local_ifcs, resolved_ip,
+                                            force=os.environ.get("FREQON_FORCE_LINK_LOCAL") == "1")
+            if ll is not None:
+                link_forwarder = net_route.LinkLocalForwarder(ll["sockaddr"], int(port))
+                local_port = link_forwarder.start()
+                off_subnet = resolved_ip and not net_route.on_local_subnet(resolved_ip, local_ifcs)
+                route_note = (f"reached over IPv6 link-local on {ll['interface'] or 'the cable'}"
+                              + (f": its address {resolved_ip} is not on this computer's networks" if off_subnet else ""))
+                resolved_ip, net_if, port = "127.0.0.1", None, local_port
+                data_queue.put(("status", f"Analyzer {target_str} {route_note}"))
+                route_note = ""
+            elif resolved_ip is None:
+                raise OSError(f"{target_str} is not known on this computer's networks")
             if net_if and sys.platform == "darwin":
                 os.environ["HTRAAPI_NET_IF"] = net_if
             else:
                 os.environ.pop("HTRAAPI_NET_IF", None)
-            if resolved_ip != target_str or route_note:
+            if ll is None and (resolved_ip != target_str or route_note):
                 data_queue.put(("status", f"Analyzer {target_str} is {resolved_ip}"
                                           + (f" via {net_if}" if net_if else "") + (f" ({route_note})" if route_note else "")))
             ip_parts = [int(p) for p in resolved_ip.split(".")]
@@ -344,7 +363,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
     dev_num = ctypes.c_int(dev_num_to_open)
     
     status = -1
-    target = f"{ip_address}:{port}" if interface_type.lower() == "network" else "USB"
+    target = f"{ip_address}:{shown_port}" if interface_type.lower() == "network" else "USB"
     is_network = interface_type.lower() == "network"
     if is_network:
         data_queue.put(("status", f"Connecting to network analyzer at {target}…"))
@@ -450,7 +469,7 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
         pass
     data_queue.put(("connected", True))
     if interface_type.lower() == "network":
-        data_queue.put(("status", f"Connected to Network Analyzer ({ip_address}:{port})."))
+        data_queue.put(("status", f"Connected to Network Analyzer ({ip_address}:{shown_port})."))
     else:
         data_queue.put(("status", "Device opened successfully."))
         
@@ -518,7 +537,10 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                             info.update({"sats_in_view": int(sd.SatsNum_All), "sats_used": int(sd.SatsNum_Use),
                                          "snr_avg": int(sd.GNSS_SNR_UsePos.Avg_SatxC_No),
                                          "snr_max": int(sd.GNSS_SNR_UsePos.Max_SatxC_No),
-                                         "snr_min": int(sd.GNSS_SNR_UsePos.Min_SatxC_No)})
+                                         "snr_min": int(sd.GNSS_SNR_UsePos.Min_SatxC_No),
+                                         # satellites tracked but left out of the fix (and how strong they are)
+                                         "snr_unused_avg": int(sd.GNSS_SNR_NotUsePos.Avg_SatxC_No),
+                                         "snr_unused_max": int(sd.GNSS_SNR_NotUsePos.Max_SatxC_No)})
                     except Exception:
                         pass
                 data_queue.put(("gnss", info))
@@ -2093,22 +2115,24 @@ class DeviceController(QObject):
         try:
             from core import net_route
             for found in net_route.browse_mdns():
-                entry = discovered_by_ip.get(found["ip"])
+                key = found["ip"] or found["hostname"]
+                entry = discovered_by_ip.get(key)
                 if entry is None:
-                    if not found["ip"]:
-                        continue
-                    entry = discovered_by_ip[found["ip"]] = {
-                        'model': None, 'uid': None, 'ip': found["ip"], 'mask': '', 'hostname': '',
+                    entry = discovered_by_ip[key] = {
+                        'model': None, 'uid': None, 'ip': found["ip"] or "(IPv6 only)", 'mask': '', 'hostname': '',
                         'is_calibrated': None, 'alias': "Harogic analyzer", 'interface': found["interface"],
                         'cal_summary': {}}
                 entry['hostname'] = found["hostname"]
                 entry['interface'] = entry.get('interface') or found["interface"]
-                if entry.get('model') is None:
+                if entry.get('model') is None and found["model"] is not None:
                     entry['model'], entry['uid'] = found["model"], found["uid"]
                     if cm:
                         entry['is_calibrated'] = cm.is_calibrated(found["model"], found["uid"])
                         entry['cal_summary'] = cm.get_cal_summary(found["model"], found["uid"])
                     entry['alias'] = (entry.get('cal_summary') or {}).get('alias') or f"Model {found['model']:03d}"
+                if found.get("via") == "ipv6":
+                    # Another subnet: connected to by name, over the cable
+                    entry['alias'] = f"{entry.get('alias') or 'Harogic analyzer'} (other subnet: by name over IPv6)"
         except Exception:
             pass
 

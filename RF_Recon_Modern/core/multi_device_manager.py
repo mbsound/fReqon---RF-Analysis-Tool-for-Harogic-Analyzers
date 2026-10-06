@@ -279,6 +279,11 @@ class MultiDeviceManager(QObject):
                 any_started = True
         return any_started
 
+    def connecting(self) -> list:
+        """Slots whose hardware process is up but has not reported a connection yet (an open in progress)."""
+        return [sid for sid, s in self.slots.items()
+                if not s.is_connected and s.controller.process is not None and s.controller.process.is_alive()]
+
     def _connect_slot(self, slot_id: str):
         slot = self.slots.get(slot_id)
         if not slot: return

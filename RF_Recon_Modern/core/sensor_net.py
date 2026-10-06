@@ -170,9 +170,13 @@ class Sensor:
         rows += [("Position", f"{self.fix_lat:.6f}, {self.fix_lon:.6f}"),
                 ("", f"mean of {self.fix_n} fixes" + (f", ±{spread:.1f} m" if spread is not None else "")),
                 ("Height", f"{self.fix_alt:.0f} m")]
-        sats = f"{g.get('sats_used', g.get('sats', '?'))} used"
+        used = g.get('sats_used', g.get('sats', '?'))
+        sats = f"{used} used"
         if g.get("sats_in_view"):
             sats += f" of {g['sats_in_view']} in view"
+            unused = g["sats_in_view"] - (used if isinstance(used, int) else 0)
+            if unused > 0 and g.get("snr_unused_avg"):
+                sats += f" ({unused} tracked but not used, {g['snr_unused_avg']} dB-Hz)"
         rows.append(("Satellites", sats))
         if g.get("snr_avg"):
             rows.append(("Signal", f"{g['snr_avg']} dB-Hz average"

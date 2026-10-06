@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QStackedWidget, QButtonGroup, QFrame,
-    QComboBox, QMessageBox
+    QComboBox, QMessageBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor
@@ -63,11 +63,17 @@ def usb_device_label(dev: dict) -> str:
     return text
 
 
+def net_route_is_ipv4(text: str) -> bool:
+    from core import net_route
+    return net_route.is_ipv4(text)
+
+
 class SlotConfigCard(QFrame):
     """
     Dedicated visual card for configuring an analyzer slot (USB or Ethernet).
     """
     rescanRequested = pyqtSignal()
+    openSettingsPage = pyqtSignal(str)      # the analyzer's address or name
 
     def __init__(self, slot_id: str, title: str, default_alias: str = "", is_default_enabled: bool = True, parent=None):
         super().__init__(parent)
@@ -199,10 +205,18 @@ class SlotConfigCard(QFrame):
         self.port_spin.setFixedHeight(26)
         self.port_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
+        self.web_btn = QPushButton("Settings page")
+        self.web_btn.setObjectName("pillBtn")
+        self.web_btn.setFixedHeight(26)
+        self.web_btn.setToolTip("Open this analyzer's network settings page (address, DHCP, name) in your browser.\n"
+                                "Works from another subnet too, over the cable.")
+        self.web_btn.clicked.connect(lambda: self.openSettingsPage.emit(self.ip_edit.text()))
+
         net_l.addWidget(ip_lbl)
         net_l.addWidget(self.ip_edit)
         net_l.addWidget(port_lbl)
         net_l.addWidget(self.port_spin)
+        net_l.addWidget(self.web_btn)
         self.details_stack.addWidget(net_w)
         
         body_layout.addWidget(self.details_stack)
@@ -464,10 +478,17 @@ class ConnectionDialog(QDialog):
         self.assign_btn.setFixedHeight(22)
         self.assign_btn.clicked.connect(lambda: self._assign_selected_to_slot(self.assign_combo.currentData()))
         disc_header.addWidget(self.assign_btn)
+        self.web_selected_btn = QPushButton("Settings page")
+        self.web_selected_btn.setObjectName("pillBtn")
+        self.web_selected_btn.setFixedHeight(22)
+        self.web_selected_btn.setToolTip("Open the selected analyzer's network settings page in your browser")
+        self.web_selected_btn.clicked.connect(self._open_selected_settings_page)
+        disc_header.addWidget(self.web_selected_btn)
         disc_card_layout.addLayout(disc_header)
 
         # Interface Selector & Scan Controls Row
         iface_row = QHBoxLayout()
+        iface_row.setSpacing(10)
         iface_lbl = QLabel("NIC:")
         iface_lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: 600;")
         iface_row.addWidget(iface_lbl)
@@ -511,7 +532,13 @@ class ConnectionDialog(QDialog):
             }
         """)
         self.scan_all_cb.toggled.connect(self._on_scan_all_toggled)
+        # Measured with its own (bold) style, and never squeezed: the layout otherwise sized it
+        # for the plain font and its text ran under the Scan button
+        self.scan_all_cb.ensurePolished()
+        self.scan_all_cb.setMinimumWidth(self.scan_all_cb.sizeHint().width() + 6)
+        self.scan_all_cb.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         iface_row.addWidget(self.scan_all_cb)
+        iface_row.addSpacing(8)
 
         self.scan_btn = QPushButton("Scan Subnet")
         self.scan_btn.setObjectName("primaryActionBtn")
@@ -567,6 +594,7 @@ class ConnectionDialog(QDialog):
         self._populate_network_interfaces()
         for card in (self.card_a, self.card_b):     # sensor cards are hooked up as they are added
             card.rescanRequested.connect(self.scan_usb)
+            card.openSettingsPage.connect(self.open_settings_page)
         self.scan_usb()
 
     # --- USB analyzers ---
@@ -682,6 +710,7 @@ class ConnectionDialog(QDialog):
             card._auto_index = len(self.cards)
         card.set_usb_devices(self._usb_devices, self._usb_status, scanned=self._usb_scanned)
         card.rescanRequested.connect(self.scan_usb)
+        card.openSettingsPage.connect(self.open_settings_page)
         self.cards[slot_id] = card
         self.extra_slots_layout.addWidget(card)
         card.setVisible(getattr(self, "selected_topology", None) == MultiDeviceTopology.SENSOR_NET)
@@ -903,6 +932,49 @@ class ConnectionDialog(QDialog):
             self.device_table.setItem(r_idx, 4, mask_item)
             self.device_table.setItem(r_idx, 5, nic_item)
             self.device_table.setItem(r_idx, 6, cal_item)
+
+    def open_settings_page(self, target: str):
+        """Open an analyzer's network settings page in the browser (over IPv6 from another subnet)."""
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        from core import net_route
+        from core.device_controller import DeviceController
+        try:
+            ifcs = [i for i in DeviceController.get_local_network_interfaces() if i.get("state") == "up"]
+        except Exception:
+            ifcs = []
+        # Looked up off the GUI thread: an unknown .local name takes seconds to give up on
+        import threading
+        from PyQt6.QtCore import QTimer
+        result = {}
+        threading.Thread(target=lambda: result.update(answer=net_route.settings_page_url(target, ifcs)),
+                         daemon=True).start()
+        self.scan_status_lbl.setText(f"Looking for {target.strip() or 'the analyzer'}'s settings page…")
+        self.scan_status_lbl.setStyleSheet("color: #8b949e; font-size: 10px;")
+
+        def done():
+            if "answer" not in result:
+                QTimer.singleShot(100, done)
+                return
+            url, note = result["answer"]
+            if url is None:
+                self.scan_status_lbl.setText("Settings page not opened.")
+                QMessageBox.information(self, "Settings page", note)
+                return
+            QDesktopServices.openUrl(QUrl(url))
+            self.scan_status_lbl.setText(f"Opened {url} in your browser" + (f". {note}" if note else "."))
+            self.scan_status_lbl.setStyleSheet("color: #38bdf8; font-size: 10px;")
+        QTimer.singleShot(50, done)
+
+    def _open_selected_settings_page(self):
+        row = self.device_table.currentRow()
+        item = self.device_table.item(row, 0) if row >= 0 else None
+        dev = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not dev:
+            QMessageBox.information(self, "Select Device", "Please select a discovered analyzer from the table first.")
+            return
+        ip = dev.get("ip") or ""
+        self.open_settings_page(dev.get("hostname") or (ip if net_route_is_ipv4(ip) else ""))
 
     def _assign_selected_to_slot(self, target_slot_id: str):
         row = self.device_table.currentRow()

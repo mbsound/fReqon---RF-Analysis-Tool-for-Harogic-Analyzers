@@ -736,6 +736,8 @@ def test_ui_gating():
     from ui.main_window import MainWindow
     MainWindow.connect_analyzer = lambda self: None      # never touch real hardware here
     win = MainWindow()
+    for _slot in win.multi_device_manager.slots.values():
+        _slot.role_alias = ""      # (the machine's saved settings may name the slots)
     import tempfile
     from PyQt6.QtCore import QSettings
     win.settings = QSettings(os.path.join(tempfile.mkdtemp(), "test.ini"), QSettings.Format.IniFormat)
@@ -798,6 +800,7 @@ def test_ui_gating():
     # No calibration files are asked for, and the device menu describes the tinySA
     win._on_slot_info_received("slot_a", 0, 12345)
     win._on_hw_endorsements("slot_a", ultra_info)
+    win.multi_device_manager.slots["slot_a"].role_alias = ""     # (the machine's saved settings may name slot A)
     win._on_all_connection_status(True)
     assert win.top_bar._identity_text == "tinySA Ultra", win.top_bar._identity_text
     win.top_bar._show_endorsements_menu()
@@ -872,6 +875,8 @@ def test_per_analyzer_settings():
     from ui.main_window import MainWindow
     MainWindow.connect_analyzer = lambda self: None
     win = MainWindow()
+    for _slot in win.multi_device_manager.slots.values():
+        _slot.role_alias = ""      # (the machine's saved settings may name the slots)
     win.settings = QSettings(os.path.join(tempfile.mkdtemp(), "test.ini"), QSettings.Format.IniFormat)
     mdm, sp = win.multi_device_manager, win.sweep_panel
     sp.set_rf_input("auto")
