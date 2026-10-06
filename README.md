@@ -212,7 +212,7 @@ analyzers by model and serial number, tinySAs by model and serial port, with
 any that a slot already holds marked as connected. A choice is pinned (a Harogic
 analyzer by its serial number, a tinySA by its port), so it survives replugging
 in another order; *Automatic* instead takes the analyzers in the order found,
-Harogic first. Network analyzers are given by IP address. fReqon refuses a USB
+Harogic first. Network analyzers are given by IP address or by name (`<name>.local`). fReqon refuses a USB
 analyzer that isn't there rather than quietly opening another one, and if two
 slots turn out to be the same analyzer it keeps it on the primary slot and
 tells you. The scan works the same on macOS and Linux; on Linux a tinySA's
@@ -391,6 +391,8 @@ on every sensor, which the analyzers' GNSS modules provide outdoors.
 
 fReqon natively supports Harogic Ethernet network analyzers (e.g., Raspberry Pi Compute Module 5 based Model 67/828) across local subnets:
 - **Subnet Auto-Discovery**: The Connection Dialog probes the local subnets for Harogic devices on ports 5000/9000, so no manual IP entry is needed. The scan finds addresses only; each analyzer's model and serial number are read from the device when it connects.
+- **Discovery by name**: analyzers also announce themselves by mDNS (`<model>-<serial>.local` from the factory). Renamed units are found too, by the ports they serve. Assigning a unit by its name keeps the connection working when its address changes.
+- **Network settings page and connecting across subnets**: install the [Harogic R1000 Network Server](https://github.com/mbsound/Harogic-R1000-Network-Server) on the analyzer. It gives the unit a password-protected web page for Static/DHCP addressing, its address and its `.local` name, so a renter never needs SSH, and an address change undoes itself unless confirmed. It also lets fReqon reach the analyzer **by name from any IPv4 subnet** on the same cable or switch: when the analyzer's address is not on any of the computer's networks, fReqon connects over the cable's IPv6 link-local address instead, at full speed. The Connection Dialog's **Settings page** buttons open the page, from another subnet too.
 - **Hardware & Firmware Setup Guide**: For embedded analyzer provisioning, bootloader power rail configurations, and daemon stability patches, see the [Harogic Network Analyzer Setup & Fix Guide](docs/hardware/harogic_network_analyzer_fix.md).
 - **Automated Provisioning Tool**: Use [`tools/remote_analyzer/provision_harogic_network_server.py`](tools/remote_analyzer/provision_harogic_network_server.py) to diagnose and configure remote analyzers over SSH.
 
