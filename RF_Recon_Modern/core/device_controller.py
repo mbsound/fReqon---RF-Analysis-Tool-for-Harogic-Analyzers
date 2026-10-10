@@ -1266,7 +1266,16 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
             if current_mode == "SWP":
                 sweep_ok = False
                 valid_hops = 0
-                for _ in range(total_hops):
+                # Read until every hop 0..T-1 has arrived once. With spur
+                # rejection on, the SDK also returns extra frames (hop index
+                # >= TotalHops, at unrelated frequencies) on some single-hop
+                # spans, so a fixed T reads can come up short.
+                seen_hops = set()
+                failed_reads = 0
+                hop_bin_bw = trace_info.TraceBinBW_Hz
+                for _ in range(4 * total_hops + 8):
+                    if len(seen_hops) >= total_hops or failed_reads >= total_hops:
+                        break
                     status = dll.SWP_GetPartialSweep(
                         ctypes.pointer(device), 
                         partial_freq_ctypes, 
@@ -1276,30 +1285,38 @@ def hardware_process(command_queue, data_queue, start_freq_hz, stop_freq_hz, pro
                         ctypes.pointer(meas_aux_info)
                     )
                     # status == 0: success, status == -12: APIRETVAL_WARNING_IFOverflow (non-fatal IF warning)
-                    if status in (0, -12):
+                    if status not in (0, -12):
+                        failed_reads += 1
+                    else:
                         h_idx = hop_index.value
-                        if 0 <= h_idx < total_hops:
-                            start_idx = h_idx * partial_sweep_points
-                            if start_idx < full_sweep_points:
-                                slice_len = max(0, min(partial_sweep_points, full_sweep_points - start_idx))
-                                end_idx = start_idx + slice_len
-                                temp_spec = np.copy(np.frombuffer(partial_spec_ctypes, dtype=np.float32, count=slice_len))
-                                
-                                # DMA Buffer healing for unpopulated chunks (runs of exact
-                                # 0.0) or NaNs/Infs; an isolated 0.0 dBm is a real reading
-                                invalid_mask = ~np.isfinite(temp_spec) | _zero_runs(temp_spec)
-                                if np.any(invalid_mask):
-                                    if last_valid_power is not None and len(last_valid_power) == full_sweep_points:
-                                        temp_spec[invalid_mask] = last_valid_power[start_idx:end_idx][invalid_mask]
+                        if not (0 <= h_idx < total_hops) or h_idx in seen_hops:
+                            continue
+                        if hop_bin_bw > 0:
+                            expect = trace_info.StartFreq_Hz + h_idx * partial_sweep_points * hop_bin_bw
+                            if abs(partial_freq_ctypes[0] - expect) > 2 * hop_bin_bw:
+                                continue
+                        seen_hops.add(h_idx)
+                        start_idx = h_idx * partial_sweep_points
+                        if start_idx < full_sweep_points:
+                            slice_len = max(0, min(partial_sweep_points, full_sweep_points - start_idx))
+                            end_idx = start_idx + slice_len
+                            temp_spec = np.copy(np.frombuffer(partial_spec_ctypes, dtype=np.float32, count=slice_len))
+                            
+                            # DMA Buffer healing for unpopulated chunks (runs of exact
+                            # 0.0) or NaNs/Infs; an isolated 0.0 dBm is a real reading
+                            invalid_mask = ~np.isfinite(temp_spec) | _zero_runs(temp_spec)
+                            if np.any(invalid_mask):
+                                if last_valid_power is not None and len(last_valid_power) == full_sweep_points:
+                                    temp_spec[invalid_mask] = last_valid_power[start_idx:end_idx][invalid_mask]
+                                else:
+                                    valid_idx = np.where(~invalid_mask)[0]
+                                    if len(valid_idx) > 0:
+                                        temp_spec[invalid_mask] = np.interp(np.where(invalid_mask)[0], valid_idx, temp_spec[valid_idx])
                                     else:
-                                        valid_idx = np.where(~invalid_mask)[0]
-                                        if len(valid_idx) > 0:
-                                            temp_spec[invalid_mask] = np.interp(np.where(invalid_mask)[0], valid_idx, temp_spec[valid_idx])
-                                        else:
-                                            temp_spec[invalid_mask] = -120.0
-                                
-                                power_np[start_idx:end_idx] = temp_spec
-                                valid_hops += 1
+                                        temp_spec[invalid_mask] = -120.0
+                            
+                            power_np[start_idx:end_idx] = temp_spec
+                            valid_hops += 1
                 
                 # Accept sweep when all or nearly all hops are populated
                 if valid_hops >= max(1, total_hops - 1):
